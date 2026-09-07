@@ -40,8 +40,8 @@ and runs with only `contents: read`. Pull-request jobs receive no release or
 package-manager secrets. Cargo caches are saved only from successful `main`
 pushes, and failure artifacts contain only the captured build log under
 `target/ci-logs` with seven-day retention. The supply-chain job installs the
-exact cargo-deny version from `.cargo-deny-version` and delegates policy
-arguments to xtask.
+exact cargo-deny and cargo-machete versions from their repository version files
+and delegates policy arguments to xtask.
 
 ## Enabling branch protection
 

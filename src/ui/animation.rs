@@ -1,7 +1,7 @@
 //! Unified animation system for Rustle
 //!
-//! This module provides CSS-like animations using `iced_anim` and custom
-//! hover animation management.
+//! This module provides project-owned CSS-like hover and scrolling animation
+//! state without coupling application timing to an additional Iced version.
 //!
 mod hover;
 mod scroll;

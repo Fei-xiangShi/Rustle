@@ -34,12 +34,12 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           install-native-dependencies: "false"
-          install-cargo-deny: "true"
+          install-supply-chain-tools: "true"
 
       - name: Cache Cargo dependency data
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}-${{ steps.rust.outputs.cargo-deny-version }}
+          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}-${{ steps.rust.outputs.cargo-deny-version }}-${{ steps.rust.outputs.cargo-machete-version }}
           cache-on-failure: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 

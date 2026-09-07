@@ -6,11 +6,12 @@ review, an exit condition, and a rollback path.
 
 ## Authoritative checks
 
-The repository pins cargo-deny in `.cargo-deny-version`. Install that exact
-version and run the xtask-owned policy command:
+The repository pins cargo-deny and cargo-machete in root version files. Install
+those exact versions and run the xtask-owned policy command:
 
 ```bash
 cargo install cargo-deny --version 0.20.2 --locked
+cargo install cargo-machete --version 0.9.2 --locked
 cargo xtask supply-chain
 cargo xtask check-production
 ```
@@ -21,6 +22,19 @@ transitive dependencies do not leak across an artificial union graph.
 Advisories, licenses, wildcard version requirements, registries, and git
 sources are policy inputs; Cargo.lock remains the exact resolved dependency
 record.
+
+The same command runs cargo-machete over repository source while skipping build
+output. Machete's metadata-assisted mode currently misclassifies the cfg-gated
+Windows build dependency used by `build.rs`, so the enforced invocation uses
+the source scanner and requires manual confirmation before deleting a reported
+dependency.
+
+Cargo-deny rejects new parallel versions by default. The exact older versions
+that remain are individually registered in `[bans].skip`, with an ownership
+reason and no wildcard ranges. Because the policy is evaluated one native
+target at a time, xtask suppresses only `unmatched-skip` and
+`unnecessary-skip` diagnostics caused by entries that belong to another target;
+duplicate-version findings remain denied.
 
 The desktop package is explicitly `publish = false`. Cargo-deny therefore
 permits revision-pinned git/path dependencies while still rejecting wildcard
@@ -77,8 +91,9 @@ Current exact advisory exceptions are:
   under the GUI dependency owner when production feature hygiene or an
   upstream serialization change removes that path; see [the RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2025-0141).
 - `RUSTSEC-2026-0192`: `ttf-parser` is used by the current text stack. Replace
-  it with maintained fontations-based APIs during dependency convergence; the
-  text-stack owner tracks [the RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2026-0192).
+  it when the owning font/render crates move to a fixed release; the direct
+  Rustle declaration has already been removed. The text-stack owner tracks
+  [the RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2026-0192).
 
 `ncm-api-rs 0.1.0` also has an exact WTFPL license exception; this does not add
 WTFPL to the global accepted license set.
@@ -89,11 +104,36 @@ WTFPL to the global accepted license set.
   evidence. Do not add a license to the global allow set for one package.
 - Unknown registry or git-source failures are not bypassed with organization-
   wide allow rules. Register only the reviewed canonical repository.
-- Duplicate-version warnings are baseline evidence for the dedicated version-
-  convergence task. GPU, windowing, platform, and audio ecosystems may retain
-  justified parallel versions; do not force convergence solely to reduce a
-  count.
+- Duplicate versions are deny-by-default. A retained version needs an exact
+  `[bans].skip` entry with an owner and exit condition; GPU, windowing,
+  platform, font, image, network, and audio ecosystems must not be forced into
+  one API generation solely to reduce a count.
 
 Policy failures may be temporarily excepted only in the same reviewed change
 that records an owner and removal condition. Disabling the complete CI job or
 using `continue-on-error` is not an acceptable exception.
+
+## Reviewed duplicate baseline
+
+At baseline commit `0fee60d`, the lockfile contained 820 packages, 58 names
+with parallel resolved entries, and 48 direct dependency declarations. The
+dependency-convergence change removes `iced_anim`, `iced_core 0.14`,
+`glam 0.25`, and the unused direct `ttf-parser` declaration. The resulting
+graph contains 817 packages, 56 duplicate names, and 46 direct declarations.
+`ttf-parser` remains only as a transitive font-stack dependency.
+
+The exact accepted versions live in `deny.toml`; the ownership and removal
+conditions are grouped here so future upgrades have a clear route:
+
+| Family | Current owner and why it remains | Exit condition |
+| --- | --- | --- |
+| Reqwest 0.12/0.13 | The pinned `ncm-api-rs` revision owns Reqwest 0.12 while Rustle uses 0.13. | Review an upstream/fork adapter revision, verify protocol/cookie/error contracts, then update its exact git rev. |
+| Windows bindings and target crates | Native, tray, media, and windowing crates span several ABI generations and target support packages. | Upgrade the owning native crates by platform and remove each exact skip only after all native CI targets pass. |
+| Fontations (`font-types`, `read-fonts`, `skrifa`) | Iced/renderer/font crates follow separate coordinated release trains. | Move through a reviewed renderer/text-stack upgrade with shaping, lyrics, and GPU validation. |
+| Image/render (`png`, `tiny-skia`, `kurbo`, compression) | SVG, raster image, and renderer crates require semver-incompatible APIs. | Upgrade the owning image/SVG stack and verify decode, cache, cover, and renderer tests. |
+| Randomness (`rand`, `rand_core`, `getrandom`, `r-efi`) | Crypto, media, and platform crates consume three API generations. | Remove older versions as their owning transitive crates publish compatible releases. |
+| Macro/build/TOML (`syn`, `thiserror`, `proc-macro-crate`, `toml*`, `winnow`) | Proc macros and platform build tooling have not converged on one parser generation. | Upgrade the owning macro/build crates; do not patch semver-incompatible parser APIs globally. |
+| Platform adapters (`x11rb`, `jni`, `objc2`, `keyboard-types`, `core-foundation`) | Desktop and optional platform backends require distinct adapter generations. | Converge per owning backend after target-specific compile and runtime smoke checks. |
+
+Adding a new duplicate must fail `cargo xtask supply-chain`; growing the
+baseline requires a reviewed exact entry and documentation in the same change.

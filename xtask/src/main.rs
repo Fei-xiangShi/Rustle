@@ -189,14 +189,7 @@ fn doc_workspace(root: &Path) -> XtaskResult<()> {
 fn supply_chain(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_manifest_git_revisions(root)?;
-    let version_file = root.join(".cargo-deny-version");
-    let expected = fs::read_to_string(&version_file)?.trim().to_owned();
-    if expected.is_empty() {
-        return Err(failure(format!(
-            "cargo-deny version file is empty: {}",
-            version_file.display()
-        )));
-    }
+    let expected = pinned_tool_version(root, ".cargo-deny-version", "cargo-deny")?;
 
     let output = capture_cargo(root, &["deny", "--version"])?;
     let actual = tool_version(&output, "cargo-deny").ok_or_else(|| {
@@ -209,6 +202,15 @@ fn supply_chain(root: &Path) -> XtaskResult<()> {
             "cargo-deny version `{actual}` does not match pinned version `{expected}`; install it with `cargo install cargo-deny --version {expected} --locked --force`"
         )));
     }
+
+    let machete_expected = pinned_tool_version(root, ".cargo-machete-version", "cargo-machete")?;
+    let machete_output = capture_program(root, "cargo-machete", &["--version"])?;
+    if machete_output != machete_expected {
+        return Err(failure(format!(
+            "cargo-machete version `{machete_output}` does not match pinned version `{machete_expected}`; install it with `cargo install cargo-machete --version {machete_expected} --locked --force`"
+        )));
+    }
+    run_program(root, "cargo-machete", &["--skip-target-dir"])?;
 
     for target in SUPPLY_CHAIN_TARGETS {
         println!("supply-chain target: {target}");
@@ -226,6 +228,10 @@ fn supply_chain(root: &Path) -> XtaskResult<()> {
                 "license-not-encountered",
                 "--allow",
                 "unmatched-source",
+                "--allow",
+                "unmatched-skip",
+                "--allow",
+                "unnecessary-skip",
                 "--hide-inclusion-graph",
                 "advisories",
                 "licenses",
@@ -235,6 +241,19 @@ fn supply_chain(root: &Path) -> XtaskResult<()> {
         )?;
     }
     Ok(())
+}
+
+fn pinned_tool_version(root: &Path, file_name: &str, tool: &str) -> XtaskResult<String> {
+    let version_file = root.join(file_name);
+    let version = fs::read_to_string(&version_file)?.trim().to_owned();
+    if version.is_empty() {
+        Err(failure(format!(
+            "{tool} version file is empty: {}",
+            version_file.display()
+        )))
+    } else {
+        Ok(version)
+    }
 }
 
 fn verify_manifest_git_revisions(root: &Path) -> XtaskResult<()> {
@@ -444,6 +463,22 @@ fn run_cargo(root: &Path, args: &[&str]) -> XtaskResult<()> {
     } else {
         Err(failure(format!(
             "`cargo {}` failed with {status}",
+            args.join(" ")
+        )))
+    }
+}
+
+fn run_program(root: &Path, program: &str, args: &[&str]) -> XtaskResult<()> {
+    print_command(program, args);
+    let status = Command::new(program)
+        .current_dir(root)
+        .args(args)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "`{program} {}` failed with {status}",
             args.join(" ")
         )))
     }

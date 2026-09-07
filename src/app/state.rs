@@ -1988,8 +1988,8 @@ impl UiState {
     /// Check if any global or submodule animation is currently active
     /// Optimized: O(1) check for hover animations, only checks active/fading states
     pub fn has_active_animations(&self, _now: Instant) -> bool {
-        // Hover animations are now O(1) - they only track active + fading
-        // iced_anim doesn't need Instant - it uses internal timing
+        // Hover animations are O(1): they retain only active + fading state.
+        // The timestamp is consumed by cleanup_animations when frames advance.
         self.sidebar_animations.is_animating()
             || self.sidebar_drawer_animation.is_animating()
             || self.playlist_page.song_animations.is_animating()

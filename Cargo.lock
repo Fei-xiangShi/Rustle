@@ -2025,12 +2025,6 @@ dependencies = [
 
 [[package]]
 name = "glam"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
-
-[[package]]
-name = "glam"
 version = "0.33.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21fef0953c54fd3de2f44b743fbf77e044c81a25faee03636dfccc0d35135e23"
@@ -2479,7 +2473,7 @@ name = "iced"
 version = "0.15.0-dev"
 source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
- "iced_core 0.15.0-dev",
+ "iced_core",
  "iced_debug",
  "iced_devtools",
  "iced_futures",
@@ -2492,22 +2486,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "iced_anim"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea7e0f5f848b041abf2907eda96a4c21cbd5c3aee4ade434bd650d898f39e95b"
-dependencies = [
- "iced_core 0.14.0",
-]
-
-[[package]]
 name = "iced_beacon"
 version = "0.15.0-dev"
 source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bincode",
  "futures",
- "iced_core 0.15.0-dev",
+ "iced_core",
  "log",
  "semver",
  "serde",
@@ -2517,30 +2502,12 @@ dependencies = [
 
 [[package]]
 name = "iced_core"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91ab1937d699403e7e69252ae743a902bcee9f4ab2052cc4c9a46fcf34729d85"
-dependencies = [
- "bitflags 2.13.1",
- "bytes",
- "glam 0.25.0",
- "lilt",
- "log",
- "num-traits",
- "rustc-hash 2.1.3",
- "smol_str 0.2.2",
- "thiserror 2.0.20",
- "web-time",
-]
-
-[[package]]
-name = "iced_core"
 version = "0.15.0-dev"
 source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
- "glam 0.33.6",
+ "glam",
  "lilt",
  "log",
  "num-traits",
@@ -2559,7 +2526,7 @@ version = "0.15.0-dev"
 source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_beacon",
- "iced_core 0.15.0-dev",
+ "iced_core",
  "iced_futures",
  "log",
 ]
@@ -2581,7 +2548,7 @@ version = "0.15.0-dev"
 source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "futures",
- "iced_core 0.15.0-dev",
+ "iced_core",
  "log",
  "rustc-hash 2.1.3",
  "tokio",
@@ -2598,7 +2565,7 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "half",
- "iced_core 0.15.0-dev",
+ "iced_core",
  "iced_futures",
  "image",
  "kamadak-exif",
@@ -2636,7 +2603,7 @@ version = "0.15.0-dev"
 source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bytes",
- "iced_core 0.15.0-dev",
+ "iced_core",
  "iced_futures",
  "thiserror 2.0.20",
 ]
@@ -5311,7 +5278,6 @@ dependencies = [
  "futures-util",
  "global-hotkey",
  "iced",
- "iced_anim",
  "iced_runtime",
  "image",
  "interprocess",
@@ -5341,7 +5307,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
- "ttf-parser",
  "walkdir",
  "windows-sys 0.61.2",
  "winresource",
