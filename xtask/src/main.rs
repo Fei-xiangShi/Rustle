@@ -148,6 +148,7 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_error_source_contracts(root)?;
+    verify_observability_source_contract(root)?;
     run_cargo(root, &["fmt", "--all", "--check"])?;
     check_production_workspace(root)?;
     check_workspace(root)?;
@@ -159,6 +160,7 @@ fn check(root: &Path) -> XtaskResult<()> {
 fn check_production(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_error_source_contracts(root)?;
+    verify_observability_source_contract(root)?;
     check_production_workspace(root)
 }
 
@@ -238,9 +240,71 @@ fn source_contract_violations(path: &str, contents: &str) -> Vec<String> {
         .collect()
 }
 
+fn verify_observability_source_contract(root: &Path) -> XtaskResult<()> {
+    let source_root = root.join("src");
+    let mut source_paths = Vec::new();
+    collect_rust_source_paths(&source_root, &mut source_paths)?;
+    source_paths.sort();
+
+    let mut violations = Vec::new();
+    for path in source_paths {
+        let relative_path = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read_to_string(&path)?;
+        violations.extend(observability_source_contract_violations(
+            &relative_path,
+            &contents,
+        ));
+    }
+
+    if violations.is_empty() {
+        println!("observability source contract: ok");
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "observability source contract violations:\n{}",
+            violations.join("\n")
+        )))
+    }
+}
+
+fn collect_rust_source_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_rust_source_paths(&path, paths)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn observability_source_contract_violations(path: &str, contents: &str) -> Vec<String> {
+    if path == "src/observability.rs" {
+        return Vec::new();
+    }
+
+    contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("tracing_subscriber"))
+        .map(|(line_index, _)| {
+            format!(
+                "{path}:{} references `tracing_subscriber`; subscriber configuration belongs to src/observability.rs",
+                line_index + 1
+            )
+        })
+        .collect()
+}
+
 fn check_native(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_error_source_contracts(root)?;
+    verify_observability_source_contract(root)?;
     check_workspace(root)?;
     clippy_workspace(root)?;
     test_workspace(root)
@@ -710,8 +774,9 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag, quoted_setting,
-        source_contract_violations, tool_version,
+        forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag,
+        observability_source_contract_violations, quoted_setting, source_contract_violations,
+        tool_version,
     };
 
     #[test]
@@ -783,6 +848,29 @@ mod tests {
                 "SongResolveFailed(PlaybackContext, AppError),"
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn observability_contract_rejects_secondary_subscriber_owners() {
+        assert!(
+            observability_source_contract_violations(
+                "src/lib.rs",
+                "tracing_subscriber::fmt::init();"
+            )
+            .len()
+                == 1
+        );
+        assert!(
+            observability_source_contract_violations(
+                "src/observability.rs",
+                "tracing_subscriber::registry();"
+            )
+            .is_empty()
+        );
+        assert!(
+            observability_source_contract_violations("src/app.rs", "tracing::info!(\"ok\");")
+                .is_empty()
         );
     }
 }

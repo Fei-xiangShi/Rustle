@@ -11,6 +11,7 @@ mod features;
 mod i18n;
 mod image;
 mod metadata;
+mod observability;
 mod platform;
 mod protocol;
 mod ui;
@@ -22,8 +23,7 @@ mod utils;
 /// Infrastructure work can now evolve the composition root without making
 /// every business module part of the executable target.
 pub fn run() -> iced::Result {
-    // Initialize tracing for logging.
-    tracing_subscriber::fmt::init();
+    let _observability = observability::initialize();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -35,7 +35,7 @@ pub fn run() -> iced::Result {
         match protocol::ipc::forward_uri_to_primary(&uri) {
             Ok(()) => {
                 tracing::info!("URI forwarded to primary instance, exiting");
-                std::process::exit(0);
+                return Ok(());
             }
             Err(error) => {
                 tracing::warn!("No primary instance found ({}), starting new one", error);
@@ -48,7 +48,7 @@ pub fn run() -> iced::Result {
         match protocol::ipc::forward_focus_to_primary() {
             Ok(()) => {
                 tracing::info!("Focused existing instance, exiting");
-                std::process::exit(0);
+                return Ok(());
             }
             Err(_) => {
                 // No existing instance, proceed with normal startup.
