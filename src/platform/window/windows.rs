@@ -12,6 +12,8 @@ pub fn initialize_process() {
     }
 
     let app_id: Vec<u16> = format!("{}\0", APP_ID).encode_utf16().collect();
+    // SAFETY: app_id is NUL-terminated and remains allocated for this
+    // synchronous process-initialization call. The API only borrows it.
     let result = unsafe { SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr()) };
 
     if result < 0 {

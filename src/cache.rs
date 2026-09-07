@@ -66,6 +66,9 @@ fn replace_closed_file(temp_path: &Path, final_path: &Path) -> std::io::Result<(
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
+    // SAFETY: Both vectors are NUL-terminated and remain allocated for the
+    // synchronous call. The caller guarantees both files are closed; failure
+    // is returned so the publishing layer can remove the temporary file.
     let moved = unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),

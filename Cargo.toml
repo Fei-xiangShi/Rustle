@@ -22,10 +22,12 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 
 [workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
 
 [package]
 name = "rustle"

@@ -168,71 +168,86 @@ impl WindowsTray {
         state: TrayState,
         identity: TrayIdentity,
     ) -> anyhow::Result<Self> {
-        // SAFETY: All calls in this constructor execute on the active Winit UI
-        // thread. The Box address passed to CreateWindowExW remains stable for
-        // the lifetime of the HWND.
-        unsafe {
-            let instance = GetModuleHandleW(null());
-            if instance.is_null() {
-                return Err(last_error("GetModuleHandleW"));
+        // SAFETY: Passing null requests the module containing the current
+        // process image; the call has no borrowed output or cleanup contract.
+        let instance = unsafe { GetModuleHandleW(null()) };
+        if instance.is_null() {
+            return Err(last_error("GetModuleHandleW"));
+        }
+
+        let class_name = wide("Rustle.TrayWindow.1");
+        let owns_window_class = register_window_class(instance, &class_name)?;
+
+        let taskbar_created_name = wide("TaskbarCreated");
+        // SAFETY: taskbar_created_name is NUL-terminated and remains allocated
+        // for this synchronous registration call.
+        let taskbar_created = unsafe { RegisterWindowMessageW(taskbar_created_name.as_ptr()) };
+        if taskbar_created == 0 {
+            let error = last_error("RegisterWindowMessageW(TaskbarCreated)");
+            if owns_window_class {
+                // SAFETY: This constructor registered the class using the same
+                // live instance/name pair and has not created a window yet.
+                let _ = unsafe { UnregisterClassW(class_name.as_ptr(), instance) };
             }
+            return Err(error);
+        }
 
-            let class_name = wide("Rustle.TrayWindow.1");
-            let owns_window_class = register_window_class(instance, &class_name)?;
-
-            let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
-            if taskbar_created == 0 {
-                let error = last_error("RegisterWindowMessageW(TaskbarCreated)");
+        let icon = match load_small_icon() {
+            Ok(icon) => icon,
+            Err(error) => {
                 if owns_window_class {
-                    let _ = UnregisterClassW(class_name.as_ptr(), instance);
+                    // SAFETY: No callback window exists, so the class owned by
+                    // this constructor can be unregistered immediately.
+                    let _ = unsafe { UnregisterClassW(class_name.as_ptr(), instance) };
                 }
                 return Err(error);
             }
-
-            let icon = match load_small_icon() {
-                Ok(icon) => icon,
-                Err(error) => {
-                    if owns_window_class {
-                        let _ = UnregisterClassW(class_name.as_ptr(), instance);
-                    }
-                    return Err(error);
+        };
+        let presentation = TrayPresentation::from_state(&state);
+        let menu = match build_menu(&presentation) {
+            Ok(menu) => menu,
+            Err(error) => {
+                if icon.owned {
+                    // SAFETY: icon is a live, uniquely owned HICON returned by
+                    // load_small_icon and has not been registered with Shell.
+                    let _ = unsafe { DestroyIcon(icon.handle) };
                 }
-            };
-            let presentation = TrayPresentation::from_state(&state);
-            let menu = match build_menu(&presentation) {
-                Ok(menu) => menu,
-                Err(error) => {
-                    if icon.owned {
-                        let _ = DestroyIcon(icon.handle);
-                    }
-                    if owns_window_class {
-                        let _ = UnregisterClassW(class_name.as_ptr(), instance);
-                    }
-                    return Err(error);
+                if owns_window_class {
+                    // SAFETY: No callback window exists and this constructor
+                    // owns the registered instance/name pair.
+                    let _ = unsafe { UnregisterClassW(class_name.as_ptr(), instance) };
                 }
-            };
+                return Err(error);
+            }
+        };
 
-            let mut window_state = Box::new(WindowState {
-                hwnd: null_mut(),
-                menu,
-                pending_menu: null_mut(),
-                menu_tracking: false,
-                icon: icon.handle,
-                icon_owned: icon.owned,
-                icon_registered: false,
-                shell_available: false,
-                taskbar_created,
-                command_tx,
-                command_overflow_warned: false,
-                identity,
-                state,
-                presentation,
-            });
+        let mut window_state = Box::new(WindowState {
+            hwnd: null_mut(),
+            menu,
+            pending_menu: null_mut(),
+            menu_tracking: false,
+            icon: icon.handle,
+            icon_owned: icon.owned,
+            icon_registered: false,
+            shell_available: false,
+            taskbar_created,
+            command_tx,
+            command_overflow_warned: false,
+            identity,
+            state,
+            presentation,
+        });
 
-            let hwnd = CreateWindowExW(
+        let window_title = wide("Rustle System Tray");
+        // SAFETY: instance/class_name identify the registered class and all
+        // string pointers remain live for this synchronous call. window_state
+        // is boxed, so the lpParam address remains stable until the HWND is
+        // destroyed; WM_NCCREATE installs that address as callback user data.
+        let hwnd = unsafe {
+            CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 class_name.as_ptr(),
-                wide("Rustle System Tray").as_ptr(),
+                window_title.as_ptr(),
                 WS_POPUP,
                 0,
                 0,
@@ -242,35 +257,41 @@ impl WindowsTray {
                 null_mut(),
                 instance,
                 window_state.as_mut() as *mut WindowState as *const c_void,
-            );
-            if hwnd.is_null() {
-                let error = last_error("CreateWindowExW(tray window)");
-                if window_state.icon_owned {
-                    let _ = DestroyIcon(window_state.icon);
-                    window_state.icon_owned = false;
-                }
-                let _ = DestroyMenu(window_state.menu);
-                window_state.menu = null_mut();
-                if owns_window_class {
-                    let _ = UnregisterClassW(class_name.as_ptr(), instance);
-                }
-                return Err(error);
+            )
+        };
+        if hwnd.is_null() {
+            let error = last_error("CreateWindowExW(tray window)");
+            if window_state.icon_owned {
+                // SAFETY: Window creation failed, so the uniquely owned icon
+                // was never exposed through a live callback window.
+                let _ = unsafe { DestroyIcon(window_state.icon) };
+                window_state.icon_owned = false;
             }
-            window_state.hwnd = hwnd;
-
-            let mut tray = Self {
-                state: window_state,
-                instance,
-                class_name,
-                owns_window_class,
-                _thread_bound: PhantomData,
-            };
-            if let Err(error) = tray.state.register_icon() {
-                drop(tray);
-                return Err(error);
+            // SAFETY: menu is the live, unattached root HMENU produced by
+            // build_menu and WindowState is still its unique owner.
+            let _ = unsafe { DestroyMenu(window_state.menu) };
+            window_state.menu = null_mut();
+            if owns_window_class {
+                // SAFETY: CreateWindowExW failed, so no window of the class is
+                // live and this constructor owns the registration.
+                let _ = unsafe { UnregisterClassW(class_name.as_ptr(), instance) };
             }
-            Ok(tray)
+            return Err(error);
         }
+        window_state.hwnd = hwnd;
+
+        let mut tray = Self {
+            state: window_state,
+            instance,
+            class_name,
+            owns_window_class,
+            _thread_bound: PhantomData,
+        };
+        if let Err(error) = tray.state.register_icon() {
+            drop(tray);
+            return Err(error);
+        }
+        Ok(tray)
     }
 
     fn update_state(&mut self, state: TrayState) -> anyhow::Result<()> {
@@ -285,32 +306,41 @@ impl WindowsTray {
 
 impl Drop for WindowsTray {
     fn drop(&mut self) {
-        // SAFETY: WindowsTray is !Send/!Sync and is dropped on its creation
-        // thread. Cleanup order removes the shell registration before
-        // destroying the callback window and its dependent native resources.
-        unsafe {
-            self.state.unregister_icon();
-            if !self.state.menu.is_null() {
-                let _ = DestroyMenu(self.state.menu);
-                self.state.menu = null_mut();
-            }
-            if !self.state.pending_menu.is_null() {
-                let _ = DestroyMenu(self.state.pending_menu);
-                self.state.pending_menu = null_mut();
-            }
-            if !self.state.hwnd.is_null() {
+        self.state.unregister_icon();
+        if !self.state.menu.is_null() {
+            // SAFETY: WindowsTray is thread-bound and uniquely owns this root
+            // menu; unregister_icon has detached the Shell identity and no
+            // TrackPopupMenuEx call can outlive the synchronous owner method.
+            let _ = unsafe { DestroyMenu(self.state.menu) };
+            self.state.menu = null_mut();
+        }
+        if !self.state.pending_menu.is_null() {
+            // SAFETY: pending_menu is never attached or tracked and is uniquely
+            // owned by WindowState.
+            let _ = unsafe { DestroyMenu(self.state.pending_menu) };
+            self.state.pending_menu = null_mut();
+        }
+        if !self.state.hwnd.is_null() {
+            // SAFETY: The callback HWND and boxed WindowState are both live on
+            // their owner thread. Clearing user data first prevents callbacks
+            // during DestroyWindow from observing a soon-to-be-dropped pointer.
+            unsafe {
                 SetWindowLongPtrW(self.state.hwnd, GWLP_USERDATA, 0);
                 let _ = DestroyWindow(self.state.hwnd);
-                self.state.hwnd = null_mut();
             }
-            if self.state.icon_owned && !self.state.icon.is_null() {
-                let _ = DestroyIcon(self.state.icon);
-                self.state.icon_owned = false;
-                self.state.icon = null_mut();
-            }
-            if self.owns_window_class {
-                let _ = UnregisterClassW(self.class_name.as_ptr(), self.instance);
-            }
+            self.state.hwnd = null_mut();
+        }
+        if self.state.icon_owned && !self.state.icon.is_null() {
+            // SAFETY: The Shell registration and callback window are gone;
+            // WindowState remains the unique owner of this HICON.
+            let _ = unsafe { DestroyIcon(self.state.icon) };
+            self.state.icon_owned = false;
+            self.state.icon = null_mut();
+        }
+        if self.owns_window_class {
+            // SAFETY: The owned callback window has been destroyed and the
+            // NUL-terminated class name/instance pair is the one we registered.
+            let _ = unsafe { UnregisterClassW(self.class_name.as_ptr(), self.instance) };
         }
     }
 }
@@ -333,7 +363,7 @@ struct WindowState {
 }
 
 impl WindowState {
-    unsafe fn register_icon(&mut self) -> anyhow::Result<()> {
+    fn register_icon(&mut self) -> anyhow::Result<()> {
         let mut data = self.notify_data(
             NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             &self.presentation.tooltip,
@@ -349,16 +379,14 @@ impl WindowState {
         // SAFETY: the icon was just registered using this HWND and numeric ID.
         if unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) } == 0 {
             let error = last_error("Shell_NotifyIconW(NIM_SETVERSION)");
-            unsafe {
-                self.unregister_icon();
-            }
+            self.unregister_icon();
             return Err(error);
         }
         self.shell_available = true;
         Ok(())
     }
 
-    unsafe fn unregister_icon(&mut self) {
+    fn unregister_icon(&mut self) {
         if !self.icon_registered || self.hwnd.is_null() {
             return;
         }
@@ -371,7 +399,7 @@ impl WindowState {
 
     fn sync_icon(&mut self) -> anyhow::Result<()> {
         if !self.icon_registered {
-            let result = unsafe { self.register_icon() };
+            let result = self.register_icon();
             return match result {
                 Ok(()) => {
                     self.send_command(TrayCommand::AvailabilityChanged(
@@ -477,7 +505,7 @@ impl WindowState {
     fn recover_after_explorer_restart(&mut self) {
         self.icon_registered = false;
         self.shell_available = false;
-        let result = unsafe { self.register_icon() };
+        let result = self.register_icon();
         match result {
             Ok(()) => {
                 tracing::info!("Windows tray icon restored after Explorer restart");
@@ -495,6 +523,14 @@ impl WindowState {
     }
 }
 
+/// Win32 callback for the thread-bound hidden notification-area window.
+///
+/// # Safety
+///
+/// Windows must invoke this function with the `WNDPROC` ABI and message-specific
+/// `wparam`/`lparam` values. While `GWLP_USERDATA` is non-zero it must be the live
+/// stable `Box<WindowState>` pointer installed during `WM_NCCREATE` by
+/// `WindowsTray::new` on the same UI thread.
 unsafe extern "system" fn tray_window_proc(
     hwnd: HWND,
     message: u32,
@@ -509,33 +545,51 @@ unsafe extern "system" fn tray_window_proc(
         if state_ptr.is_null() {
             return 0;
         }
+        // SAFETY: state_ptr came from the validated CREATESTRUCTW payload and
+        // the boxed state is still uniquely owned by the constructing tray.
         unsafe {
             (*state_ptr).hwnd = hwnd;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
         }
     }
 
+    // SAFETY: hwnd is the live window currently dispatching this callback;
+    // reading its integer-sized user-data slot does not retain a Rust borrow.
     let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState };
     if !state_ptr.is_null() {
         // Keep every Rust reference to WindowState scoped away from Win32 calls
         // that can run a nested message loop. WndProc may be re-entered while a
         // popup menu is being tracked.
+        // SAFETY: A non-null user-data value is the stable WindowState pointer
+        // installed above and remains live until it is cleared before teardown.
         let taskbar_created = unsafe { (*state_ptr).taskbar_created };
         if message == taskbar_created {
+            // SAFETY: This callback runs on the owner thread and no Rust
+            // reference to the state is held across this call.
             unsafe { (&mut *state_ptr).recover_after_explorer_restart() };
             return 0;
         }
 
         if message == TRAY_CALLBACK_MESSAGE {
+            // SAFETY: Same validated live state pointer; copying TrayIdentity
+            // does not create a reference that can cross a nested message loop.
             let identity = unsafe { (*state_ptr).identity };
             match classify_callback(identity, lparam) {
-                TrayCallbackAction::PrimaryActivation => unsafe {
-                    (&mut *state_ptr)
-                        .send_command(TrayCommand::Window(TrayWindowCommand::PrimaryActivation));
-                },
-                TrayCallbackAction::ContextMenu => unsafe {
-                    show_context_menu(state_ptr, wparam);
-                },
+                TrayCallbackAction::PrimaryActivation => {
+                    // SAFETY: The pointer is live and callback dispatch holds no
+                    // competing Rust reference. send_command is non-blocking.
+                    unsafe {
+                        (&mut *state_ptr).send_command(TrayCommand::Window(
+                            TrayWindowCommand::PrimaryActivation,
+                        ));
+                    }
+                }
+                TrayCallbackAction::ContextMenu => {
+                    // SAFETY: The pointer is the tray-owned state on its UI
+                    // thread. show_context_menu revalidates it after the nested
+                    // TrackPopupMenuEx loop before reacquiring a Rust reference.
+                    unsafe { show_context_menu(state_ptr, wparam) };
+                }
                 TrayCallbackAction::Ignore => {}
             }
             return 0;
@@ -543,24 +597,42 @@ unsafe extern "system" fn tray_window_proc(
 
         match message {
             WM_COMMAND => {
+                // SAFETY: The state pointer remains live and no reference is
+                // retained after the bounded, non-blocking command projection.
                 unsafe {
                     (&mut *state_ptr).send_menu_command((wparam as u32 & 0xffff) as u16);
                 }
                 return 0;
             }
-            WM_NCDESTROY => unsafe {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            },
+            WM_NCDESTROY => {
+                // SAFETY: hwnd is being destroyed on its owner thread. Clearing
+                // the slot prevents all later callbacks from dereferencing the
+                // WindowState pointer.
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+            }
             _ => {}
         }
     }
 
+    // SAFETY: Forwarding unhandled messages with the original arguments is the
+    // required WNDPROC contract; no Rust-owned pointer is passed to Windows.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+/// Shows the current popup menu without retaining a Rust borrow across Win32's
+/// nested message loop.
+///
+/// # Safety
+///
+/// `state_ptr` must point to the live, uniquely owned `WindowState` installed in
+/// the callback `HWND`, and this function must run on that window's owner thread.
+/// The pointer may be invalidated by nested dispatch, so it must be revalidated
+/// through `GWLP_USERDATA` before it is dereferenced after `TrackPopupMenuEx`.
 unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM) {
     // Capture the native handles, then end the Rust borrow before calling
     // TrackPopupMenuEx because it runs a nested Windows message loop.
+    // SAFETY: The caller guarantees state_ptr is live and uniquely accessible
+    // at entry. The reference ends before any nested-loop Win32 call.
     let (hwnd, menu, identity) = unsafe {
         let state = &mut *state_ptr;
         if state.menu_tracking {
@@ -570,12 +642,19 @@ unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM
         (state.hwnd, state.menu, state.identity)
     };
 
-    let point = unsafe { context_menu_point(hwnd, identity, packed_position) };
+    let point = context_menu_point(hwnd, identity, packed_position);
+    // SAFETY: This reads a process/system metric and has no pointer, ownership,
+    // or cleanup preconditions.
     let alignment = menu_alignment_flag(unsafe { GetSystemMetrics(SM_MENUDROPALIGNMENT) } != 0);
 
     // TPM_RETURNCMD | TPM_NONOTIFY keeps WM_COMMAND out of the nested loop.
     // The owner must be foreground or clicking outside will not dismiss the menu.
+    // SAFETY: hwnd is the live owner window captured before releasing the Rust
+    // reference; failure is benign and reported by the API return value.
     let _ = unsafe { SetForegroundWindow(hwnd) };
+    // SAFETY: menu and hwnd are live thread-owned handles. No Rust reference is
+    // held while TrackPopupMenuEx runs its nested message loop, and NONOTIFY
+    // prevents a menu command from being delivered through reentrant WM_COMMAND.
     let selected = unsafe {
         TrackPopupMenuEx(
             menu,
@@ -587,6 +666,8 @@ unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM
         )
     };
     // WM_NULL completes the documented notification-area menu-dismissal handoff.
+    // SAFETY: hwnd is the captured callback window; posting copies plain values
+    // and does not borrow state. Failure requires no cleanup.
     let _ = unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
 
     let mut focus_data = NOTIFYICONDATAW {
@@ -597,10 +678,14 @@ unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM
     identity.apply_to_notify_data(&mut focus_data);
     // Return keyboard focus to the notification area after either selection or
     // cancellation, as required for notification-icon shortcut menus.
+    // SAFETY: focus_data is fully initialized for the live captured HWND and
+    // numeric identity and remains borrowed only for this synchronous call.
     if unsafe { Shell_NotifyIconW(NIM_SETFOCUS, &focus_data) } == 0 {
         tracing::debug!("Windows notification area rejected NIM_SETFOCUS");
     }
 
+    // SAFETY: Reading the live HWND's user-data slot is the required validity
+    // check after nested dispatch and creates no Rust reference.
     if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState } != state_ptr {
         return;
     }
@@ -614,7 +699,7 @@ unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM
     }
 }
 
-unsafe fn context_menu_point(hwnd: HWND, identity: TrayIdentity, packed_position: WPARAM) -> POINT {
+fn context_menu_point(hwnd: HWND, identity: TrayIdentity, packed_position: WPARAM) -> POINT {
     let point = point_from_packed_position(packed_position);
     if point.x != -1 || point.y != -1 {
         return point;
@@ -640,7 +725,7 @@ unsafe fn context_menu_point(hwnd: HWND, identity: TrayIdentity, packed_position
     }
 }
 
-unsafe fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> anyhow::Result<bool> {
+fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> anyhow::Result<bool> {
     let class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(tray_window_proc),
@@ -650,6 +735,8 @@ unsafe fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> anyh
     };
     // SAFETY: class_name is NUL-terminated and the callback has the required ABI.
     if unsafe { RegisterClassExW(&class) } == 0 {
+        // SAFETY: GetLastError is thread-local and must be read immediately
+        // after the failed registration call on this same thread.
         let error = unsafe { GetLastError() };
         if error != ERROR_CLASS_ALREADY_EXISTS {
             return Err(anyhow!(
@@ -666,19 +753,25 @@ struct LoadedIcon {
     owned: bool,
 }
 
-unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
+fn load_small_icon() -> anyhow::Result<LoadedIcon> {
     static ICON_DATA: &[u8] = include_bytes!("../../../assets/icons/icon_256.png");
 
+    // SAFETY: GetDpiForSystem reads process DPI state and has no pointer or
+    // ownership preconditions.
     let dpi = unsafe { GetDpiForSystem() };
     let metric = |index| {
         let scaled = if dpi == 0 {
             0
         } else {
+            // SAFETY: index is one of the documented small-icon metrics and
+            // dpi came from GetDpiForSystem in this function.
             unsafe { GetSystemMetricsForDpi(index, dpi) }
         };
         if scaled > 0 {
             scaled
         } else {
+            // SAFETY: index is one of the documented system metric constants
+            // and this query has no ownership or pointer preconditions.
             unsafe { GetSystemMetrics(index) }
         }
     };
@@ -705,6 +798,9 @@ unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
         ..Default::default()
     };
     let mut dib_bits = null_mut();
+    // SAFETY: bitmap_info describes a top-down 32-bit DIB with an exact
+    // width*height*4 allocation. dib_bits is a valid out-pointer; the returned
+    // HBITMAP uniquely owns that allocation until DeleteObject below.
     let color_bitmap = unsafe {
         CreateDIBSection(
             null_mut(),
@@ -718,6 +814,8 @@ unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
     if color_bitmap.is_null() || dib_bits.is_null() {
         let error = last_error("CreateDIBSection(tray icon)");
         if !color_bitmap.is_null() {
+            // SAFETY: A non-null color_bitmap is the unique partial allocation
+            // returned by CreateDIBSection and has not escaped this function.
             unsafe {
                 let _ = DeleteObject(color_bitmap);
             }
@@ -725,6 +823,9 @@ unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
         return Err(error);
     }
 
+    // SAFETY: Successful CreateDIBSection returned a non-null allocation of
+    // exactly width*height*4 writable bytes, uniquely owned through
+    // color_bitmap. No other pointer accesses it while this slice is used.
     let target = unsafe {
         std::slice::from_raw_parts_mut(dib_bits.cast::<u8>(), (width * height * 4) as usize)
     };
@@ -732,10 +833,14 @@ unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
 
     let mask_stride = width.div_ceil(16) * 2;
     let mask_bits = vec![0u8; (mask_stride * height) as usize];
+    // SAFETY: mask_bits contains the documented 1-bpp scanline allocation and
+    // remains live for the synchronous copy performed by CreateBitmap.
     let mask_bitmap =
         unsafe { CreateBitmap(width as i32, height as i32, 1, 1, mask_bits.as_ptr().cast()) };
     if mask_bitmap.is_null() {
         let error = last_error("CreateBitmap(tray icon mask)");
+        // SAFETY: color_bitmap is still uniquely owned here and must be
+        // released when creation of its paired mask fails.
         unsafe {
             let _ = DeleteObject(color_bitmap);
         }
@@ -748,10 +853,15 @@ unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
         hbmColor: color_bitmap,
         ..Default::default()
     };
+    // SAFETY: Both HBITMAPs are live and uniquely owned for the duration of
+    // this call. CreateIconIndirect copies their bitmap data into a new HICON.
     let icon = unsafe { CreateIconIndirect(&icon_info) };
     let icon_error = icon
         .is_null()
         .then(|| last_error("CreateIconIndirect(tray icon)"));
+    // SAFETY: CreateIconIndirect does not transfer HBITMAP ownership. Both
+    // temporary handles remain unique and are released exactly once here,
+    // regardless of icon creation success.
     unsafe {
         let _ = DeleteObject(mask_bitmap);
         let _ = DeleteObject(color_bitmap);
