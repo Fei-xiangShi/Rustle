@@ -147,6 +147,7 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
+    verify_architecture_source_contracts(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
     verify_panic_boundary_contracts(root)?;
@@ -160,6 +161,7 @@ fn check(root: &Path) -> XtaskResult<()> {
 
 fn check_production(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
+    verify_architecture_source_contracts(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
     verify_panic_boundary_contracts(root)?;
@@ -392,12 +394,145 @@ fn release_panic_contract_violations(contents: &str) -> Vec<String> {
 
 fn check_native(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
+    verify_architecture_source_contracts(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
     verify_panic_boundary_contracts(root)?;
     check_workspace(root)?;
     clippy_workspace(root)?;
     test_workspace(root)
+}
+
+fn verify_architecture_source_contracts(root: &Path) -> XtaskResult<()> {
+    let source_root = root.join("src");
+    let mut source_paths = Vec::new();
+    collect_rust_source_paths(&source_root, &mut source_paths)?;
+    source_paths.sort();
+
+    let mut violations = Vec::new();
+    for path in source_paths {
+        let relative_path = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read_to_string(&path)?;
+        violations.extend(architecture_source_contract_violations(
+            &relative_path,
+            &contents,
+        ));
+    }
+
+    if violations.is_empty() {
+        println!("architecture source contracts: ok");
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "architecture source contract violations:\n{}",
+            violations.join("\n")
+        )))
+    }
+}
+
+fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<String> {
+    let mut forbidden = Vec::new();
+
+    if path.starts_with("src/features/lyrics/") || path == "src/features/media/lyrics.rs" {
+        forbidden.push((
+            "crate::ui",
+            "lyrics parsing/media must return domain models",
+        ));
+    }
+    if path.starts_with("src/audio/") || path == "src/audio.rs" {
+        forbidden.push(("crate::api", "audio must not depend on the NCM adapter"));
+        forbidden.push((
+            "crate::cache",
+            "audio must consume the application cache port",
+        ));
+    }
+    if path.starts_with("src/platform/tray/") || path == "src/platform/tray.rs" {
+        forbidden.push(("crate::app::", "native tray code must emit pure commands"));
+        forbidden.push((
+            "crate::i18n",
+            "native tray code must consume localized presentation",
+        ));
+        forbidden.push((
+            "crate::features",
+            "native tray code must use domain/application contracts",
+        ));
+    }
+    if path.starts_with("src/domain/") || path == "src/domain.rs" {
+        forbidden.extend([
+            ("iced::", "domain must be UI-framework free"),
+            ("tokio::", "domain must be runtime free"),
+            ("sqlx::", "domain must be persistence-adapter free"),
+            ("reqwest::", "domain must be transport-adapter free"),
+            ("rodio::", "domain must be audio-backend free"),
+            ("crate::application::", "domain must not depend outward"),
+            ("crate::platform", "domain must not depend outward"),
+            ("crate::api", "domain must not depend outward"),
+            ("crate::cache", "domain must not depend outward"),
+            ("crate::database", "domain must not depend outward"),
+            ("crate::ui", "domain must not depend outward"),
+            ("crate::app::", "domain must not depend outward"),
+        ]);
+    }
+    if path.starts_with("src/application/") || path == "src/application.rs" {
+        forbidden.extend([
+            ("iced::", "application contracts must be UI-framework free"),
+            (
+                "sqlx::",
+                "application contracts must not own storage adapters",
+            ),
+            (
+                "reqwest::",
+                "application contracts must not own network adapters",
+            ),
+            (
+                "rodio::",
+                "application contracts must not own audio backends",
+            ),
+            (
+                "crate::platform",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "crate::api",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "crate::cache",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "crate::database",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "crate::ui",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "crate::app::",
+                "application must not depend on the composition root",
+            ),
+        ]);
+    }
+
+    forbidden
+        .into_iter()
+        .flat_map(|(token, rationale)| {
+            contents
+                .lines()
+                .enumerate()
+                .filter(move |(_, line)| line.contains(token))
+                .map(move |(line_index, _)| {
+                    format!(
+                        "{path}:{} contains forbidden `{token}`: {rationale}",
+                        line_index + 1
+                    )
+                })
+        })
+        .collect()
 }
 
 fn check_workspace(root: &Path) -> XtaskResult<()> {
@@ -864,8 +999,9 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ffi_panic_boundary_violations, forbidden_packages_in_tree, inline_quoted_setting,
-        normalize_release_tag, observability_source_contract_violations, quoted_setting,
+        architecture_source_contract_violations, ffi_panic_boundary_violations,
+        forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag,
+        observability_source_contract_violations, quoted_setting,
         release_panic_contract_violations, source_contract_violations, tool_version,
     };
 
@@ -936,6 +1072,49 @@ mod tests {
             source_contract_violations(
                 "src/app/message.rs",
                 "SongResolveFailed(PlaybackContext, AppError),"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn architecture_contracts_reject_reverse_dependencies() {
+        assert!(
+            architecture_source_contract_violations(
+                "src/features/lyrics/parser.rs",
+                "use crate::ui::pages::LyricLine;",
+            )
+            .iter()
+            .any(|violation| violation.contains("crate::ui"))
+        );
+        assert!(
+            architecture_source_contract_violations(
+                "src/audio/streaming.rs",
+                "crate::cache::publish_or_reuse(); crate::api::NcmQualityLevel;",
+            )
+            .len()
+                == 2
+        );
+        assert!(
+            architecture_source_contract_violations(
+                "src/platform/tray/windows.rs",
+                "crate::i18n::t(); crate::app::Message::Noop;",
+            )
+            .len()
+                == 2
+        );
+        assert!(
+            architecture_source_contract_violations(
+                "src/domain/playback.rs",
+                "use iced::Theme; use crate::database::Database;",
+            )
+            .len()
+                == 2
+        );
+        assert!(
+            architecture_source_contract_violations(
+                "src/application/tray.rs",
+                "use crate::domain::playback::PlayMode;",
             )
             .is_empty()
         );

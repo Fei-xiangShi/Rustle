@@ -2,11 +2,13 @@
 
 mod api;
 mod app;
+pub mod application;
 mod audio;
 mod cache;
 mod database;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
+pub mod domain;
 mod download;
 pub mod error;
 mod features;

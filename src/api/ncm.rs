@@ -8,6 +8,8 @@ mod error;
 mod mapper;
 mod models;
 
+pub(crate) use models::quality_api_level;
+
 pub use client::NcmClient;
 pub use error::{NcmError, NcmResult};
 pub use models::{

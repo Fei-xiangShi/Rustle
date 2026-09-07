@@ -349,7 +349,7 @@ pub enum Message {
     /// Font system initialized asynchronously (for lyrics text shaping)
     LyricsFontSystemReady(crate::features::lyrics::engine::SharedFontSystem),
     /// Lyrics loaded from online (song_id, lyrics_lines)
-    LyricsLoaded(i64, Vec<crate::ui::pages::LyricLine>),
+    LyricsLoaded(i64, Vec<crate::application::lyrics::LyricLine>),
     /// Lyrics loading failed
     LyricsLoadFailed(i64, AppError),
     /// Start online lyrics fetch for display loading (song_id, ncm_id)
@@ -359,7 +359,7 @@ pub enum Message {
     /// Background lyrics cache warmup completed
     LyricsWarmupFinished(i64, Result<(), AppError>),
     /// Local/cached lyrics loaded asynchronously (song_id, lyrics_lines)
-    LocalLyricsReady(i64, Vec<crate::ui::pages::LyricLine>),
+    LocalLyricsReady(i64, Vec<crate::application::lyrics::LyricLine>),
     /// Engine lines pre-computed asynchronously (song_id, engine_lines)
     LyricsEngineLinesReady(
         i64,

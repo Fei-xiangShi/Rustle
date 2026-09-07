@@ -472,6 +472,7 @@ async fn download_audio_streaming(
                 url,
                 cache_path,
                 cache_key,
+                crate::cache::audio_cache_store(),
                 quality.bitrate,
                 StreamingIdentity::Preload(identity.clone()),
                 None,

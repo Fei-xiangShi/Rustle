@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::domain::playback::PlayMode;
+
 use super::KeyBindings;
 
 /// Close behavior when clicking the X button
@@ -423,54 +425,6 @@ impl NetworkSettings {
                     scheme, auth, self.proxy_host, self.proxy_port
                 ))
             }
-        }
-    }
-}
-
-/// Play mode for playback
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlayMode {
-    /// Play in order, stop at end
-    #[default]
-    Sequential,
-    /// Play in order, loop back to start
-    LoopAll,
-    /// Repeat current song
-    LoopOne,
-    /// Random order
-    Shuffle,
-}
-
-impl std::fmt::Display for PlayMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlayMode::Sequential => write!(f, "顺序播放"),
-            PlayMode::LoopAll => write!(f, "列表循环"),
-            PlayMode::LoopOne => write!(f, "单曲循环"),
-            PlayMode::Shuffle => write!(f, "随机播放"),
-        }
-    }
-}
-
-impl PlayMode {
-    /// Get the next play mode in cycle order
-    pub fn next(self) -> Self {
-        match self {
-            PlayMode::Sequential => PlayMode::LoopAll,
-            PlayMode::LoopAll => PlayMode::LoopOne,
-            PlayMode::LoopOne => PlayMode::Shuffle,
-            PlayMode::Shuffle => PlayMode::Sequential,
-        }
-    }
-
-    /// Get display name for the mode
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            PlayMode::Sequential => "顺序播放",
-            PlayMode::LoopAll => "列表循环",
-            PlayMode::LoopOne => "单曲循环",
-            PlayMode::Shuffle => "随机播放",
         }
     }
 }

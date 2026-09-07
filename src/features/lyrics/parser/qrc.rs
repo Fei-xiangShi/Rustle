@@ -4,7 +4,7 @@
 //! 格式: [start_time,duration]word(word_start,word_duration)word(word_start,word_duration)...
 //! 与 YRC 不同，QRC 的单词在时间戳之前
 
-use super::types::{LyricLineOwned, LyricWordOwned, process_lyrics};
+use crate::domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
 
 /// Parse line timestamp: [start_time,duration]
 fn parse_line_time(src: &str) -> Option<(usize, u64, u64)> {

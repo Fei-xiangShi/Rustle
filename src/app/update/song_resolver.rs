@@ -119,7 +119,11 @@ pub(crate) async fn resolve_audio_source(
     })?;
 
     let requested_level = client.current_quality_level();
-    let requested_stem = format!("{}_{}", ncm_id, requested_level.api_level());
+    let requested_stem = format!(
+        "{}_{}",
+        ncm_id,
+        crate::api::quality_api_level(requested_level)
+    );
     let requested_candidate = crate::utils::find_cached_audio(&song_cache_dir, &requested_stem);
     if let Some(cached_path) = requested_candidate.as_ref()
         && crate::cache::is_audio_cache_complete(cached_path, ncm_id, requested_level, None)
@@ -135,7 +139,7 @@ pub(crate) async fn resolve_audio_source(
         .await
         .map_err(AppError::from)?;
     let quality = ResolvedAudioQuality::from(&url);
-    let actual_stem = format!("{}_{}", ncm_id, url.level.api_level());
+    let actual_stem = format!("{}_{}", ncm_id, crate::api::quality_api_level(url.level));
     if actual_stem == requested_stem {
         if let Some(cached_path) = requested_candidate {
             if crate::cache::is_audio_cache_complete(&cached_path, ncm_id, url.level, url.size) {
@@ -286,6 +290,7 @@ pub async fn resolve_song(
                 url,
                 cache_path,
                 cache_key,
+                crate::cache::audio_cache_store(),
                 quality.bitrate,
                 identity,
                 Some(event_tx),

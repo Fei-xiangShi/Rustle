@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use crate::application::ports::cache::{AudioCacheStore, PublishOutcome};
 use crate::audio::identity::{PlaybackContext, PreloadIdentity};
 use crate::audio::player::{PlaybackError, PlaybackResult};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -272,7 +273,7 @@ pub enum StreamingIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioCacheKey {
     pub song_id: u64,
-    pub actual_quality: crate::api::NcmQualityLevel,
+    pub actual_quality: crate::domain::audio::QualityLevel,
 }
 
 #[derive(Debug, Clone)]
@@ -1566,6 +1567,7 @@ pub fn start_buffer_download(
     url: String,
     cache_path: PathBuf,
     cache_key: AudioCacheKey,
+    cache_store: Arc<dyn AudioCacheStore>,
     bitrate_bps: Option<u32>,
     identity: StreamingIdentity,
     event_tx: Option<tokio::sync::mpsc::Sender<StreamingEvent>>,
@@ -1753,7 +1755,7 @@ pub fn start_buffer_download(
         let total_size = probe_range.total;
         buffer_clone.set_total_size(total_size);
 
-        let temp_path = crate::cache::unique_temp_path(&cache_path);
+        let temp_path = cache_store.unique_temp_path(&cache_path);
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1782,7 +1784,7 @@ pub fn start_buffer_download(
             let error = PlaybackError::IoError(format!("cache write failed: {error}"));
             fail(error.clone(), &buffer_clone);
             drop(file);
-            crate::cache::cleanup_temp_file(&temp_path);
+            cache_store.cleanup_temp_file(&temp_path);
             if let Some(tx) = &event_tx {
                 let _ = tx
                     .send(StreamingEvent::new(
@@ -1818,12 +1820,12 @@ pub fn start_buffer_download(
         'download: loop {
             if buffer_clone.is_cancelled() {
                 drop(file);
-                crate::cache::cleanup_temp_file(&temp_path);
+                cache_store.cleanup_temp_file(&temp_path);
                 return;
             }
             if buffer_clone.has_error() {
                 drop(file);
-                crate::cache::cleanup_temp_file(&temp_path);
+                cache_store.cleanup_temp_file(&temp_path);
                 return;
             }
 
@@ -1891,7 +1893,7 @@ pub fn start_buffer_download(
                     let error = PlaybackError::IoError(format!("cache read failed: {error}"));
                     fail(error.clone(), &buffer_clone);
                     drop(file);
-                    crate::cache::cleanup_temp_file(&temp_path);
+                    cache_store.cleanup_temp_file(&temp_path);
                     if let Some(tx) = &event_tx {
                         let _ = tx
                             .send(StreamingEvent::new(
@@ -1915,13 +1917,13 @@ pub fn start_buffer_download(
                     RangeFetchResult::Cancelled => {
                         buffer_clone.cancel_coordinator();
                         drop(file);
-                        crate::cache::cleanup_temp_file(&temp_path);
+                        cache_store.cleanup_temp_file(&temp_path);
                         return;
                     }
                     RangeFetchResult::Fatal(error) => {
                         fail(error.clone(), &buffer_clone);
                         drop(file);
-                        crate::cache::cleanup_temp_file(&temp_path);
+                        cache_store.cleanup_temp_file(&temp_path);
                         if let Some(tx) = &event_tx {
                             let _ = tx
                                 .send(StreamingEvent::new(
@@ -1943,7 +1945,7 @@ pub fn start_buffer_download(
                     let error = PlaybackError::IoError(format!("cache write failed: {error}"));
                     fail(error.clone(), &buffer_clone);
                     drop(file);
-                    crate::cache::cleanup_temp_file(&temp_path);
+                    cache_store.cleanup_temp_file(&temp_path);
                     if let Some(tx) = &event_tx {
                         let _ = tx
                             .send(StreamingEvent::new(
@@ -1962,7 +1964,7 @@ pub fn start_buffer_download(
                 while !buffer_clone.append_window(start, &body, active_epoch) {
                     if buffer_clone.is_cancelled() {
                         drop(file);
-                        crate::cache::cleanup_temp_file(&temp_path);
+                        cache_store.cleanup_temp_file(&temp_path);
                         return;
                     }
                     if buffer_clone.window_epoch() != active_epoch {
@@ -2010,7 +2012,7 @@ pub fn start_buffer_download(
             let error = PlaybackError::IoError(format!("cache flush failed: {error}"));
             fail(error.clone(), &buffer_clone);
             drop(file);
-            crate::cache::cleanup_temp_file(&temp_path);
+            cache_store.cleanup_temp_file(&temp_path);
             if let Some(tx) = &event_tx {
                 let _ = tx
                     .send(StreamingEvent::new(
@@ -2025,7 +2027,7 @@ pub fn start_buffer_download(
             let error = PlaybackError::IoError(format!("cache sync failed: {error}"));
             fail(error.clone(), &buffer_clone);
             drop(file);
-            crate::cache::cleanup_temp_file(&temp_path);
+            cache_store.cleanup_temp_file(&temp_path);
             if let Some(tx) = &event_tx {
                 let _ = tx
                     .send(StreamingEvent::new(
@@ -2049,7 +2051,7 @@ pub fn start_buffer_download(
                             "unknown or damaged audio prefix".to_string(),
                         );
                         drop(reader);
-                        crate::cache::cleanup_temp_file(&temp_path);
+                        cache_store.cleanup_temp_file(&temp_path);
                         if let Some(tx) = &event_tx {
                             let _ = tx
                                 .send(StreamingEvent::new(
@@ -2067,7 +2069,7 @@ pub fn start_buffer_download(
                 let error = PlaybackError::IoError(format!(
                     "could not open cache for format detection: {error}"
                 ));
-                crate::cache::cleanup_temp_file(&temp_path);
+                cache_store.cleanup_temp_file(&temp_path);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
@@ -2098,10 +2100,10 @@ pub fn start_buffer_download(
                 .await;
         }
 
-        match crate::cache::publish_or_reuse(&temp_path, &final_path, Some(total_size)) {
+        match cache_store.publish_or_reuse(&temp_path, &final_path, Some(total_size)) {
             Err(error) => {
                 let message = format!("failed to finalize cache {:?}: {}", final_path, error);
-                crate::cache::cleanup_temp_file(&temp_path);
+                cache_store.cleanup_temp_file(&temp_path);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
@@ -2111,7 +2113,7 @@ pub fn start_buffer_download(
                         .await;
                 }
             }
-            Ok(publish_result) => match crate::cache::write_audio_manifest(
+            Ok(publish_result) => match cache_store.write_audio_manifest(
                 &final_path,
                 cache_key.song_id,
                 cache_key.actual_quality,
@@ -2124,8 +2126,8 @@ pub fn start_buffer_download(
                         final_path, error
                     );
                     tracing::warn!(?error, ?final_path, "Failed to write audio cache manifest");
-                    if publish_result == crate::cache::PublishResult::Published {
-                        crate::cache::remove_audio_cache(&final_path);
+                    if publish_result == PublishOutcome::Published {
+                        cache_store.remove_audio_cache(&final_path);
                     }
                     if let Some(tx) = &event_tx {
                         let _ = tx
@@ -2205,6 +2207,67 @@ pub async fn wait_for_buffer_playable(buffer: &SharedBuffer, timeout_secs: u64) 
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct TestCacheStore;
+
+    impl crate::application::ports::cache::CachePublisher for TestCacheStore {
+        fn unique_temp_path(&self, final_path: &std::path::Path) -> PathBuf {
+            static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let name = final_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("audio");
+            final_path.with_file_name(format!(
+                ".{name}.test-{}-{sequence}.part",
+                std::process::id()
+            ))
+        }
+
+        fn cleanup_temp_file(&self, path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+        }
+
+        fn publish_or_reuse(
+            &self,
+            temp_path: &std::path::Path,
+            final_path: &std::path::Path,
+            expected_size: Option<u64>,
+        ) -> std::io::Result<PublishOutcome> {
+            if let Some(expected_size) = expected_size
+                && std::fs::metadata(temp_path)?.len() != expected_size
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test cache size mismatch",
+                ));
+            }
+            std::fs::rename(temp_path, final_path)?;
+            Ok(PublishOutcome::Published)
+        }
+    }
+
+    impl AudioCacheStore for TestCacheStore {
+        fn write_audio_manifest(
+            &self,
+            _path: &std::path::Path,
+            _song_id: u64,
+            _actual_quality: crate::domain::audio::QualityLevel,
+            _size: u64,
+            _format: &str,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_audio_cache(&self, path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn test_cache_store() -> Arc<dyn AudioCacheStore> {
+        Arc::new(TestCacheStore)
+    }
+
     #[test]
     fn range_window_refills_until_the_policy_high_water_mark() {
         let policy = StreamingBufferPolicy::from_bitrate(Some(9_200_000));
@@ -2274,7 +2337,7 @@ mod tests {
     fn audio_downloads_are_deduplicated_by_song_and_actual_quality() {
         let key = AudioCacheKey {
             song_id: 991,
-            actual_quality: crate::api::NcmQualityLevel::Lossless,
+            actual_quality: crate::domain::audio::QualityLevel::Lossless,
         };
         let existing = SharedBuffer::new(100);
         existing.set_coordinator_active_for_test(true);
@@ -2288,6 +2351,7 @@ mod tests {
             "http://127.0.0.1:1/audio".to_string(),
             std::env::temp_dir().join("rustle-dedupe"),
             key,
+            test_cache_store(),
             Some(320_000),
             StreamingIdentity::Preload(controller.reserve_preload_identity().unwrap()),
             None,
@@ -2359,7 +2423,7 @@ mod tests {
             buffer: buffer.clone(),
             key: AudioCacheKey {
                 song_id: 1,
-                actual_quality: crate::api::NcmQualityLevel::Standard,
+                actual_quality: crate::domain::audio::QualityLevel::Standard,
             },
         });
 
@@ -2664,7 +2728,7 @@ mod tests {
             buffer: buffer.clone(),
             key: AudioCacheKey {
                 song_id: 1,
-                actual_quality: crate::api::NcmQualityLevel::Standard,
+                actual_quality: crate::domain::audio::QualityLevel::Standard,
             },
         });
         assert!(!buffer.inner.coordinator_active.load(Ordering::Acquire));
@@ -2796,8 +2860,9 @@ mod tests {
             cache_dir.join("range-cache"),
             AudioCacheKey {
                 song_id: unique as u64,
-                actual_quality: crate::api::NcmQualityLevel::Standard,
+                actual_quality: crate::domain::audio::QualityLevel::Standard,
             },
+            test_cache_store(),
             Some(320_000),
             StreamingIdentity::Playback(context),
             None,

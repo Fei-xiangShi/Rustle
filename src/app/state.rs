@@ -2350,7 +2350,7 @@ pub struct LyricsState {
     pub displayed_song_id: Option<i64>,
     /// Song currently being loaded for display.
     pub pending_song_id: Option<i64>,
-    pub lines: Vec<crate::ui::pages::LyricLine>,
+    pub lines: Vec<crate::application::lyrics::LyricLine>,
     pub current_line_idx: Option<usize>,
     pub last_update: Option<Instant>,
 

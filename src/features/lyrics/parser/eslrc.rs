@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 use super::lrc;
-use super::types::{LyricLineOwned, LyricWordOwned, process_lyrics};
+use crate::domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
 
 /// Parse a single ESLrc line
 fn parse_line(src: &str) -> Option<LyricLineOwned> {

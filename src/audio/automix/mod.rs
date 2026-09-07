@@ -10,8 +10,10 @@ use std::fs;
 use std::hash::Hasher;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::application::ports::cache::CachePublisher;
 use rodio::Source;
 use serde::{Deserialize, Serialize};
 
@@ -152,10 +154,21 @@ pub fn content_identity(path: &Path, fallback: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnalysisCache {
     root: PathBuf,
     max_entries: usize,
+    publisher: Arc<dyn CachePublisher>,
+}
+
+impl std::fmt::Debug for AnalysisCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnalysisCache")
+            .field("root", &self.root)
+            .field("max_entries", &self.max_entries)
+            .finish_non_exhaustive()
+    }
 }
 
 struct CacheClaim(PathBuf);
@@ -167,15 +180,16 @@ impl Drop for CacheClaim {
 }
 
 impl AnalysisCache {
-    pub fn new(root: impl Into<PathBuf>, max_entries: usize) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        max_entries: usize,
+        publisher: Arc<dyn CachePublisher>,
+    ) -> Self {
         Self {
             root: root.into(),
             max_entries: max_entries.max(1),
+            publisher,
         }
-    }
-
-    pub fn app_default() -> Self {
-        Self::new(crate::utils::automix_cache_dir(), 512)
     }
 
     fn path_for(&self, content_id: &str, config: AnalysisConfig) -> PathBuf {
@@ -247,7 +261,7 @@ impl AnalysisCache {
             }
         }
 
-        let temp = crate::cache::unique_temp_path(&path);
+        let temp = self.publisher.unique_temp_path(&path);
         let bytes = serde_json::to_vec(analysis)
             .map_err(|error| format!("serialize Automix analysis: {error}"))?;
         let write_result = (|| {
@@ -261,12 +275,13 @@ impl AnalysisCache {
             file.sync_all()
                 .map_err(|error| format!("sync Automix cache {:?}: {error}", temp))?;
             drop(file);
-            crate::cache::publish_or_reuse(&temp, &path, None)
+            self.publisher
+                .publish_or_reuse(&temp, &path, None)
                 .map_err(|error| format!("publish Automix cache {:?}: {error}", path))?;
             Ok::<(), String>(())
         })();
         if write_result.is_err() {
-            crate::cache::cleanup_temp_file(&temp);
+            self.publisher.cleanup_temp_file(&temp);
         }
         write_result?;
         self.prune()?;
@@ -1221,6 +1236,57 @@ pub fn automation_for_transition(
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct TestPublisher;
+
+    impl CachePublisher for TestPublisher {
+        fn unique_temp_path(&self, final_path: &Path) -> PathBuf {
+            static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = final_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("automix");
+            final_path.with_file_name(format!(
+                ".{name}.test-{}-{sequence}.part",
+                std::process::id()
+            ))
+        }
+
+        fn cleanup_temp_file(&self, path: &Path) {
+            let _ = fs::remove_file(path);
+        }
+
+        fn publish_or_reuse(
+            &self,
+            temp_path: &Path,
+            final_path: &Path,
+            expected_size: Option<u64>,
+        ) -> std::io::Result<crate::application::ports::cache::PublishOutcome> {
+            let temp_size = fs::metadata(temp_path)?.len();
+            if let Some(expected_size) = expected_size
+                && expected_size != temp_size
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test publication size mismatch",
+                ));
+            }
+            if fs::metadata(final_path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == temp_size)
+            {
+                self.cleanup_temp_file(temp_path);
+                return Ok(crate::application::ports::cache::PublishOutcome::Reused);
+            }
+            fs::rename(temp_path, final_path)?;
+            Ok(crate::application::ports::cache::PublishOutcome::Published)
+        }
+    }
+
+    fn test_publisher() -> Arc<dyn CachePublisher> {
+        Arc::new(TestPublisher)
+    }
+
     fn fallback_analysis(content_id: impl Into<String>, duration: Duration) -> TrackAnalysis {
         let exit = duration.saturating_sub(Duration::from_secs(5));
         TrackAnalysis {
@@ -1267,7 +1333,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let cache = AnalysisCache::new(&root, 2);
+        let cache = AnalysisCache::new(&root, 2, test_publisher());
         let config = AnalysisConfig::default();
         let analysis = fallback_analysis("song", Duration::from_secs(30));
         cache.store(&analysis, config).unwrap();
@@ -1300,7 +1366,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let cache = AnalysisCache::new(&root, 2);
+        let cache = AnalysisCache::new(&root, 2, test_publisher());
         let config = AnalysisConfig::default();
         let analysis = fallback_analysis("song", Duration::from_secs(30));
         fs::create_dir_all(&root).unwrap();

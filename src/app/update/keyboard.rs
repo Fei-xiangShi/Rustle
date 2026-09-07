@@ -41,23 +41,26 @@ impl App {
                 }
 
                 // Otherwise, check for keybinding actions
-                if let Some(action) = self
+                if let Some(action) = crate::platform::keybindings::find_global_action(
+                    &self.core.settings.keybindings,
+                    key,
+                    modifiers,
+                ) && self
                     .core
-                    .settings
-                    .keybindings
-                    .find_global_action(key, modifiers)
-                    && self
-                        .core
-                        .global_hotkeys
-                        .as_ref()
-                        .is_some_and(|service| service.is_registered(action))
+                    .global_hotkeys
+                    .as_ref()
+                    .is_some_and(|service| service.is_registered(action))
                 {
                     // The native global event owns this press. Skipping the local
                     // path prevents one focused-window press from firing twice.
                     return Some(Task::none());
                 }
 
-                if let Some(action) = self.core.settings.keybindings.find_action(key, modifiers) {
+                if let Some(action) = crate::platform::keybindings::find_action(
+                    &self.core.settings.keybindings,
+                    key,
+                    modifiers,
+                ) {
                     return Some(self.update(Message::ExecuteAction(action)));
                 }
                 Some(Task::none())

@@ -1,8 +1,7 @@
 //! Native Windows notification-area implementation.
 
-use super::{TrayAvailability, TrayCommand, TrayHandle, TrayState, TrayWindowCommand};
-use crate::features::PlayMode;
-use crate::i18n::{Key, Language, t};
+use super::{TrayAvailability, TrayCommand, TrayHandle, TrayPresentation, TrayWindowCommand};
+use crate::domain::playback::PlayMode;
 use anyhow::{Context, anyhow};
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -91,19 +90,19 @@ thread_local! {
 }
 
 pub fn start_windows_tray(
-    language: Language,
+    presentation: TrayPresentation,
     command_capacity: usize,
 ) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
-    start_windows_tray_with_identity(language, command_capacity, default_tray_identity())
+    start_windows_tray_with_identity(presentation, command_capacity, default_tray_identity())
 }
 
 fn start_windows_tray_with_identity(
-    language: Language,
+    presentation: TrayPresentation,
     command_capacity: usize,
     identity: TrayIdentity,
 ) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
-    let tray = WindowsTray::new(command_tx, TrayState::new(language), identity)?;
+    let tray = WindowsTray::new(command_tx, presentation, identity)?;
 
     WINDOWS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -117,25 +116,13 @@ fn start_windows_tray_with_identity(
     Ok((TrayHandle { _private: () }, command_rx))
 }
 
-pub fn update_state(state: TrayState) -> anyhow::Result<()> {
+pub fn update_state(presentation: TrayPresentation) -> anyhow::Result<()> {
     WINDOWS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
         let tray = slot
             .as_mut()
             .ok_or_else(|| anyhow!("Windows system tray is not initialized"))?;
-        tray.update_state(state)
-    })
-}
-
-pub fn set_language(language: Language) -> anyhow::Result<()> {
-    WINDOWS_TRAY.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let tray = slot
-            .as_mut()
-            .ok_or_else(|| anyhow!("Windows system tray is not initialized"))?;
-        let mut state = tray.state.state.clone();
-        state.language = language;
-        tray.update_state(state)
+        tray.update_state(presentation)
     })
 }
 
@@ -165,7 +152,7 @@ struct WindowsTray {
 impl WindowsTray {
     fn new(
         command_tx: mpsc::Sender<TrayCommand>,
-        state: TrayState,
+        presentation: TrayPresentation,
         identity: TrayIdentity,
     ) -> anyhow::Result<Self> {
         // SAFETY: Passing null requests the module containing the current
@@ -203,7 +190,6 @@ impl WindowsTray {
                 return Err(error);
             }
         };
-        let presentation = TrayPresentation::from_state(&state);
         let menu = match build_menu(&presentation) {
             Ok(menu) => menu,
             Err(error) => {
@@ -234,7 +220,6 @@ impl WindowsTray {
             command_tx,
             command_overflow_warned: false,
             identity,
-            state,
             presentation,
         });
 
@@ -294,11 +279,9 @@ impl WindowsTray {
         Ok(tray)
     }
 
-    fn update_state(&mut self, state: TrayState) -> anyhow::Result<()> {
-        let presentation = TrayPresentation::from_state(&state);
+    fn update_state(&mut self, presentation: TrayPresentation) -> anyhow::Result<()> {
         let new_menu = build_menu(&presentation)?;
         self.state.install_menu(new_menu);
-        self.state.state = state;
         self.state.presentation = presentation;
         self.state.sync_icon()
     }
@@ -358,7 +341,6 @@ struct WindowState {
     command_tx: mpsc::Sender<TrayCommand>,
     command_overflow_warned: bool,
     identity: TrayIdentity,
-    state: TrayState,
     presentation: TrayPresentation,
 }
 
@@ -1058,71 +1040,6 @@ fn append_text(menu: HMENU, flags: u32, id: usize, label: &str) -> anyhow::Resul
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrayPresentation {
-    now_playing: String,
-    tooltip: String,
-    play_pause: &'static str,
-    previous: &'static str,
-    next: &'static str,
-    favorite: &'static str,
-    favorite_enabled: bool,
-    play_mode_label: &'static str,
-    sequential: &'static str,
-    loop_all: &'static str,
-    loop_one: &'static str,
-    shuffle: &'static str,
-    toggle_window: &'static str,
-    quit: &'static str,
-    play_mode: PlayMode,
-}
-
-impl TrayPresentation {
-    fn from_state(state: &TrayState) -> Self {
-        let language = state.language;
-        let song = now_playing_text(state, t(language, Key::TrayNotPlaying));
-        Self {
-            now_playing: song.clone(),
-            tooltip: format!("Rustle — {song}"),
-            play_pause: t(
-                language,
-                if state.is_playing {
-                    Key::TrayPause
-                } else {
-                    Key::TrayPlay
-                },
-            ),
-            previous: t(language, Key::TrayPrevious),
-            next: t(language, Key::TrayNext),
-            favorite: t(
-                language,
-                if state.is_favorited && state.ncm_song_id.is_some() {
-                    Key::TrayUnfavorite
-                } else {
-                    Key::TrayFavorite
-                },
-            ),
-            favorite_enabled: state.ncm_song_id.is_some(),
-            play_mode_label: t(language, Key::TrayPlayMode),
-            sequential: t(language, Key::TraySequential),
-            loop_all: t(language, Key::TrayLoopAll),
-            loop_one: t(language, Key::TrayLoopOne),
-            shuffle: t(language, Key::TrayShuffle),
-            toggle_window: t(language, Key::TrayToggleWindow),
-            quit: t(language, Key::TrayQuit),
-            play_mode: state.play_mode,
-        }
-    }
-}
-
-fn now_playing_text(state: &TrayState, fallback: &str) -> String {
-    match (&state.title, &state.artist) {
-        (Some(title), Some(artist)) if !artist.is_empty() => format!("♪ {title} — {artist}"),
-        (Some(title), _) => format!("♪ {title}"),
-        _ => fallback.to_string(),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayCallbackAction {
     PrimaryActivation,
@@ -1207,35 +1124,47 @@ fn last_error(operation: &'static str) -> anyhow::Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn presentation_localizes_and_projects_dynamic_state() {
-        let state = TrayState {
-            is_playing: true,
-            title: Some("Song".into()),
-            artist: Some("Artist".into()),
-            play_mode: PlayMode::LoopOne,
-            ncm_song_id: Some(42),
-            is_favorited: true,
-            language: Language::English,
-        };
-        let english = TrayPresentation::from_state(&state);
-        assert_eq!(english.now_playing, "♪ Song — Artist");
-        assert_eq!(english.play_pause, "Pause");
-        assert_eq!(english.favorite, "Remove from Favorites");
-        assert!(english.favorite_enabled);
-        assert_eq!(english.play_mode, PlayMode::LoopOne);
+    fn test_presentation() -> TrayPresentation {
+        TrayPresentation {
+            is_playing: false,
+            now_playing: "Not playing".to_string(),
+            tooltip: "Rustle — Not playing".to_string(),
+            play_pause: "Play",
+            previous: "Previous",
+            next: "Next",
+            favorite: "Add to Favorites",
+            favorite_enabled: false,
+            is_favorited: false,
+            play_mode_label: "Play Mode",
+            sequential: "Sequential",
+            loop_all: "Loop All",
+            loop_one: "Loop One",
+            shuffle: "Shuffle",
+            toggle_window: "Show/Hide Window",
+            quit: "Quit",
+            play_mode: PlayMode::Sequential,
+        }
+    }
 
-        let chinese = TrayPresentation::from_state(&TrayState {
-            language: Language::Chinese,
-            ..state
-        });
-        assert_eq!(chinese.play_pause, "暂停");
-        assert_eq!(chinese.favorite, "取消收藏");
+    #[test]
+    fn backend_uses_the_supplied_presentation_verbatim() {
+        let mut presentation = test_presentation();
+        presentation.now_playing = "♪ Song — Artist".to_string();
+        presentation.play_pause = "Pause";
+        presentation.favorite = "Remove from Favorites";
+        presentation.favorite_enabled = true;
+        presentation.play_mode = PlayMode::LoopOne;
+
+        assert_eq!(presentation.now_playing, "♪ Song — Artist");
+        assert_eq!(presentation.play_pause, "Pause");
+        assert_eq!(presentation.favorite, "Remove from Favorites");
+        assert!(presentation.favorite_enabled);
+        assert_eq!(presentation.play_mode, PlayMode::LoopOne);
     }
 
     #[test]
     fn favorite_is_visible_but_disabled_without_ncm_identity() {
-        let presentation = TrayPresentation::from_state(&TrayState::default());
+        let presentation = test_presentation();
         assert_eq!(presentation.favorite, "Add to Favorites");
         assert!(!presentation.favorite_enabled);
     }
@@ -1337,17 +1266,18 @@ mod tests {
     }
 
     fn run_native_shell_smoke(identity: TrayIdentity, title: &str) {
-        let (_handle, _commands) = start_windows_tray_with_identity(Language::English, 4, identity)
-            .expect("register tray icon");
+        let (_handle, _commands) =
+            start_windows_tray_with_identity(test_presentation(), 4, identity)
+                .expect("register tray icon");
         assert!(is_available(), "registered tray must be reported available");
-        update_state(TrayState {
+        update_state(TrayPresentation {
             is_playing: true,
-            title: Some(format!("Rustle Tray Smoke Test — {title}")),
-            artist: Some("Rustle".into()),
+            now_playing: format!("Rustle Tray Smoke Test — {title}"),
+            tooltip: format!("Rustle — Rustle Tray Smoke Test — {title}"),
             play_mode: PlayMode::Shuffle,
-            ncm_song_id: Some(1),
             is_favorited: true,
-            language: Language::English,
+            favorite_enabled: true,
+            ..test_presentation()
         })
         .expect("update registered tray icon");
         assert!(is_available(), "updated tray must remain available");

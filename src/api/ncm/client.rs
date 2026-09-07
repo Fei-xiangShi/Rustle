@@ -467,7 +467,7 @@ impl NcmClient {
         let query = self
             .query()
             .param("id", &id_list)
-            .param("level", level.api_level());
+            .param("level", super::models::quality_api_level(level));
         let response = self.client.song_url_v1(&query).await?;
         mapper::track_urls(&response.body, level)
     }
@@ -536,7 +536,7 @@ impl NcmClient {
                         NcmError::protocol(format!(
                             "official URL response omitted song {} for quality preference {}",
                             song_id,
-                            requested.api_level()
+                            super::models::quality_api_level(requested)
                         ))
                     })
             })
@@ -591,7 +591,7 @@ impl NcmClient {
             .ok_or_else(|| {
                 NcmError::protocol(format!(
                     "official URL response omitted song {song_id} for quality preference {}",
-                    requested.api_level()
+                    super::models::quality_api_level(requested)
                 ))
             })
     }

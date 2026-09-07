@@ -251,7 +251,7 @@ fn quality_options_from_object(value: &Value) -> Vec<SongQualityOption> {
     let mut options = fields
         .into_iter()
         .filter_map(|field| {
-            let level = NcmQualityLevel::from_api_field(field)?;
+            let level = super::models::quality_from_api_field(field)?;
             value
                 .get(field)
                 .and_then(|node| quality_option_from_value(level, node))
@@ -399,7 +399,7 @@ pub fn track_urls(value: &Value, requested_level: NcmQualityLevel) -> Result<Vec
             let level = item
                 .get("level")
                 .and_then(Value::as_str)
-                .and_then(NcmQualityLevel::from_api_level)?;
+                .and_then(super::models::quality_from_api_level)?;
             (!url.is_empty()).then(|| TrackUrl {
                 id,
                 url,

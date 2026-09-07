@@ -1307,8 +1307,8 @@ fn shortcut_table(
             shortcut_row(
                 *action,
                 locale.get(*key),
-                &keybindings.display_for_action(action),
-                &keybindings.display_global_for_action(action),
+                &crate::platform::keybindings::display_for_action(keybindings, action),
+                &crate::platform::keybindings::display_global_for_action(keybindings, action),
                 editing_keybinding,
                 locale,
                 context,

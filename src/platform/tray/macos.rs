@@ -5,9 +5,8 @@
 //! work (opt-in status item and dedicated template artwork) is intentionally a
 //! separate task.
 
-use super::{TrayCommand, TrayHandle, TrayState, TrayWindowCommand};
-use crate::features::PlayMode;
-use crate::i18n::{Key, Language, t};
+use super::{TrayCommand, TrayHandle, TrayPresentation, TrayWindowCommand};
+use crate::domain::playback::PlayMode;
 use anyhow::{Context, anyhow};
 use std::cell::RefCell;
 use tokio::sync::mpsc;
@@ -32,26 +31,29 @@ thread_local! {
 }
 
 pub fn start_macos_tray(
-    language: Language,
+    presentation: TrayPresentation,
     command_capacity: usize,
 ) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
     install_menu_handler(command_tx.clone());
 
-    let state = TrayState::new(language);
-    let (menu, items) = build_menu(&state)?;
+    let (menu, items) = build_menu(&presentation)?;
     let icon = load_icon()?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(true)
         .with_menu_on_right_click(true)
-        .with_tooltip(tooltip(&state))
+        .with_tooltip(&presentation.tooltip)
         .with_icon(icon)
         .with_icon_as_template(true)
         .build()
         .map_err(|error| anyhow!("Failed to create macOS status item: {error}"))?;
 
-    let owner = MacosTray { tray, items, state };
+    let owner = MacosTray {
+        tray,
+        items,
+        presentation,
+    };
     MACOS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
@@ -64,25 +66,13 @@ pub fn start_macos_tray(
     Ok((TrayHandle { _private: () }, command_rx))
 }
 
-pub fn update_state(state: TrayState) -> anyhow::Result<()> {
+pub fn update_state(presentation: TrayPresentation) -> anyhow::Result<()> {
     MACOS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
         let owner = slot
             .as_mut()
             .ok_or_else(|| anyhow!("macOS status item is not initialized"))?;
-        owner.apply_state(state)
-    })
-}
-
-pub fn set_language(language: Language) -> anyhow::Result<()> {
-    MACOS_TRAY.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let owner = slot
-            .as_mut()
-            .ok_or_else(|| anyhow!("macOS status item is not initialized"))?;
-        let mut state = owner.state.clone();
-        state.language = language;
-        owner.apply_state(state)
+        owner.apply_state(presentation)
     })
 }
 
@@ -99,63 +89,46 @@ pub fn is_available() -> bool {
 struct MacosTray {
     tray: TrayIcon,
     items: MenuItems,
-    state: TrayState,
+    presentation: TrayPresentation,
 }
 
 impl MacosTray {
-    fn apply_state(&mut self, state: TrayState) -> anyhow::Result<()> {
-        let language = state.language;
+    fn apply_state(&mut self, presentation: TrayPresentation) -> anyhow::Result<()> {
+        self.items.now_playing.set_text(&presentation.now_playing);
+        self.items.play_pause.set_text(presentation.play_pause);
+        self.items.previous.set_text(presentation.previous);
+        self.items.next.set_text(presentation.next);
+        self.items.favorite.set_text(presentation.favorite);
         self.items
-            .now_playing
-            .set_text(now_playing(&state, t(language, Key::TrayNotPlaying)));
-        self.items.play_pause.set_text(t(
-            language,
-            if state.is_playing {
-                Key::TrayPause
-            } else {
-                Key::TrayPlay
-            },
-        ));
-        self.items.previous.set_text(t(language, Key::TrayPrevious));
-        self.items.next.set_text(t(language, Key::TrayNext));
-        self.items.favorite.set_text(t(
-            language,
-            if state.is_favorited && state.ncm_song_id.is_some() {
-                Key::TrayUnfavorite
-            } else {
-                Key::TrayFavorite
-            },
-        ));
-        self.items.favorite.set_enabled(state.ncm_song_id.is_some());
+            .favorite
+            .set_enabled(presentation.favorite_enabled);
         self.items
             .play_mode_menu
-            .set_text(t(language, Key::TrayPlayMode));
-        self.items
-            .sequential
-            .set_text(t(language, Key::TraySequential));
-        self.items.loop_all.set_text(t(language, Key::TrayLoopAll));
-        self.items.loop_one.set_text(t(language, Key::TrayLoopOne));
-        self.items.shuffle.set_text(t(language, Key::TrayShuffle));
+            .set_text(presentation.play_mode_label);
+        self.items.sequential.set_text(presentation.sequential);
+        self.items.loop_all.set_text(presentation.loop_all);
+        self.items.loop_one.set_text(presentation.loop_one);
+        self.items.shuffle.set_text(presentation.shuffle);
         self.items
             .toggle_window
-            .set_text(t(language, Key::TrayToggleWindow));
-        self.items.quit.set_text(t(language, Key::TrayQuit));
+            .set_text(presentation.toggle_window);
+        self.items.quit.set_text(presentation.quit);
         self.items
             .sequential
-            .set_checked(state.play_mode == PlayMode::Sequential);
+            .set_checked(presentation.play_mode == PlayMode::Sequential);
         self.items
             .loop_all
-            .set_checked(state.play_mode == PlayMode::LoopAll);
+            .set_checked(presentation.play_mode == PlayMode::LoopAll);
         self.items
             .loop_one
-            .set_checked(state.play_mode == PlayMode::LoopOne);
+            .set_checked(presentation.play_mode == PlayMode::LoopOne);
         self.items
             .shuffle
-            .set_checked(state.play_mode == PlayMode::Shuffle);
+            .set_checked(presentation.play_mode == PlayMode::Shuffle);
         self.tray
-            .set_tooltip(Some(tooltip(&state)))
+            .set_tooltip(Some(&presentation.tooltip))
             .context("Failed to update macOS status item tooltip")?;
-        self.state = state;
+        self.presentation = presentation;
         Ok(())
     }
 }
@@ -204,75 +177,69 @@ fn install_menu_handler(command_tx: mpsc::Sender<TrayCommand>) {
     }));
 }
 
-fn build_menu(state: &TrayState) -> anyhow::Result<(Menu, MenuItems)> {
-    let language = state.language;
+fn build_menu(presentation: &TrayPresentation) -> anyhow::Result<(Menu, MenuItems)> {
     let menu = Menu::new();
     let now_playing = MenuItem::with_id(
         MenuId::new("now_playing"),
-        now_playing(state, t(language, Key::TrayNotPlaying)),
+        &presentation.now_playing,
         false,
         None,
     );
     let play_pause = MenuItem::with_id(
         MenuId::new(PLAY_PAUSE_ID),
-        t(language, Key::TrayPlay),
+        presentation.play_pause,
         true,
         None,
     );
     let previous = MenuItem::with_id(
         MenuId::new(PREV_TRACK_ID),
-        t(language, Key::TrayPrevious),
+        presentation.previous,
         true,
         None,
     );
-    let next = MenuItem::with_id(
-        MenuId::new(NEXT_TRACK_ID),
-        t(language, Key::TrayNext),
-        true,
-        None,
-    );
+    let next = MenuItem::with_id(MenuId::new(NEXT_TRACK_ID), presentation.next, true, None);
     let favorite = MenuItem::with_id(
         MenuId::new(TOGGLE_FAVORITE_ID),
-        t(language, Key::TrayFavorite),
-        false,
+        presentation.favorite,
+        presentation.favorite_enabled,
         None,
     );
-    let play_mode_menu = Submenu::new(t(language, Key::TrayPlayMode), true);
+    let play_mode_menu = Submenu::new(presentation.play_mode_label, true);
     let sequential = CheckMenuItem::with_id(
         MenuId::new(SEQUENTIAL_ID),
-        t(language, Key::TraySequential),
+        presentation.sequential,
         true,
         true,
         None,
     );
     let loop_all = CheckMenuItem::with_id(
         MenuId::new(LOOP_ALL_ID),
-        t(language, Key::TrayLoopAll),
+        presentation.loop_all,
         true,
         false,
         None,
     );
     let loop_one = CheckMenuItem::with_id(
         MenuId::new(LOOP_ONE_ID),
-        t(language, Key::TrayLoopOne),
+        presentation.loop_one,
         true,
         false,
         None,
     );
     let shuffle = CheckMenuItem::with_id(
         MenuId::new(SHUFFLE_ID),
-        t(language, Key::TrayShuffle),
+        presentation.shuffle,
         true,
         false,
         None,
     );
     let toggle_window = MenuItem::with_id(
         MenuId::new(TOGGLE_WINDOW_ID),
-        t(language, Key::TrayToggleWindow),
+        presentation.toggle_window,
         true,
         None,
     );
-    let quit = MenuItem::with_id(MenuId::new(QUIT_ID), t(language, Key::TrayQuit), true, None);
+    let quit = MenuItem::with_id(MenuId::new(QUIT_ID), presentation.quit, true, None);
 
     menu.append(&now_playing)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -319,19 +286,4 @@ fn load_icon() -> anyhow::Result<tray_icon::Icon> {
     let (width, height) = rgba.dimensions();
     tray_icon::Icon::from_rgba(rgba.into_raw(), width, height)
         .map_err(|error| anyhow!("Failed to create status item icon: {error}"))
-}
-
-fn now_playing(state: &TrayState, fallback: &str) -> String {
-    match (&state.title, &state.artist) {
-        (Some(title), Some(artist)) if !artist.is_empty() => format!("♪ {title} — {artist}"),
-        (Some(title), _) => format!("♪ {title}"),
-        _ => fallback.to_string(),
-    }
-}
-
-fn tooltip(state: &TrayState) -> String {
-    format!(
-        "Rustle — {}",
-        now_playing(state, t(state.language, Key::TrayNotPlaying))
-    )
 }

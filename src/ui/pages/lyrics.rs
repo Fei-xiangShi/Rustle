@@ -13,6 +13,7 @@ use iced::widget::{
 use iced::{Alignment, Animation, Color, Element, Fill, Length, Padding};
 
 use crate::app::{ImageState, LyricsDisplayMode, Message};
+use crate::application::lyrics::LyricLine;
 use crate::database::DbSong;
 use crate::features::PlayMode;
 use crate::features::lyrics::engine::{LyricLineData, LyricsEngine};
@@ -1040,27 +1041,6 @@ fn build_simple_lyrics_panel(
         .height(Length::Fill)
         .center_y(Length::Fill)
         .into()
-}
-
-/// A single word in a lyric line (for word-by-word sync)
-#[derive(Debug, Clone)]
-pub struct LyricWord {
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub word: String,
-}
-
-/// A single line of lyrics with timestamp
-#[derive(Debug, Clone)]
-pub struct LyricLine {
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub text: String,
-    pub words: Vec<LyricWord>,
-    pub translated: Option<String>,
-    pub romanized: Option<String>,
-    pub is_background: bool,
-    pub is_duet: bool,
 }
 
 /// Find the current lyric line index based on playback position

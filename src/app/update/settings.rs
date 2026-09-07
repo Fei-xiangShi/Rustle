@@ -8,7 +8,6 @@ use crate::features::keybindings::{KeyBinding, KeyCode, ModifierSet, ShortcutSco
 use crate::i18n::{Key as I18nKey, Language, Locale};
 use iced::Task;
 use iced::advanced::widget::operation::{self as widget_op, Operation, Outcome, Scrollable};
-use iced::keyboard::Key;
 use iced::time::Instant;
 use iced::widget::Id;
 use iced::{Rectangle, Size};
@@ -246,88 +245,6 @@ impl App {
     }
 }
 
-/// Convert iced Key to our KeyCode
-fn key_to_keycode(key: &Key) -> Option<KeyCode> {
-    match key {
-        Key::Character(c) => {
-            let c = c.to_lowercase();
-            match c.as_str() {
-                "a" => Some(KeyCode::A),
-                "b" => Some(KeyCode::B),
-                "c" => Some(KeyCode::C),
-                "d" => Some(KeyCode::D),
-                "e" => Some(KeyCode::E),
-                "f" => Some(KeyCode::F),
-                "g" => Some(KeyCode::G),
-                "h" => Some(KeyCode::H),
-                "i" => Some(KeyCode::I),
-                "j" => Some(KeyCode::J),
-                "k" => Some(KeyCode::K),
-                "l" => Some(KeyCode::L),
-                "m" => Some(KeyCode::M),
-                "n" => Some(KeyCode::N),
-                "o" => Some(KeyCode::O),
-                "p" => Some(KeyCode::P),
-                "q" => Some(KeyCode::Q),
-                "r" => Some(KeyCode::R),
-                "s" => Some(KeyCode::S),
-                "t" => Some(KeyCode::T),
-                "u" => Some(KeyCode::U),
-                "v" => Some(KeyCode::V),
-                "w" => Some(KeyCode::W),
-                "x" => Some(KeyCode::X),
-                "y" => Some(KeyCode::Y),
-                "z" => Some(KeyCode::Z),
-                "0" => Some(KeyCode::Key0),
-                "1" => Some(KeyCode::Key1),
-                "2" => Some(KeyCode::Key2),
-                "3" => Some(KeyCode::Key3),
-                "4" => Some(KeyCode::Key4),
-                "5" => Some(KeyCode::Key5),
-                "6" => Some(KeyCode::Key6),
-                "7" => Some(KeyCode::Key7),
-                "8" => Some(KeyCode::Key8),
-                "9" => Some(KeyCode::Key9),
-                " " => Some(KeyCode::Space),
-                _ => None,
-            }
-        }
-        Key::Named(named) => {
-            use iced::keyboard::key::Named;
-            match named {
-                Named::Space => Some(KeyCode::Space),
-                Named::Enter => Some(KeyCode::Enter),
-                Named::Escape => Some(KeyCode::Escape),
-                Named::Tab => Some(KeyCode::Tab),
-                Named::Backspace => Some(KeyCode::Backspace),
-                Named::Delete => Some(KeyCode::Delete),
-                Named::ArrowUp => Some(KeyCode::Up),
-                Named::ArrowDown => Some(KeyCode::Down),
-                Named::ArrowLeft => Some(KeyCode::Left),
-                Named::ArrowRight => Some(KeyCode::Right),
-                Named::Home => Some(KeyCode::Home),
-                Named::End => Some(KeyCode::End),
-                Named::PageUp => Some(KeyCode::PageUp),
-                Named::PageDown => Some(KeyCode::PageDown),
-                Named::F1 => Some(KeyCode::F1),
-                Named::F2 => Some(KeyCode::F2),
-                Named::F3 => Some(KeyCode::F3),
-                Named::F4 => Some(KeyCode::F4),
-                Named::F5 => Some(KeyCode::F5),
-                Named::F6 => Some(KeyCode::F6),
-                Named::F7 => Some(KeyCode::F7),
-                Named::F8 => Some(KeyCode::F8),
-                Named::F9 => Some(KeyCode::F9),
-                Named::F10 => Some(KeyCode::F10),
-                Named::F11 => Some(KeyCode::F11),
-                Named::F12 => Some(KeyCode::F12),
-                _ => None,
-            }
-        }
-        Key::Unidentified => None,
-    }
-}
-
 impl App {
     pub(super) fn refresh_cache_stats(&mut self) {
         let stats = cache::calculate_cache_stats();
@@ -416,7 +333,7 @@ impl App {
                 let lang = Language::from_code(language).unwrap_or_default();
                 self.core.settings.display.language = lang.code().to_string();
                 self.core.locale = Locale::new(lang);
-                crate::platform::tray::set_language(lang);
+                self.update_tray_and_mpris_current(self.playback_is_playing());
                 tracing::info!("Language changed to: {}", lang.code());
                 Some(Task::perform(async { Message::SaveSettings }, |m| m))
             }
@@ -685,7 +602,7 @@ impl App {
             Message::KeybindingKeyPressed(key, modifiers) => {
                 if let Some((action, scope)) = self.ui.editing_keybinding {
                     // Convert iced key to our KeyCode
-                    if let Some(key_code) = key_to_keycode(key) {
+                    if let Some(key_code) = crate::platform::keybindings::key_to_keycode(key) {
                         let binding = KeyBinding {
                             modifiers: ModifierSet {
                                 ctrl: modifiers.control(),
@@ -745,11 +662,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::keyboard::Key;
 
     #[test]
     fn converts_character_space_to_space_keycode() {
         assert_eq!(
-            key_to_keycode(&Key::Character(" ".into())),
+            crate::platform::keybindings::key_to_keycode(&Key::Character(" ".into())),
             Some(KeyCode::Space)
         );
     }

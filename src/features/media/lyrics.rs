@@ -151,11 +151,6 @@ fn extract_embedded_lyrics(audio_path: &Path) -> Option<String> {
     None
 }
 
-/// Convert LyricLineOwned to the UI LyricLine format
-pub fn to_ui_lyric_lines(lines: Vec<LyricLineOwned>) -> Vec<crate::ui::pages::LyricLine> {
-    lyrics::to_ui_lyrics(lines)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

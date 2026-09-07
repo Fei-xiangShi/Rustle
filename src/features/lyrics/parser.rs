@@ -18,11 +18,10 @@ mod lys;
 mod online;
 mod qrc;
 mod ttml;
-mod types;
 mod yrc;
 
+pub use crate::domain::lyrics::*;
 pub use online::*;
-pub use types::*;
 
 fn split_bracket_prefix(line: &str) -> Option<(&str, &str)> {
     if !line.starts_with('[') {
@@ -150,8 +149,8 @@ pub fn parse_lyrics(content: &str) -> Vec<LyricLineOwned> {
 /// Parse lyrics with specified format
 pub fn parse_lyrics_with_format(content: &str, format: LyricsFormat) -> Vec<LyricLineOwned> {
     // Keep parser output faithful to the source. Display-time normalization
-    // and timing optimization are applied to a clone in `to_ui_lyrics`, just
-    // like AMLL's rawLines/processedLines pipeline.
+    // and timing optimization are applied to a clone in the application
+    // projection, like AMLL's rawLines/processedLines pipeline.
     match format {
         LyricsFormat::Lrc => lrc::parse_lrc(content),
         LyricsFormat::Lqe => lqe::parse_lqe(content),
@@ -173,59 +172,6 @@ pub fn parse_lyrics_with_format(content: &str, format: LyricsFormat) -> Vec<Lyri
 /// Parse sidecar LRC attributes like `.tlrc` using raw line timestamps.
 pub fn parse_lrc_sidecar(content: &str) -> Vec<LyricLineOwned> {
     lrc::parse_lrc(content)
-}
-
-/// Convert parsed lyrics to UI format
-pub fn to_ui_lyrics(lines: Vec<LyricLineOwned>) -> Vec<crate::ui::pages::LyricLine> {
-    let mut lines = lines;
-    // Keep the source/cache representation untouched and optimize only the
-    // render copy. This preserves exact source timestamps for seeking,
-    // serialization, and tests while retaining AMLL's display smoothing.
-    optimize_lyrics_lines(&mut lines);
-
-    lines
-        .into_iter()
-        .map(|line| {
-            let words: Vec<crate::ui::pages::LyricWord> = line
-                .words
-                .into_iter()
-                .map(|w| crate::ui::pages::LyricWord {
-                    start_ms: w.start_time,
-                    end_ms: w.end_time,
-                    word: normalize_lyric_text(&w.word),
-                })
-                .collect();
-
-            let text = if words.is_empty() {
-                String::new()
-            } else {
-                words
-                    .iter()
-                    .map(|w| w.word.as_str())
-                    .collect::<Vec<_>>()
-                    .join("")
-            };
-
-            crate::ui::pages::LyricLine {
-                start_ms: line.start_time,
-                end_ms: line.end_time,
-                text,
-                words,
-                translated: if line.translated_lyric.is_empty() {
-                    None
-                } else {
-                    Some(normalize_lyric_text(&line.translated_lyric))
-                },
-                romanized: if line.roman_lyric.is_empty() {
-                    None
-                } else {
-                    Some(normalize_lyric_text(&line.roman_lyric))
-                },
-                is_background: line.is_bg,
-                is_duet: line.is_duet,
-            }
-        })
-        .collect()
 }
 
 /// Merge translation lyrics into main lyrics

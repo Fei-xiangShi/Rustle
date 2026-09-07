@@ -7,6 +7,7 @@ use futures_util::future::BoxFuture;
 use iced::Task;
 
 use crate::app::Message;
+use crate::application::tray::{TrayLabels, TrayPresentation, TrayState};
 use crate::audio::chain::AudioProcessingChain;
 use crate::database::{
     Database, DbPlaybackState, DbPlaylist, DbSong, DbWatchedFolder, NewPlaylist,
@@ -14,7 +15,7 @@ use crate::database::{
 use crate::features::PlayMode;
 use crate::features::import::{CoverCache, default_cache_dir};
 use crate::platform::media_controls::{MediaCommand, MediaHandle, start_media_controls};
-use crate::platform::tray::{TrayHandle, TrayState};
+use crate::platform::tray::TrayHandle;
 use crate::ui::pages;
 use crate::utils::format_relative_time;
 
@@ -284,9 +285,29 @@ pub fn update_tray_state_with_favorite(
             play_mode,
             ncm_song_id,
             is_favorited,
-            language,
         };
-        handle.update(state);
+        handle.update(TrayPresentation::new(&state, tray_labels(language)));
+    }
+}
+
+pub fn tray_labels(language: crate::i18n::Language) -> TrayLabels {
+    use crate::i18n::{Key, t};
+
+    TrayLabels {
+        play: t(language, Key::TrayPlay),
+        pause: t(language, Key::TrayPause),
+        previous: t(language, Key::TrayPrevious),
+        next: t(language, Key::TrayNext),
+        favorite: t(language, Key::TrayFavorite),
+        unfavorite: t(language, Key::TrayUnfavorite),
+        play_mode: t(language, Key::TrayPlayMode),
+        sequential: t(language, Key::TraySequential),
+        loop_all: t(language, Key::TrayLoopAll),
+        loop_one: t(language, Key::TrayLoopOne),
+        shuffle: t(language, Key::TrayShuffle),
+        toggle_window: t(language, Key::TrayToggleWindow),
+        quit: t(language, Key::TrayQuit),
+        not_playing: t(language, Key::TrayNotPlaying),
     }
 }
 

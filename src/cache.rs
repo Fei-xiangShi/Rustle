@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::api::NcmQualityLevel;
+use crate::application::ports::cache::{AudioCacheStore, CachePublisher};
+use crate::domain::audio::QualityLevel as NcmQualityLevel;
 use crate::utils::{
     automix_cache_dir, avatars_cache_dir, banners_cache_dir, cache_dir, covers_cache_dir,
     lyrics_cache_dir, songs_cache_dir, vip_badges_cache_dir,
@@ -18,10 +19,53 @@ use crate::utils::{
 const AUDIO_MANIFEST_VERSION: u8 = 1;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublishResult {
-    Published,
-    Reused,
+pub use crate::application::ports::cache::PublishOutcome as PublishResult;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileCacheStore;
+
+pub fn audio_cache_store() -> std::sync::Arc<dyn AudioCacheStore> {
+    std::sync::Arc::new(FileCacheStore)
+}
+
+pub fn cache_publisher() -> std::sync::Arc<dyn CachePublisher> {
+    std::sync::Arc::new(FileCacheStore)
+}
+
+impl CachePublisher for FileCacheStore {
+    fn unique_temp_path(&self, final_path: &Path) -> PathBuf {
+        unique_temp_path(final_path)
+    }
+
+    fn cleanup_temp_file(&self, path: &Path) {
+        cleanup_temp_file(path);
+    }
+
+    fn publish_or_reuse(
+        &self,
+        temp_path: &Path,
+        final_path: &Path,
+        expected_size: Option<u64>,
+    ) -> std::io::Result<PublishResult> {
+        publish_or_reuse(temp_path, final_path, expected_size)
+    }
+}
+
+impl AudioCacheStore for FileCacheStore {
+    fn write_audio_manifest(
+        &self,
+        path: &Path,
+        song_id: u64,
+        actual_quality: NcmQualityLevel,
+        size: u64,
+        format: &str,
+    ) -> std::io::Result<()> {
+        write_audio_manifest(path, song_id, actual_quality, size, format)
+    }
+
+    fn remove_audio_cache(&self, path: &Path) {
+        remove_audio_cache(path);
+    }
 }
 
 /// Build a process-unique temporary path next to the eventual destination.

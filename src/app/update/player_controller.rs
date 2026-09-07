@@ -1247,7 +1247,11 @@ impl App {
                 continue;
             }
             let content_id = crate::audio::automix::content_identity(&path, &song.id.to_string());
-            let cache = crate::audio::automix::AnalysisCache::app_default();
+            let cache = crate::audio::automix::AnalysisCache::new(
+                crate::utils::automix_cache_dir(),
+                512,
+                crate::cache::cache_publisher(),
+            );
             let cancellation = context.cancellation.clone();
             tokio::task::spawn_blocking(move || {
                 if cancellation.is_cancelled() {
@@ -1300,7 +1304,11 @@ impl App {
             crate::audio::automix::content_identity(&current_path, &current.id.to_string());
         let next_id = crate::audio::automix::content_identity(&next_path, &next.id.to_string());
         let config = self.automix_config();
-        let cache = crate::audio::automix::AnalysisCache::app_default();
+        let cache = crate::audio::automix::AnalysisCache::new(
+            crate::utils::automix_cache_dir(),
+            512,
+            crate::cache::cache_publisher(),
+        );
         let analyses = cache
             .load(&current_id, config)
             .ok()

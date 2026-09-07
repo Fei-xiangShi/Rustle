@@ -81,114 +81,51 @@ impl VipInfo {
     }
 }
 
-/// NCM's complete quality taxonomy. This is the only place that translates
-/// API level strings into product-facing metadata.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize, PartialOrd, Ord,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum NcmQualityLevel {
-    #[default]
-    Standard,
-    Higher,
-    ExHigh,
-    Lossless,
-    HiRes,
-    #[serde(rename = "jyeffect")]
-    JvEffect,
-    Sky,
-    Dolby,
-    JyMaster,
+/// Compatibility name retained at the NCM adapter boundary.
+pub type NcmQualityLevel = crate::domain::audio::QualityLevel;
+
+pub fn quality_api_level(level: NcmQualityLevel) -> &'static str {
+    match level {
+        NcmQualityLevel::Standard => "standard",
+        NcmQualityLevel::Higher => "higher",
+        NcmQualityLevel::ExHigh => "exhigh",
+        NcmQualityLevel::Lossless => "lossless",
+        NcmQualityLevel::HiRes => "hires",
+        NcmQualityLevel::JvEffect => "jyeffect",
+        NcmQualityLevel::Sky => "sky",
+        NcmQualityLevel::Dolby => "dolby",
+        NcmQualityLevel::JyMaster => "jymaster",
+    }
 }
 
-impl NcmQualityLevel {
-    pub fn api_level(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Higher => "higher",
-            Self::ExHigh => "exhigh",
-            Self::Lossless => "lossless",
-            Self::HiRes => "hires",
-            Self::JvEffect => "jyeffect",
-            Self::Sky => "sky",
-            Self::Dolby => "dolby",
-            Self::JyMaster => "jymaster",
-        }
+/// Parse only the documented compact fields from the quality-detail API.
+pub fn quality_from_api_field(value: &str) -> Option<NcmQualityLevel> {
+    match value {
+        "l" => Some(NcmQualityLevel::Standard),
+        "m" => Some(NcmQualityLevel::Higher),
+        "h" => Some(NcmQualityLevel::ExHigh),
+        "sq" => Some(NcmQualityLevel::Lossless),
+        "hr" => Some(NcmQualityLevel::HiRes),
+        "je" => Some(NcmQualityLevel::JvEffect),
+        "sk" => Some(NcmQualityLevel::Sky),
+        "db" => Some(NcmQualityLevel::Dolby),
+        "jm" => Some(NcmQualityLevel::JyMaster),
+        _ => None,
     }
+}
 
-    /// Parse only the documented compact fields from the quality-detail API.
-    pub fn from_api_field(value: &str) -> Option<Self> {
-        match value {
-            "l" => Some(Self::Standard),
-            "m" => Some(Self::Higher),
-            "h" => Some(Self::ExHigh),
-            "sq" => Some(Self::Lossless),
-            "hr" => Some(Self::HiRes),
-            "je" => Some(Self::JvEffect),
-            "sk" => Some(Self::Sky),
-            "db" => Some(Self::Dolby),
-            "jm" => Some(Self::JyMaster),
-            _ => None,
-        }
-    }
-
-    pub fn from_api_level(value: &str) -> Option<Self> {
-        match value {
-            "standard" => Some(Self::Standard),
-            "higher" => Some(Self::Higher),
-            "exhigh" => Some(Self::ExHigh),
-            "lossless" => Some(Self::Lossless),
-            "hires" => Some(Self::HiRes),
-            "jyeffect" => Some(Self::JvEffect),
-            "sky" => Some(Self::Sky),
-            "dolby" => Some(Self::Dolby),
-            "jymaster" => Some(Self::JyMaster),
-            _ => None,
-        }
-    }
-
-    pub fn from_api_rate(value: u32) -> Option<Self> {
-        Some(match value {
-            0 => Self::Standard,
-            1 => Self::Higher,
-            2 => Self::ExHigh,
-            3 => Self::Lossless,
-            4 => Self::HiRes,
-            5 => Self::JvEffect,
-            6 => Self::Sky,
-            7 => Self::Dolby,
-            8 => Self::JyMaster,
-            _ => return None,
-        })
-    }
-
-    pub fn short_name(self) -> &'static str {
-        match self {
-            Self::Standard => "128K",
-            Self::Higher => "192K",
-            Self::ExHigh => "320K",
-            Self::Lossless => "SQ",
-            Self::HiRes => "Hi-Res",
-            Self::JvEffect => "臻音",
-            Self::Sky => "环绕声",
-            Self::Dolby => "Dolby",
-            Self::JyMaster => "母带",
-        }
-    }
-
-    /// Higher values represent a more premium server quality tier.
-    pub fn priority(self) -> u8 {
-        match self {
-            Self::Standard => 0,
-            Self::Higher => 1,
-            Self::ExHigh => 2,
-            Self::Lossless => 3,
-            Self::HiRes => 4,
-            Self::JvEffect => 5,
-            Self::Sky => 6,
-            Self::Dolby => 7,
-            Self::JyMaster => 8,
-        }
+pub fn quality_from_api_level(value: &str) -> Option<NcmQualityLevel> {
+    match value {
+        "standard" => Some(NcmQualityLevel::Standard),
+        "higher" => Some(NcmQualityLevel::Higher),
+        "exhigh" => Some(NcmQualityLevel::ExHigh),
+        "lossless" => Some(NcmQualityLevel::Lossless),
+        "hires" => Some(NcmQualityLevel::HiRes),
+        "jyeffect" => Some(NcmQualityLevel::JvEffect),
+        "sky" => Some(NcmQualityLevel::Sky),
+        "dolby" => Some(NcmQualityLevel::Dolby),
+        "jymaster" => Some(NcmQualityLevel::JyMaster),
+        _ => None,
     }
 }
 
@@ -234,17 +171,20 @@ impl VipTier {
 
 #[cfg(test)]
 mod tests {
-    use super::{NcmQualityLevel, SongQualityDetail, SongQualityOption, VipInfo, VipTier};
+    use super::{
+        NcmQualityLevel, SongQualityDetail, SongQualityOption, VipInfo, VipTier,
+        quality_from_api_level,
+    };
 
     #[test]
     fn quality_level_parser_accepts_only_canonical_api_values() {
         assert_eq!(
-            NcmQualityLevel::from_api_level("exhigh"),
+            quality_from_api_level("exhigh"),
             Some(NcmQualityLevel::ExHigh)
         );
-        assert_eq!(NcmQualityLevel::from_api_level("hi-res"), None);
-        assert_eq!(NcmQualityLevel::from_api_level(" HIGH "), None);
-        assert_eq!(NcmQualityLevel::from_api_level("master"), None);
+        assert_eq!(quality_from_api_level("hi-res"), None);
+        assert_eq!(quality_from_api_level(" HIGH "), None);
+        assert_eq!(quality_from_api_level("master"), None);
     }
 
     #[test]

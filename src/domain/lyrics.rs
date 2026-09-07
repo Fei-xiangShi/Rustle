@@ -1,4 +1,4 @@
-//! Lyrics data types
+//! Framework-free lyrics domain types and normalization rules.
 //!
 //! Owned variants for easier use.
 

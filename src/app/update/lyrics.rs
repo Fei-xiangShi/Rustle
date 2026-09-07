@@ -199,7 +199,7 @@ impl App {
                                     {
                                         Ok(lines) => {
                                             let ui_lines =
-                                                crate::features::lyrics::to_ui_lyrics(lines);
+                                                crate::application::lyrics::project_lyrics(lines);
                                             Message::LyricsLoaded(song_id, ui_lines)
                                         }
                                         Err(e) => Message::LyricsLoadFailed(
@@ -1004,7 +1004,7 @@ impl App {
             let Some(raw_lines) = crate::features::lyrics::load_cached_lyrics(ncm_id) else {
                 continue;
             };
-            let ui_lines = crate::features::lyrics::to_ui_lyrics(raw_lines);
+            let ui_lines = crate::application::lyrics::project_lyrics(raw_lines);
 
             tracing::info!(
                 "Background render prep: preparing engine lines for adjacent song {}",
@@ -1315,17 +1315,17 @@ impl App {
 
     fn engine_lines_to_ui_lines(
         engine_lines: &[crate::features::lyrics::engine::LyricLineData],
-    ) -> Vec<crate::ui::pages::LyricLine> {
+    ) -> Vec<crate::application::lyrics::LyricLine> {
         engine_lines
             .iter()
-            .map(|line| crate::ui::pages::LyricLine {
+            .map(|line| crate::application::lyrics::LyricLine {
                 start_ms: line.start_ms,
                 end_ms: line.end_ms,
                 text: line.text.clone(),
                 words: line
                     .words
                     .iter()
-                    .map(|word| crate::ui::pages::LyricWord {
+                    .map(|word| crate::application::lyrics::LyricWord {
                         start_ms: word.start_ms,
                         end_ms: word.end_ms,
                         word: word.text.clone(),
@@ -1361,7 +1361,11 @@ impl App {
         }
     }
 
-    fn apply_lyrics_lines(&mut self, song_id: i64, lines: Vec<crate::ui::pages::LyricLine>) {
+    fn apply_lyrics_lines(
+        &mut self,
+        song_id: i64,
+        lines: Vec<crate::application::lyrics::LyricLine>,
+    ) {
         self.ui.lyrics.displayed_song_id = Some(song_id);
         self.ui.lyrics.pending_song_id = None;
         self.ui.lyrics.lines = lines;
@@ -1426,7 +1430,7 @@ impl App {
                 tokio::task::spawn_blocking(move || {
                     if song_id < 0 {
                         crate::features::lyrics::load_cached_lyrics(ncm_id)
-                            .map(crate::features::lyrics::to_ui_lyrics)
+                            .map(crate::application::lyrics::project_lyrics)
                     } else {
                         None
                     }
@@ -1450,7 +1454,7 @@ impl App {
 
     fn prepare_engine_lines_task(
         song_id: i64,
-        lines_for_task: Vec<crate::ui::pages::LyricLine>,
+        lines_for_task: Vec<crate::application::lyrics::LyricLine>,
     ) -> Task<Message> {
         Task::perform(
             async move {
@@ -1734,8 +1738,7 @@ impl App {
                         if let Some(lrc_lines) =
                             crate::features::media::lyrics::find_lyrics(audio_path)
                         {
-                            let ui_lines =
-                                crate::features::media::lyrics::to_ui_lyric_lines(lrc_lines);
+                            let ui_lines = crate::application::lyrics::project_lyrics(lrc_lines);
                             return Some((song_id, ui_lines, false)); // false = no online fetch needed
                         }
                     }
@@ -1745,7 +1748,7 @@ impl App {
                         if let Some(cached_lines) =
                             crate::features::lyrics::load_cached_lyrics(ncm_id)
                         {
-                            let ui_lines = crate::features::lyrics::to_ui_lyrics(cached_lines);
+                            let ui_lines = crate::application::lyrics::project_lyrics(cached_lines);
                             return Some((song_id, ui_lines, false));
                         }
                         // Need online fetch

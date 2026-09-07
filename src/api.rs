@@ -4,6 +4,7 @@
 
 mod ncm;
 
+pub(crate) use ncm::quality_api_level;
 #[allow(unused_imports)]
 pub use ncm::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LoginInfo, NcmClient, NcmError,

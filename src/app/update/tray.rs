@@ -5,8 +5,57 @@ use iced::Task;
 
 use crate::app::message::Message;
 use crate::app::state::App;
-use crate::features::TrayCommand;
-use crate::platform::tray::TrayAvailability;
+use crate::application::tray::{
+    TrayAvailability, TrayCommand, TrayPresentation, TrayState, TrayWindowCommand,
+};
+
+fn initialize_tray_task(language: crate::i18n::Language) -> Task<Message> {
+    let presentation = TrayPresentation::new(
+        &TrayState::default(),
+        crate::app::helpers::tray_labels(language),
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        Task::perform(
+            crate::platform::tray::initialize(presentation),
+            |result| match result {
+                Ok(receiver) => Message::TrayStarted(receiver),
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to start system tray");
+                    Message::TrayUnavailable(error.to_string())
+                }
+            },
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Task::done(match crate::platform::tray::initialize(presentation) {
+            Ok(receiver) => Message::TrayStarted(receiver),
+            Err(error) => {
+                tracing::warn!(%error, "Failed to start system tray");
+                Message::TrayUnavailable(error.to_string())
+            }
+        })
+    }
+}
+
+fn tray_window_message(command: TrayWindowCommand) -> Message {
+    match command {
+        TrayWindowCommand::Toggle => Message::ToggleWindow,
+        TrayWindowCommand::PrimaryActivation => {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                Message::ShowOrFocusWindow
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                Message::ToggleWindow
+            }
+        }
+    }
+}
 
 impl App {
     /// Handle tray-related messages
@@ -17,10 +66,7 @@ impl App {
                     return Some(Task::none());
                 }
                 self.core.tray_initialization_requested = true;
-                Some(crate::platform::tray::init_task(
-                    self.core.locale.language,
-                    Message::TrayStarted,
-                ))
+                Some(initialize_tray_task(self.core.locale.language))
             }
 
             Message::TrayStarted(rx) => {
@@ -68,8 +114,7 @@ impl App {
             Message::TrayCommand(cmd) => {
                 match cmd {
                     TrayCommand::Window(window_command) => {
-                        let message = window_command
-                            .resolve_message(Message::ShowOrFocusWindow, Message::ToggleWindow);
+                        let message = tray_window_message(*window_command);
                         return Some(self.update(message));
                     }
                     TrayCommand::PlayPause => {
@@ -105,7 +150,6 @@ impl App {
                     TrayCommand::Quit => {
                         return Some(self.update(Message::ConfirmExit));
                     }
-                    #[cfg(target_os = "windows")]
                     TrayCommand::AvailabilityChanged(availability) => {
                         let became_unavailable =
                             matches!(availability, TrayAvailability::Unavailable(_))

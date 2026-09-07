@@ -42,7 +42,7 @@ impl GlobalHotkeyService {
                 Err(error) => {
                     tracing::warn!(
                         ?action,
-                        binding = %binding.display(),
+                        binding = %crate::platform::keybindings::display_binding(Some(binding)),
                         %error,
                         "Failed to register configured global hotkey"
                     );
