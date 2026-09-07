@@ -110,11 +110,13 @@ sudo apt-get install -y libasound2-dev pkg-config
 # Arch
 sudo pacman -S --needed alsa-lib pkgconf
 
+cargo xtask metadata
+cargo xtask check
 cargo build --release --locked
 ./target/release/rustle
 ```
 
-Windows / macOS 安装好 [Rust 工具链](https://rustup.rs) 后直接 `cargo build --release` 即可；Windows 本地构建未生成临时 ICO 时不保证 EXE 带 PE 文件图标，正式 Release 由 CI 负责生成。
+仓库通过 `rust-toolchain.toml` 自动选择已验证的 Rust patch，并安装 rustfmt/Clippy。`cargo xtask check` 是本地与后续 CI 共用的权威基础检查入口。Windows / macOS 安装好 [Rustup](https://rustup.rs) 后执行 `cargo build --release --locked` 即可；Windows 本地构建未生成临时 ICO 时不保证 EXE 带 PE 文件图标，正式 Release 由 CI 负责生成。
 </details>
 
 ---

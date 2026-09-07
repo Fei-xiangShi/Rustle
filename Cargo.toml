@@ -1,15 +1,48 @@
-[package]
-name = "rustle"
+[workspace]
+members = [".", "xtask"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.package]
 version = "0.5.2"
 edition = "2024"
-description = "A modern music player built with Rust and iced, supporting NetEase Cloud Music"
+rust-version = "1.98.0"
 authors = ["Fei_xiangShi"]
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Fei-xiangShi/Rustle"
 homepage = "https://github.com/Fei-xiangShi/Rustle"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+serde = "1.0.229"
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = "1.53"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[package]
+name = "rustle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A modern music player built with Rust and iced, supporting NetEase Cloud Music"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords = ["music", "player", "netease", "iced", "gui"]
 categories = ["multimedia::audio"]
+
+[lints]
+workspace = true
 
 [features]
 default = []
@@ -19,7 +52,7 @@ iced = { version = "=0.15.0-dev", features = ["tokio", "advanced", "canvas", "im
 iced_runtime = { version = "=0.15.0-dev" }
 iced_anim = "0.3.1"
 bytemuck = { version = "1.25", features = ["derive"] }
-tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"] }
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
 spectrum-analyzer = "1.8.0"
 
@@ -28,11 +61,11 @@ lofty = "0.25.1"
 walkdir = "2.5.0"
 directories = "6.0.0"
 
-serde = "1.0.229"
-serde_json = "1.0.151"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
-anyhow = "1.0.104"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
 
 # Local playlist import
 rayon = "1.12.0"
@@ -57,7 +90,7 @@ futures-util = "0.3.34"
 discord-rich-presence = "1.1.0"
 
 # Netease Cloud Music API
-ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs.git" }
+ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs.git", rev = "133b65bfe482e41ebccf018870d3fce07bf58eb3" }
 qrcode-generator = "6.0"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "gzip", "stream"] }
@@ -71,9 +104,9 @@ ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
 x11rb = "0.14.0"
 
 [patch.crates-io]
-iced = { git = "https://github.com/Fei-xiangShi/iced.git", branch = "master" }
-iced_runtime = { git = "https://github.com/Fei-xiangShi/iced.git", branch = "master" }
-smithay-client-toolkit = { git = "https://github.com/Fei-xiangShi/client-toolkit.git", branch = "master" }
+iced = { git = "https://github.com/Fei-xiangShi/iced.git", rev = "573ebbf00ed3f544e784488cd3e71ab0ea10ec1b" }
+iced_runtime = { git = "https://github.com/Fei-xiangShi/iced.git", rev = "573ebbf00ed3f544e784488cd3e71ab0ea10ec1b" }
+smithay-client-toolkit = { git = "https://github.com/Fei-xiangShi/client-toolkit.git", rev = "f69a98395ead55777832525623ff82d40c16a25b" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

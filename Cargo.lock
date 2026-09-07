@@ -2477,7 +2477,7 @@ dependencies = [
 [[package]]
 name = "iced"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_core 0.15.0-dev",
  "iced_debug",
@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "iced_beacon"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bincode",
  "futures",
@@ -2536,7 +2536,7 @@ dependencies = [
 [[package]]
 name = "iced_core"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "iced_debug"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_beacon",
  "iced_core 0.15.0-dev",
@@ -2567,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "iced_devtools"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_debug",
  "iced_program",
@@ -2578,7 +2578,7 @@ dependencies = [
 [[package]]
 name = "iced_futures"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "futures",
  "iced_core 0.15.0-dev",
@@ -2592,7 +2592,7 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -2612,7 +2612,7 @@ dependencies = [
 [[package]]
 name = "iced_program"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_graphics",
  "iced_runtime",
@@ -2621,7 +2621,7 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
@@ -2633,7 +2633,7 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bytes",
  "iced_core 0.15.0-dev",
@@ -2644,7 +2644,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -2661,7 +2661,7 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -2681,7 +2681,7 @@ dependencies = [
 [[package]]
 name = "iced_widget"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "iced_renderer",
  "iced_runtime",
@@ -2695,7 +2695,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.15.0-dev"
-source = "git+https://github.com/Fei-xiangShi/iced.git?branch=master#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
+source = "git+https://github.com/Fei-xiangShi/iced.git?rev=573ebbf00ed3f544e784488cd3e71ab0ea10ec1b#573ebbf00ed3f544e784488cd3e71ab0ea10ec1b"
 dependencies = [
  "arboard",
  "iced_debug",
@@ -3632,7 +3632,7 @@ dependencies = [
 [[package]]
 name = "ncm-api-rs"
 version = "0.1.0"
-source = "git+https://github.com/SPlayer-Dev/ncm-api-rs.git#133b65bfe482e41ebccf018870d3fce07bf58eb3"
+source = "git+https://github.com/SPlayer-Dev/ncm-api-rs.git?rev=133b65bfe482e41ebccf018870d3fce07bf58eb3#133b65bfe482e41ebccf018870d3fce07bf58eb3"
 dependencies = [
  "aes",
  "base64",
@@ -5762,7 +5762,7 @@ dependencies = [
 [[package]]
 name = "smithay-client-toolkit"
 version = "0.21.1"
-source = "git+https://github.com/Fei-xiangShi/client-toolkit.git?branch=master#f69a98395ead55777832525623ff82d40c16a25b"
+source = "git+https://github.com/Fei-xiangShi/client-toolkit.git?rev=f69a98395ead55777832525623ff82d40c16a25b#f69a98395ead55777832525623ff82d40c16a25b"
 dependencies = [
  "bitflags 2.13.1",
  "calloop",
@@ -8456,6 +8456,13 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "xtask"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "xxhash-rust"

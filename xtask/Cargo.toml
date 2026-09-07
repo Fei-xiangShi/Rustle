@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rustle workspace engineering commands"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json.workspace = true
