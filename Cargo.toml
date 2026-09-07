@@ -1,5 +1,10 @@
 [workspace]
-members = [".", "xtask"]
+members = [
+    ".",
+    "crates/rustle-application",
+    "crates/rustle-domain",
+    "xtask",
+]
 default-members = ["."]
 resolver = "3"
 
@@ -14,7 +19,7 @@ homepage = "https://github.com/Fei-xiangShi/Rustle"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-serde = "1.0.229"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = "1.53"
@@ -23,6 +28,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.5"
 zip = { version = "8.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 fs4 = "1.1.0"
+regex = "1.13"
+rustle-application = { path = "crates/rustle-application" }
+rustle-domain = { path = "crates/rustle-domain" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -82,6 +90,8 @@ zip = { workspace = true, optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 fs4.workspace = true
+rustle-application.workspace = true
+rustle-domain.workspace = true
 
 # Local playlist import
 rayon = "1.12.0"
@@ -110,7 +120,7 @@ qrcode-generator = "6.0"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "gzip", "stream"] }
 
-regex = "1.13"
+regex.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

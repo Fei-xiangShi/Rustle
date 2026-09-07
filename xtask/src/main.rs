@@ -148,6 +148,7 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_architecture_source_contracts(root)?;
+    verify_architecture_dependency_graph(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
     verify_panic_boundary_contracts(root)?;
@@ -162,6 +163,7 @@ fn check(root: &Path) -> XtaskResult<()> {
 fn check_production(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_architecture_source_contracts(root)?;
+    verify_architecture_dependency_graph(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
     verify_panic_boundary_contracts(root)?;
@@ -395,6 +397,7 @@ fn release_panic_contract_violations(contents: &str) -> Vec<String> {
 fn check_native(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_architecture_source_contracts(root)?;
+    verify_architecture_dependency_graph(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
     verify_panic_boundary_contracts(root)?;
@@ -404,9 +407,12 @@ fn check_native(root: &Path) -> XtaskResult<()> {
 }
 
 fn verify_architecture_source_contracts(root: &Path) -> XtaskResult<()> {
-    let source_root = root.join("src");
     let mut source_paths = Vec::new();
-    collect_rust_source_paths(&source_root, &mut source_paths)?;
+    for source_root in [root.join("src"), root.join("crates")] {
+        if source_root.is_dir() {
+            collect_rust_source_paths(&source_root, &mut source_paths)?;
+        }
+    }
     source_paths.sort();
 
     let mut violations = Vec::new();
@@ -431,6 +437,97 @@ fn verify_architecture_source_contracts(root: &Path) -> XtaskResult<()> {
             violations.join("\n")
         )))
     }
+}
+
+fn verify_architecture_dependency_graph(root: &Path) -> XtaskResult<()> {
+    let metadata = load_metadata(root)?;
+    let violations = architecture_dependency_violations(&metadata)?;
+
+    if violations.is_empty() {
+        println!("architecture dependency graph: ok");
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "architecture dependency graph violations:\n{}",
+            violations.join("\n")
+        )))
+    }
+}
+
+fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<String>> {
+    let packages = metadata_array(metadata, "packages")?;
+    let workspace_members = metadata_array(metadata, "workspace_members")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut violations = Vec::new();
+
+    for package_name in ["rustle-domain", "rustle-application"] {
+        let Some(package) = packages
+            .iter()
+            .find(|package| package.get("name").and_then(Value::as_str) == Some(package_name))
+        else {
+            violations.push(format!("workspace package `{package_name}` is missing"));
+            continue;
+        };
+
+        let package_id = metadata_string(package, "id")?;
+        if !workspace_members.contains(&package_id) {
+            violations.push(format!(
+                "package `{package_name}` is not a workspace member"
+            ));
+        }
+
+        let dependencies = metadata_array(package, "dependencies")?
+            .iter()
+            .filter_map(|dependency| dependency.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let allowed: &[&str] = match package_name {
+            "rustle-domain" => &["regex", "serde", "serde_json"],
+            "rustle-application" => &["rustle-domain"],
+            _ => unreachable!(),
+        };
+
+        for dependency in dependencies {
+            if !allowed.contains(&dependency) {
+                violations.push(format!(
+                    "package `{package_name}` has forbidden direct dependency `{dependency}`"
+                ));
+            }
+        }
+
+        if package_name == "rustle-application"
+            && !metadata_array(package, "dependencies")?
+                .iter()
+                .any(|dependency| {
+                    dependency.get("name").and_then(Value::as_str) == Some("rustle-domain")
+                })
+        {
+            violations
+                .push("package `rustle-application` must depend on `rustle-domain`".to_string());
+        }
+    }
+
+    let Some(root_package) = packages
+        .iter()
+        .find(|package| package.get("name").and_then(Value::as_str) == Some("rustle"))
+    else {
+        violations.push("workspace package `rustle` is missing".to_string());
+        return Ok(violations);
+    };
+    let root_dependencies = metadata_array(root_package, "dependencies")?;
+    for dependency in ["rustle-domain", "rustle-application"] {
+        if !root_dependencies
+            .iter()
+            .any(|candidate| candidate.get("name").and_then(Value::as_str) == Some(dependency))
+        {
+            violations.push(format!(
+                "root package `rustle` must depend on `{dependency}`"
+            ));
+        }
+    }
+
+    Ok(violations)
 }
 
 fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<String> {
@@ -460,7 +557,10 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
             "native tray code must use domain/application contracts",
         ));
     }
-    if path.starts_with("src/domain/") || path == "src/domain.rs" {
+    if path.starts_with("src/domain/")
+        || path == "src/domain.rs"
+        || path.starts_with("crates/rustle-domain/src/")
+    {
         forbidden.extend([
             ("iced::", "domain must be UI-framework free"),
             ("tokio::", "domain must be runtime free"),
@@ -474,9 +574,13 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
             ("crate::database", "domain must not depend outward"),
             ("crate::ui", "domain must not depend outward"),
             ("crate::app::", "domain must not depend outward"),
+            ("rustle_application", "domain must not depend outward"),
         ]);
     }
-    if path.starts_with("src/application/") || path == "src/application.rs" {
+    if path.starts_with("src/application/")
+        || path == "src/application.rs"
+        || path.starts_with("crates/rustle-application/src/")
+    {
         forbidden.extend([
             ("iced::", "application contracts must be UI-framework free"),
             (
@@ -514,6 +618,26 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
             (
                 "crate::app::",
                 "application must not depend on the composition root",
+            ),
+            (
+                "rustle_storage",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "rustle_ncm",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "rustle_audio",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "rustle_platform",
+                "application must not depend on concrete adapters",
+            ),
+            (
+                "rustle_ui",
+                "application must not depend on concrete adapters",
             ),
         ]);
     }
@@ -999,11 +1123,12 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        architecture_source_contract_violations, ffi_panic_boundary_violations,
-        forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag,
-        observability_source_contract_violations, quoted_setting,
+        architecture_dependency_violations, architecture_source_contract_violations,
+        ffi_panic_boundary_violations, forbidden_packages_in_tree, inline_quoted_setting,
+        normalize_release_tag, observability_source_contract_violations, quoted_setting,
         release_panic_contract_violations, source_contract_violations, tool_version,
     };
+    use serde_json::json;
 
     #[test]
     fn reads_quoted_toolchain_setting() {
@@ -1105,18 +1230,66 @@ mod tests {
         );
         assert!(
             architecture_source_contract_violations(
-                "src/domain/playback.rs",
-                "use iced::Theme; use crate::database::Database;",
+                "crates/rustle-domain/src/playback.rs",
+                "use iced::Theme; use rustle_application::Service;",
             )
             .len()
                 == 2
         );
         assert!(
             architecture_source_contract_violations(
-                "src/application/tray.rs",
-                "use crate::domain::playback::PlayMode;",
+                "crates/rustle-application/src/tray.rs",
+                "use rustle_domain::playback::PlayMode;",
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn architecture_graph_requires_physical_members_and_directed_dependencies() {
+        let metadata = json!({
+            "workspace_members": ["domain-id", "application-id", "root-id"],
+            "packages": [
+                {
+                    "name": "rustle-domain",
+                    "id": "domain-id",
+                    "dependencies": [
+                        {"name": "regex"},
+                        {"name": "serde"},
+                        {"name": "serde_json"}
+                    ]
+                },
+                {
+                    "name": "rustle-application",
+                    "id": "application-id",
+                    "dependencies": [{"name": "rustle-domain"}]
+                },
+                {
+                    "name": "rustle",
+                    "id": "root-id",
+                    "dependencies": [
+                        {"name": "rustle-domain"},
+                        {"name": "rustle-application"}
+                    ]
+                }
+            ]
+        });
+        assert!(
+            architecture_dependency_violations(&metadata)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut invalid = metadata;
+        invalid["packages"][0]["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "iced"}));
+        assert!(
+            architecture_dependency_violations(&invalid)
+                .unwrap()
+                .iter()
+                .any(|violation| violation.contains("forbidden direct dependency `iced`"))
         );
     }
 

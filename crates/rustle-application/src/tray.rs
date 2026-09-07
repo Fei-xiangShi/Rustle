@@ -1,6 +1,6 @@
 //! Framework-neutral system-tray presentation and command contracts.
 
-use crate::domain::playback::PlayMode;
+use rustle_domain::playback::PlayMode;
 
 /// Runtime availability of the native tray recovery surface.
 #[derive(Debug, Clone, PartialEq, Eq)]

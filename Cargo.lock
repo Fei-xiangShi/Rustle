@@ -5317,6 +5317,8 @@ dependencies = [
  "reqwest 0.13.4",
  "rfd",
  "rodio",
+ "rustle-application",
+ "rustle-domain",
  "sdf_glyph_renderer",
  "serde",
  "serde_json",
@@ -5335,6 +5337,22 @@ dependencies = [
  "x11rb 0.14.0",
  "xxhash-rust",
  "zip",
+]
+
+[[package]]
+name = "rustle-application"
+version = "0.5.2"
+dependencies = [
+ "rustle-domain",
+]
+
+[[package]]
+name = "rustle-domain"
+version = "0.5.2"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

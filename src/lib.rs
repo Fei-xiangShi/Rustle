@@ -2,13 +2,13 @@
 
 mod api;
 mod app;
-pub mod application;
+pub use rustle_application as application;
 mod audio;
 mod cache;
 mod database;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
-pub mod domain;
+pub use rustle_domain as domain;
 mod download;
 pub mod error;
 mod features;

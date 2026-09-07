@@ -1,6 +1,6 @@
 //! Presentation-safe lyrics view models and projection.
 
-use crate::domain::lyrics::{LyricLineOwned, normalize_lyric_text, optimize_lyrics_lines};
+use rustle_domain::lyrics::{LyricLineOwned, normalize_lyric_text, optimize_lyrics_lines};
 
 /// A single word in a projected lyric line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +61,7 @@ pub fn project_lyrics(mut lines: Vec<LyricLineOwned>) -> Vec<LyricLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::lyrics::LyricWordOwned;
+    use rustle_domain::lyrics::LyricWordOwned;
 
     #[test]
     fn projection_normalizes_a_clone_and_preserves_presentation_metadata() {

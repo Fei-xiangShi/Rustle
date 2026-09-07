@@ -1,0 +1,17 @@
+[package]
+name = "rustle-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Framework-neutral application contracts and ports for Rustle"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rustle-domain.workspace = true
