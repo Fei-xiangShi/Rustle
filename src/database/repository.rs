@@ -2,7 +2,7 @@
 //! Delegates to ops modules for actual operations
 
 use sqlx::{Pool, Sqlite};
-use std::path::Path;
+use std::path::PathBuf;
 
 use super::{StorageResult as Result, connection, migrations, models::*, ops};
 
@@ -14,14 +14,19 @@ pub struct Database {
 
 impl Database {
     /// Create and initialize database at the given path
-    pub async fn new(db_path: &Path) -> Result<Self> {
+    pub async fn new(db_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = db_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            std::fs::create_dir_all(parent)?;
         }
 
-        let pool = connection::connect(db_path).await?;
-        migrations::initialize(&pool).await?;
+        let pool = connection::connect(db_path.clone()).await?;
+        migrations::initialize(pool.clone(), db_path.clone()).await?;
+        let pool = if pool.is_closed() {
+            connection::connect(db_path).await?
+        } else {
+            pool
+        };
 
         Ok(Self { pool })
     }

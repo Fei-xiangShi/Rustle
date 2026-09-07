@@ -40,6 +40,10 @@ pub enum ErrorCode {
     BusinessRejected,
     StorageOpenFailed,
     StorageMigrationFailed,
+    StorageBackupFailed,
+    StorageInsufficientSpace,
+    StorageAdoptionFailed,
+    StorageRecoveryFailed,
     StorageSchemaUnsupported,
     StorageQueryFailed,
     StorageTransactionFailed,
@@ -62,7 +66,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Exhaustive stable code list used by compatibility tests and diagnostics.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 32] = [
         Self::OperationCancelled,
         Self::NetworkRequestFailed,
         Self::NetworkTimeout,
@@ -73,6 +77,10 @@ impl ErrorCode {
         Self::BusinessRejected,
         Self::StorageOpenFailed,
         Self::StorageMigrationFailed,
+        Self::StorageBackupFailed,
+        Self::StorageInsufficientSpace,
+        Self::StorageAdoptionFailed,
+        Self::StorageRecoveryFailed,
         Self::StorageSchemaUnsupported,
         Self::StorageQueryFailed,
         Self::StorageTransactionFailed,
@@ -105,6 +113,10 @@ impl ErrorCode {
             Self::BusinessRejected => "business.rejected",
             Self::StorageOpenFailed => "storage.open_failed",
             Self::StorageMigrationFailed => "storage.migration_failed",
+            Self::StorageBackupFailed => "storage.backup_failed",
+            Self::StorageInsufficientSpace => "storage.insufficient_space",
+            Self::StorageAdoptionFailed => "storage.adoption_failed",
+            Self::StorageRecoveryFailed => "storage.recovery_failed",
             Self::StorageSchemaUnsupported => "storage.schema_unsupported",
             Self::StorageQueryFailed => "storage.query_failed",
             Self::StorageTransactionFailed => "storage.transaction_failed",
@@ -137,6 +149,10 @@ impl ErrorCode {
             Self::BusinessRejected => ErrorCategory::Business,
             Self::StorageOpenFailed
             | Self::StorageMigrationFailed
+            | Self::StorageBackupFailed
+            | Self::StorageInsufficientSpace
+            | Self::StorageAdoptionFailed
+            | Self::StorageRecoveryFailed
             | Self::StorageSchemaUnsupported
             | Self::StorageQueryFailed
             | Self::StorageTransactionFailed
@@ -168,8 +184,12 @@ impl ErrorCode {
             Self::ProtocolInvalidResponse
             | Self::ProtocolUnsupported
             | Self::StorageMigrationFailed
+            | Self::StorageBackupFailed
+            | Self::StorageAdoptionFailed
+            | Self::StorageRecoveryFailed
             | Self::StorageSchemaUnsupported
             | Self::InvariantViolation => RecoveryHint::ExportDiagnostics,
+            Self::StorageInsufficientSpace => RecoveryHint::Retry,
             Self::BusinessRejected | Self::StorageNotFound => RecoveryHint::None,
             Self::StoragePermissionDenied
             | Self::StorageOpenFailed

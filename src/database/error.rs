@@ -13,6 +13,29 @@ pub enum StorageError {
     Sqlx(#[from] sqlx::Error),
     #[error("database migration failed")]
     Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("database backup failed")]
+    Backup {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error(
+        "insufficient space for database backup (required {required_bytes} bytes, available {available_bytes} bytes)"
+    )]
+    InsufficientSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    #[error("legacy database adoption failed for {legacy_version}")]
+    Adoption {
+        legacy_version: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("database recovery failed")]
+    Recovery {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("database schema is not a recognized Rustle release ({fingerprint})")]
     UnsupportedSchema { fingerprint: String },
     #[error("storage operation failed")]
@@ -56,6 +79,10 @@ impl StorageError {
             }
             Self::Transaction { .. } => ErrorCode::StorageTransactionFailed,
             Self::Migration(_) => ErrorCode::StorageMigrationFailed,
+            Self::Backup { .. } => ErrorCode::StorageBackupFailed,
+            Self::InsufficientSpace { .. } => ErrorCode::StorageInsufficientSpace,
+            Self::Adoption { .. } => ErrorCode::StorageAdoptionFailed,
+            Self::Recovery { .. } => ErrorCode::StorageRecoveryFailed,
             Self::UnsupportedSchema { .. } => ErrorCode::StorageSchemaUnsupported,
             Self::Sqlx(_) | Self::Operation(_) => ErrorCode::StorageQueryFailed,
         }
@@ -98,5 +125,29 @@ mod tests {
             fingerprint: "fixture".to_string(),
         };
         assert_eq!(unsupported.code(), ErrorCode::StorageSchemaUnsupported);
+
+        let backup = StorageError::Backup {
+            source: anyhow::anyhow!("private backup detail"),
+        };
+        assert_eq!(backup.code(), ErrorCode::StorageBackupFailed);
+        assert_eq!(backup.to_string(), "database backup failed");
+
+        let insufficient = StorageError::InsufficientSpace {
+            required_bytes: 2,
+            available_bytes: 1,
+        };
+        assert_eq!(insufficient.code(), ErrorCode::StorageInsufficientSpace);
+
+        let adoption = StorageError::Adoption {
+            legacy_version: "v1",
+            source: anyhow::anyhow!("private adoption detail"),
+        };
+        assert_eq!(adoption.code(), ErrorCode::StorageAdoptionFailed);
+
+        let recovery = StorageError::Recovery {
+            source: anyhow::anyhow!("private recovery detail"),
+        };
+        assert_eq!(recovery.code(), ErrorCode::StorageRecoveryFailed);
+        assert_eq!(recovery.to_string(), "database recovery failed");
     }
 }

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use futures_util::future::BoxFuture;
 use iced::Task;
 
 use crate::app::Message;
@@ -77,19 +78,21 @@ pub fn init_audio(
 }
 
 /// Initialize database connection
-pub async fn init_database() -> crate::database::StorageResult<Database> {
-    let data_dir = directories::ProjectDirs::from("com", "rustle", "Rustle")
-        .map(|dirs| dirs.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+pub fn init_database() -> BoxFuture<'static, crate::database::StorageResult<Database>> {
+    Box::pin(async move {
+        let data_dir = directories::ProjectDirs::from("com", "rustle", "Rustle")
+            .map(|dirs| dirs.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
 
-    std::fs::create_dir_all(&data_dir)?;
-    let db_path = data_dir.join("rustle.db");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("rustle.db");
 
-    tracing::info!(
-        event = "database_initializing",
-        "Initializing database storage"
-    );
-    Database::new(&db_path).await
+        tracing::info!(
+            event = "database_initializing",
+            "Initializing database storage"
+        );
+        Database::new(db_path).await
+    })
 }
 
 /// Load all songs from database

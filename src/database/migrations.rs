@@ -1,10 +1,14 @@
-//! Embedded SQLx migrations and staged legacy-schema routing.
+//! Embedded SQLx migrations and verified legacy-schema adoption routing.
 
+use std::path::PathBuf;
+
+use futures_util::future::BoxFuture;
 use sqlx::SqlitePool;
 
+use super::StorageResult as Result;
 use super::error::StorageError;
 use super::legacy::{self, LegacySchemaVersion, SchemaFingerprint};
-use super::{StorageResult as Result, schema};
+use super::{adoption, connection};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -27,11 +31,14 @@ impl SchemaState {
     }
 }
 
-pub(crate) async fn initialize(pool: &SqlitePool) -> Result<SchemaState> {
-    let state = classify(pool).await?;
+pub(crate) async fn initialize(pool: SqlitePool, database_path: PathBuf) -> Result<SchemaState> {
+    let state = classify(pool.clone()).await?;
     match state {
-        SchemaState::Empty | SchemaState::Managed => MIGRATOR.run(pool).await?,
-        SchemaState::Legacy(_) => schema::run_migrations(pool).await?,
+        SchemaState::Empty | SchemaState::Managed => run_migrator(pool.clone()).await?,
+        SchemaState::Legacy(version) => {
+            pool.close().await;
+            run_legacy_adoption(database_path.clone(), version).await?;
+        }
         SchemaState::UnknownLegacy(fingerprint) => {
             tracing::error!(
                 event = "database_schema_unsupported",
@@ -45,10 +52,10 @@ pub(crate) async fn initialize(pool: &SqlitePool) -> Result<SchemaState> {
         }
     }
 
-    let version = if matches!(state, SchemaState::Legacy(_)) {
-        None
+    let version = if pool.is_closed() {
+        Some(latest_version())
     } else {
-        Some(current_version(pool).await?)
+        Some(current_version(pool.clone()).await?)
     };
     let legacy_version = match state {
         SchemaState::Legacy(version) => Some(version.as_str()),
@@ -59,18 +66,53 @@ pub(crate) async fn initialize(pool: &SqlitePool) -> Result<SchemaState> {
         schema_state = state.as_str(),
         migration_version = version,
         legacy_version,
-        legacy_compatibility = matches!(state, SchemaState::Legacy(_)),
+        legacy_adopted = matches!(state, SchemaState::Legacy(_)),
         "Database schema initialization completed"
     );
     Ok(state)
 }
 
-pub(crate) async fn classify(pool: &SqlitePool) -> Result<SchemaState> {
+async fn run_legacy_adoption(database_path: PathBuf, version: LegacySchemaVersion) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| StorageError::Adoption {
+                legacy_version: version.as_str(),
+                source: source.into(),
+            })?;
+        runtime.block_on(async move {
+            let pool = connection::connect(database_path.clone()).await?;
+            let state = classify(pool.clone()).await?;
+            if state != SchemaState::Legacy(version) {
+                pool.close().await;
+                return Err(StorageError::Adoption {
+                    legacy_version: version.as_str(),
+                    source: anyhow::anyhow!(
+                        "legacy schema identity changed before maintenance startup: {state:?}"
+                    ),
+                });
+            }
+            let result = adoption::adopt(pool.clone(), database_path, version, &MIGRATOR)
+                .await
+                .map(|_| ());
+            pool.close().await;
+            result
+        })
+    })
+    .await
+    .map_err(|source| StorageError::Adoption {
+        legacy_version: version.as_str(),
+        source: source.into(),
+    })?
+}
+
+pub(crate) async fn classify(pool: SqlitePool) -> Result<SchemaState> {
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT name FROM sqlite_master \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )
-    .fetch_all(pool)
+    .fetch_all(&pool)
     .await?;
 
     if tables.is_empty() {
@@ -86,16 +128,25 @@ pub(crate) async fn classify(pool: &SqlitePool) -> Result<SchemaState> {
     }
 }
 
-async fn current_version(pool: &SqlitePool) -> Result<i64> {
+async fn current_version(pool: SqlitePool) -> Result<i64> {
     sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(version) FROM _sqlx_migrations WHERE success = TRUE",
     )
-    .fetch_one(pool)
+    .fetch_one(&pool)
     .await?
     .ok_or_else(|| {
         StorageError::Migration(sqlx::migrate::MigrateError::VersionNotPresent(
             latest_version(),
         ))
+    })
+}
+
+fn run_migrator(
+    pool: SqlitePool,
+) -> BoxFuture<'static, std::result::Result<(), sqlx::migrate::MigrateError>> {
+    Box::pin(async move {
+        let mut connection = pool.acquire().await?;
+        MIGRATOR.run_direct(&mut *connection).await
     })
 }
 
@@ -173,11 +224,21 @@ mod tests {
     #[tokio::test]
     async fn empty_database_migrates_to_the_canonical_schema_and_is_repeatable() {
         let database = TestDatabase::new("empty");
-        let pool = connection::connect(&database.path).await.unwrap();
+        let pool = connection::connect(database.path.clone()).await.unwrap();
 
-        assert_eq!(initialize(&pool).await.unwrap(), SchemaState::Empty);
-        assert_eq!(classify(&pool).await.unwrap(), SchemaState::Managed);
-        assert_eq!(initialize(&pool).await.unwrap(), SchemaState::Managed);
+        assert_eq!(
+            initialize(pool.clone(), database.path.clone())
+                .await
+                .unwrap(),
+            SchemaState::Empty
+        );
+        assert_eq!(classify(pool.clone()).await.unwrap(), SchemaState::Managed);
+        assert_eq!(
+            initialize(pool.clone(), database.path.clone())
+                .await
+                .unwrap(),
+            SchemaState::Managed
+        );
 
         let tables = sqlx::query_scalar::<_, String>(
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
@@ -256,21 +317,28 @@ mod tests {
                 .await
                 .unwrap();
         assert!(migration_success);
-        assert_eq!(current_version(&pool).await.unwrap(), latest_version());
+        assert_eq!(
+            current_version(pool.clone()).await.unwrap(),
+            latest_version()
+        );
         pool.close().await;
     }
 
     #[tokio::test]
     async fn changed_migration_checksum_is_rejected() {
         let database = TestDatabase::new("checksum");
-        let pool = connection::connect(&database.path).await.unwrap();
-        initialize(&pool).await.unwrap();
+        let pool = connection::connect(database.path.clone()).await.unwrap();
+        initialize(pool.clone(), database.path.clone())
+            .await
+            .unwrap();
         sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 1")
             .execute(&pool)
             .await
             .unwrap();
 
-        let error = initialize(&pool).await.unwrap_err();
+        let error = initialize(pool.clone(), database.path.clone())
+            .await
+            .unwrap_err();
         assert_eq!(
             error.code(),
             crate::error::ErrorCode::StorageMigrationFailed
@@ -285,12 +353,21 @@ mod tests {
     #[tokio::test]
     async fn embedded_baseline_matches_the_legacy_canonical_schema() {
         let managed_database = TestDatabase::new("managed-parity");
-        let managed_pool = connection::connect(&managed_database.path).await.unwrap();
-        initialize(&managed_pool).await.unwrap();
+        let managed_pool = connection::connect(managed_database.path.clone())
+            .await
+            .unwrap();
+        initialize(managed_pool.clone(), managed_database.path.clone())
+            .await
+            .unwrap();
 
         let legacy_database = TestDatabase::new("legacy-parity");
-        let legacy_pool = connection::connect(&legacy_database.path).await.unwrap();
-        schema::run_migrations(&legacy_pool).await.unwrap();
+        let legacy_pool = connection::connect(legacy_database.path.clone())
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../../migrations/0001_canonical_schema.sql"))
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             schema_fingerprint(&managed_pool).await,
@@ -313,23 +390,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_unversioned_schema_stays_on_the_legacy_route() {
+    async fn current_unversioned_schema_is_adopted_with_data_preserved() {
         let database = TestDatabase::new("legacy");
-        let pool = connection::connect(&database.path).await.unwrap();
-        schema::run_migrations(&pool).await.unwrap();
+        let mut pool = connection::connect(database.path.clone()).await.unwrap();
+        sqlx::raw_sql(include_str!("../../migrations/0001_canonical_schema.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO playlists (name, created_at, updated_at) VALUES ('kept', 1, 1)")
             .execute(&pool)
             .await
             .unwrap();
 
         assert_eq!(
-            classify(&pool).await.unwrap(),
+            classify(pool.clone()).await.unwrap(),
             SchemaState::Legacy(LegacySchemaVersion::V5)
         );
         assert_eq!(
-            initialize(&pool).await.unwrap(),
+            initialize(pool.clone(), database.path.clone())
+                .await
+                .unwrap(),
             SchemaState::Legacy(LegacySchemaVersion::V5)
         );
+        assert!(pool.is_closed());
+        pool = connection::connect(database.path.clone()).await.unwrap();
+        assert_eq!(classify(pool.clone()).await.unwrap(), SchemaState::Managed);
         let playlist_name =
             sqlx::query_scalar::<_, String>("SELECT name FROM playlists WHERE name = 'kept'")
                 .fetch_one(&pool)
@@ -343,7 +428,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(ledger_exists, 0);
+        assert_eq!(ledger_exists, 1);
+        assert_eq!(
+            initialize(pool.clone(), database.path.clone())
+                .await
+                .unwrap(),
+            SchemaState::Managed
+        );
         pool.close().await;
     }
 
@@ -351,20 +442,23 @@ mod tests {
     async fn every_released_fixture_upgrades_without_losing_synthetic_data() {
         for version in LegacySchemaVersion::ALL {
             let database = TestDatabase::new(&format!("upgrade-{}", version.as_str()));
-            let pool = connection::connect(&database.path).await.unwrap();
+            let mut pool = connection::connect(database.path.clone()).await.unwrap();
             legacy::apply_fixture(&pool, version).await.unwrap();
 
             assert_eq!(
-                initialize(&pool).await.unwrap(),
+                initialize(pool.clone(), database.path.clone())
+                    .await
+                    .unwrap(),
                 SchemaState::Legacy(version)
             );
+            assert!(pool.is_closed());
+            pool = connection::connect(database.path.clone()).await.unwrap();
+            assert_eq!(classify(pool.clone()).await.unwrap(), SchemaState::Managed);
             assert_eq!(
-                classify(&pool).await.unwrap(),
-                SchemaState::Legacy(LegacySchemaVersion::V5)
-            );
-            assert_eq!(
-                initialize(&pool).await.unwrap(),
-                SchemaState::Legacy(LegacySchemaVersion::V5)
+                initialize(pool.clone(), database.path.clone())
+                    .await
+                    .unwrap(),
+                SchemaState::Managed
             );
 
             let song_title =
@@ -395,7 +489,7 @@ mod tests {
             assert_eq!(song_title, "Fixture Song");
             assert_eq!(playlist_relation, 1);
             assert_eq!(playback_position, 12.5);
-            assert_eq!(ledger_exists, 0);
+            assert_eq!(ledger_exists, 1);
             pool.close().await;
         }
     }
@@ -403,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_schema_is_rejected_before_any_ddl_or_data_change() {
         let database = TestDatabase::new("unknown");
-        let pool = connection::connect(&database.path).await.unwrap();
+        let pool = connection::connect(database.path.clone()).await.unwrap();
         legacy::apply_fixture(&pool, LegacySchemaVersion::V5)
             .await
             .unwrap();
@@ -411,15 +505,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let before = legacy::fingerprint(&pool).await.unwrap();
+        let before = legacy::fingerprint(pool.clone()).await.unwrap();
 
-        let error = initialize(&pool).await.unwrap_err();
+        let error = initialize(pool.clone(), database.path.clone())
+            .await
+            .unwrap_err();
         assert_eq!(
             error.code(),
             crate::error::ErrorCode::StorageSchemaUnsupported
         );
         assert!(matches!(error, StorageError::UnsupportedSchema { .. }));
-        assert_eq!(legacy::fingerprint(&pool).await.unwrap(), before);
+        assert_eq!(legacy::fingerprint(pool.clone()).await.unwrap(), before);
         let song_title = sqlx::query_scalar::<_, String>("SELECT title FROM songs WHERE id = 1")
             .fetch_one(&pool)
             .await

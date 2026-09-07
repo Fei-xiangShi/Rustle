@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use sqlx::{Row, SqlitePool};
+use futures_util::future::BoxFuture;
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::StorageResult as Result;
 
@@ -16,7 +17,6 @@ pub(crate) enum LegacySchemaVersion {
 }
 
 impl LegacySchemaVersion {
-    #[cfg(test)]
     pub(crate) const ALL: [Self; 5] = [Self::V1, Self::V2, Self::V3, Self::V4, Self::V5];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -26,6 +26,22 @@ impl LegacySchemaVersion {
             Self::V3 => "v3",
             Self::V4 => "v4",
             Self::V5 => "v5",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|version| version.as_str() == value)
+    }
+
+    pub(crate) fn upgrade_scripts(self) -> &'static [&'static str] {
+        match self {
+            Self::V1 => &LEGACY_UPGRADE_SQL,
+            Self::V2 => &LEGACY_UPGRADE_SQL[1..],
+            Self::V3 => &LEGACY_UPGRADE_SQL[2..],
+            Self::V4 => &LEGACY_UPGRADE_SQL[3..],
+            Self::V5 => &[],
         }
     }
 
@@ -40,6 +56,13 @@ impl LegacySchemaVersion {
         }
     }
 }
+
+const LEGACY_UPGRADE_SQL: [&str; 4] = [
+    include_str!("../../migrations/legacy/v1_to_v2.sql"),
+    include_str!("../../migrations/legacy/v2_to_v3.sql"),
+    include_str!("../../migrations/legacy/v3_to_v4.sql"),
+    include_str!("../../migrations/legacy/v4_to_v5.sql"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SchemaFingerprint {
@@ -82,172 +105,198 @@ const KNOWN_LEGACY_SCHEMAS: [(LegacySchemaVersion, SchemaFingerprint); 5] = [
     ),
 ];
 
-pub(crate) async fn identify(
-    pool: &SqlitePool,
-) -> Result<(Option<LegacySchemaVersion>, SchemaFingerprint)> {
-    let fingerprint = fingerprint(pool).await?;
-    let version = KNOWN_LEGACY_SCHEMAS
+pub(crate) fn expected_fingerprint(version: LegacySchemaVersion) -> SchemaFingerprint {
+    KNOWN_LEGACY_SCHEMAS
         .iter()
-        .find_map(|(version, expected)| (*expected == fingerprint).then_some(*version));
-    Ok((version, fingerprint))
+        .find_map(|(candidate, fingerprint)| (*candidate == version).then_some(*fingerprint))
+        .expect("every typed legacy version has a locked fingerprint")
 }
 
-pub(crate) async fn fingerprint(pool: &SqlitePool) -> Result<SchemaFingerprint> {
-    let tables = sqlx::query(
-        "SELECT name, COALESCE(sql, '') AS sql FROM sqlite_master \
+pub(crate) async fn identify(
+    pool: SqlitePool,
+) -> Result<(Option<LegacySchemaVersion>, SchemaFingerprint)> {
+    let mut connection = pool.acquire().await?;
+    identify_connection(&mut connection).await
+}
+
+pub(crate) fn identify_connection(
+    connection: &mut SqliteConnection,
+) -> BoxFuture<'_, Result<(Option<LegacySchemaVersion>, SchemaFingerprint)>> {
+    Box::pin(async move {
+        let fingerprint = fingerprint_connection(connection).await?;
+        let version = KNOWN_LEGACY_SCHEMAS
+            .iter()
+            .find_map(|(version, expected)| (*expected == fingerprint).then_some(*version));
+        Ok((version, fingerprint))
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn fingerprint(pool: SqlitePool) -> Result<SchemaFingerprint> {
+    let mut connection = pool.acquire().await?;
+    fingerprint_connection(&mut connection).await
+}
+
+pub(crate) fn fingerprint_connection(
+    connection: &mut SqliteConnection,
+) -> BoxFuture<'_, Result<SchemaFingerprint>> {
+    Box::pin(async move {
+        let tables = sqlx::query(
+            "SELECT name, COALESCE(sql, '') AS sql FROM sqlite_master \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
          AND name <> '_sqlx_migrations' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut components = Vec::new();
+        )
+        .fetch_all(&mut *connection)
+        .await?;
+        let mut components = Vec::new();
 
-    for table in tables {
-        let table_name = table.get::<String, _>("name");
-        let table_sql = table.get::<String, _>("sql");
-        components.push(format!("table|{table_name}"));
+        for table in tables {
+            let table_name = table.get::<String, _>("name");
+            let table_sql = table.get::<String, _>("sql");
+            components.push(format!("table|{table_name}"));
 
-        let mut columns = sqlx::query(&format!(
-            "PRAGMA table_info({})",
-            quote_identifier(&table_name)
-        ))
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("name"),
-                row.get::<String, _>("type").trim().to_ascii_uppercase(),
-                row.get::<i64, _>("notnull"),
-                row.get::<Option<String>, _>("dflt_value")
-                    .map(|value| normalize_sql(&value))
-                    .unwrap_or_else(|| "<none>".to_string()),
-                row.get::<i64, _>("pk"),
-            )
-        })
-        .collect::<Vec<_>>();
-        columns.sort();
-        for (name, data_type, not_null, default, primary_key) in columns {
-            components.push(format!(
-                "column|{table_name}|{name}|{data_type}|{not_null}|{default}|{primary_key}"
-            ));
-        }
-
-        let mut foreign_keys = sqlx::query(&format!(
-            "PRAGMA foreign_key_list({})",
-            quote_identifier(&table_name)
-        ))
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("from"),
-                row.get::<String, _>("table"),
-                row.get::<Option<String>, _>("to")
-                    .unwrap_or_else(|| "<implicit>".to_string()),
-                row.get::<String, _>("on_update"),
-                row.get::<String, _>("on_delete"),
-                row.get::<String, _>("match"),
-            )
-        })
-        .collect::<Vec<_>>();
-        foreign_keys.sort();
-        for (from, target_table, to, on_update, on_delete, match_kind) in foreign_keys {
-            components.push(format!(
-                "foreign_key|{table_name}|{from}|{target_table}|{to}|{on_update}|{on_delete}|{match_kind}"
-            ));
-        }
-
-        let mut indexes = sqlx::query(&format!(
-            "PRAGMA index_list({})",
-            quote_identifier(&table_name)
-        ))
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("name"),
-                row.get::<i64, _>("unique"),
-                row.get::<String, _>("origin"),
-                row.get::<i64, _>("partial"),
-            )
-        })
-        .collect::<Vec<_>>();
-        indexes.sort();
-        for (index_name, unique, origin, partial) in indexes {
-            let mut index_columns = sqlx::query(&format!(
-                "PRAGMA index_info({})",
-                quote_identifier(&index_name)
+            let mut columns = sqlx::query(&format!(
+                "PRAGMA table_info({})",
+                quote_identifier(&table_name)
             ))
-            .fetch_all(pool)
+            .fetch_all(&mut *connection)
             .await?
             .into_iter()
             .map(|row| {
                 (
-                    row.get::<i64, _>("seqno"),
-                    row.get::<Option<String>, _>("name")
-                        .unwrap_or_else(|| "<expression>".to_string()),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("type").trim().to_ascii_uppercase(),
+                    row.get::<i64, _>("notnull"),
+                    row.get::<Option<String>, _>("dflt_value")
+                        .map(|value| normalize_sql(&value))
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    row.get::<i64, _>("pk"),
                 )
             })
             .collect::<Vec<_>>();
-            index_columns.sort_by_key(|(sequence, _)| *sequence);
-            let column_names = index_columns
-                .into_iter()
-                .map(|(_, name)| name)
-                .collect::<Vec<_>>()
-                .join(",");
-            let identity = if origin == "c" {
-                index_name.clone()
-            } else {
-                format!("<{origin}>")
-            };
-            let predicate = if partial == 1 {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            columns.sort();
+            for (name, data_type, not_null, default, primary_key) in columns {
+                components.push(format!(
+                    "column|{table_name}|{name}|{data_type}|{not_null}|{default}|{primary_key}"
+                ));
+            }
+
+            let mut foreign_keys = sqlx::query(&format!(
+                "PRAGMA foreign_key_list({})",
+                quote_identifier(&table_name)
+            ))
+            .fetch_all(&mut *connection)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("from"),
+                    row.get::<String, _>("table"),
+                    row.get::<Option<String>, _>("to")
+                        .unwrap_or_else(|| "<implicit>".to_string()),
+                    row.get::<String, _>("on_update"),
+                    row.get::<String, _>("on_delete"),
+                    row.get::<String, _>("match"),
                 )
-                .bind(&index_name)
-                .fetch_one(pool)
-                .await
-                .map(|sql| normalize_sql(&sql).replace("IF NOT EXISTS ", ""))?
-            } else {
-                "<none>".to_string()
-            };
-            components.push(format!(
+            })
+            .collect::<Vec<_>>();
+            foreign_keys.sort();
+            for (from, target_table, to, on_update, on_delete, match_kind) in foreign_keys {
+                components.push(format!(
+                "foreign_key|{table_name}|{from}|{target_table}|{to}|{on_update}|{on_delete}|{match_kind}"
+            ));
+            }
+
+            let mut indexes = sqlx::query(&format!(
+                "PRAGMA index_list({})",
+                quote_identifier(&table_name)
+            ))
+            .fetch_all(&mut *connection)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("name"),
+                    row.get::<i64, _>("unique"),
+                    row.get::<String, _>("origin"),
+                    row.get::<i64, _>("partial"),
+                )
+            })
+            .collect::<Vec<_>>();
+            indexes.sort();
+            for (index_name, unique, origin, partial) in indexes {
+                let mut index_columns = sqlx::query(&format!(
+                    "PRAGMA index_info({})",
+                    quote_identifier(&index_name)
+                ))
+                .fetch_all(&mut *connection)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<i64, _>("seqno"),
+                        row.get::<Option<String>, _>("name")
+                            .unwrap_or_else(|| "<expression>".to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+                index_columns.sort_by_key(|(sequence, _)| *sequence);
+                let column_names = index_columns
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let identity = if origin == "c" {
+                    index_name.clone()
+                } else {
+                    format!("<{origin}>")
+                };
+                let predicate = if partial == 1 {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    )
+                    .bind(&index_name)
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map(|sql| normalize_sql(&sql).replace("IF NOT EXISTS ", ""))?
+                } else {
+                    "<none>".to_string()
+                };
+                components.push(format!(
                 "index|{table_name}|{identity}|{unique}|{origin}|{partial}|{column_names}|{predicate}"
+            ));
+            }
+
+            let mut checks = extract_check_clauses(&table_sql);
+            checks.sort();
+            for check in checks {
+                components.push(format!("check|{table_name}|{check}"));
+            }
+        }
+
+        let extra_objects = sqlx::query(
+            "SELECT type, name, COALESCE(sql, '') AS sql FROM sqlite_master \
+         WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
+        for object in extra_objects {
+            components.push(format!(
+                "object|{}|{}|{}",
+                object.get::<String, _>("type"),
+                object.get::<String, _>("name"),
+                normalize_sql(&object.get::<String, _>("sql"))
             ));
         }
 
-        let mut checks = extract_check_clauses(&table_sql);
-        checks.sort();
-        for check in checks {
-            components.push(format!("check|{table_name}|{check}"));
-        }
-    }
-
-    let extra_objects = sqlx::query(
-        "SELECT type, name, COALESCE(sql, '') AS sql FROM sqlite_master \
-         WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%' \
-         ORDER BY type, name",
-    )
-    .fetch_all(pool)
-    .await?;
-    for object in extra_objects {
-        components.push(format!(
-            "object|{}|{}|{}",
-            object.get::<String, _>("type"),
-            object.get::<String, _>("name"),
-            normalize_sql(&object.get::<String, _>("sql"))
-        ));
-    }
-
-    components.sort();
-    let signature = components.join("\n");
-    Ok(SchemaFingerprint::new(
-        xxhash_rust::xxh3::xxh3_128(signature.as_bytes()),
-        components.len(),
-    ))
+        components.sort();
+        let signature = components.join("\n");
+        Ok(SchemaFingerprint::new(
+            xxhash_rust::xxh3::xxh3_128(signature.as_bytes()),
+            components.len(),
+        ))
+    })
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -322,7 +371,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::database::{connection, schema};
+    use crate::database::connection;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -354,11 +403,11 @@ mod tests {
     async fn released_fixtures_have_locked_fingerprints() {
         for (version, expected) in KNOWN_LEGACY_SCHEMAS {
             let database = TestDatabase::new(version.as_str());
-            let pool = connection::connect(&database.path).await.unwrap();
+            let pool = connection::connect(database.path.clone()).await.unwrap();
             apply_fixture(&pool, version).await.unwrap();
-            let actual = fingerprint(&pool).await.unwrap();
+            let actual = fingerprint(pool.clone()).await.unwrap();
             assert_eq!(actual, expected, "changed {} fixture", version.as_str());
-            assert_eq!(identify(&pool).await.unwrap().0, Some(version));
+            assert_eq!(identify(pool.clone()).await.unwrap().0, Some(version));
             pool.close().await;
         }
     }
@@ -366,21 +415,28 @@ mod tests {
     #[tokio::test]
     async fn fresh_and_altered_v5_column_order_share_one_identity() {
         let altered_database = TestDatabase::new("altered-v5");
-        let altered_pool = connection::connect(&altered_database.path).await.unwrap();
+        let altered_pool = connection::connect(altered_database.path.clone())
+            .await
+            .unwrap();
         apply_fixture(&altered_pool, LegacySchemaVersion::V5)
             .await
             .unwrap();
 
         let fresh_database = TestDatabase::new("fresh-v5");
-        let fresh_pool = connection::connect(&fresh_database.path).await.unwrap();
-        schema::run_migrations(&fresh_pool).await.unwrap();
+        let fresh_pool = connection::connect(fresh_database.path.clone())
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../../migrations/0001_canonical_schema.sql"))
+            .execute(&fresh_pool)
+            .await
+            .unwrap();
 
         assert_eq!(
-            fingerprint(&altered_pool).await.unwrap(),
-            fingerprint(&fresh_pool).await.unwrap()
+            fingerprint(altered_pool.clone()).await.unwrap(),
+            fingerprint(fresh_pool.clone()).await.unwrap()
         );
         assert_eq!(
-            identify(&fresh_pool).await.unwrap().0,
+            identify(fresh_pool.clone()).await.unwrap().0,
             Some(LegacySchemaVersion::V5)
         );
         altered_pool.close().await;
@@ -449,12 +505,12 @@ mod tests {
 
         for (index, mutation) in mutations.into_iter().enumerate() {
             let database = TestDatabase::new(&format!("mutation-{index}"));
-            let pool = connection::connect(&database.path).await.unwrap();
+            let pool = connection::connect(database.path.clone()).await.unwrap();
             apply_fixture(&pool, LegacySchemaVersion::V5).await.unwrap();
             sqlx::raw_sql(mutation).execute(&pool).await.unwrap();
 
             assert_eq!(
-                identify(&pool).await.unwrap().0,
+                identify(pool.clone()).await.unwrap().0,
                 None,
                 "mutation {index} matched a released schema"
             );
