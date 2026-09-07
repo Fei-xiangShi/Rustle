@@ -537,6 +537,35 @@ unsafe extern "system" fn tray_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    crate::runtime::catch_ffi_unwind(
+        "windows_tray_wndproc",
+        || {
+            // SAFETY: The outer WNDPROC contract supplies the same validated
+            // native arguments to the implementation, and this closure cannot
+            // unwind beyond the ABI wrapper.
+            unsafe { tray_window_proc_inner(hwnd, message, wparam, lparam) }
+        },
+        || {
+            // SAFETY: On a captured panic, forwarding the untouched native
+            // arguments is the only operation performed before returning to
+            // Windows.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        },
+    )
+}
+
+/// Rust implementation behind the no-unwind Win32 ABI wrapper.
+///
+/// # Safety
+///
+/// The caller must uphold the same native message and `GWLP_USERDATA` lifetime
+/// contract documented on `tray_window_proc`.
+unsafe fn tray_window_proc_inner(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if message == WM_NCCREATE {
         // SAFETY: lparam is a CREATESTRUCTW for WM_NCCREATE and lpCreateParams
         // is the stable Box<WindowState> address supplied to CreateWindowExW.

@@ -22,6 +22,18 @@ Every Cargo resolution/build command inside these entry points uses
 `--locked`. `rust-toolchain.toml` owns the Rust version; the CI setup action
 reads that file instead of copying the version into workflow YAML.
 
+The full quality/native commands compile and test all features, including the
+feature-gated diagnostic exporter. Release preflight must additionally build
+the default desktop graph and the explicit diagnostics binary separately:
+
+```bash
+cargo build --release --locked
+cargo build --release --locked --features diagnostics --bin rustle-diagnostics
+```
+
+This separation proves ZIP support remains absent from the ordinary desktop
+feature graph while the support tool remains releasable.
+
 ## Stable required-check contract
 
 The workflow name is `Rust CI`. Its stable job names are:

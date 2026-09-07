@@ -322,19 +322,29 @@ pub fn start() -> (LinuxMediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
         cmd_tx: cmd_tx.clone(),
     };
 
-    // Spawn MPRIS on a dedicated thread with its own runtime
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+    // Spawn MPRIS on a dedicated panic-contained thread with its own runtime.
+    let spawn_result = crate::runtime::spawn_guarded("linux-mpris", "mpris_service", move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("Failed to create runtime for MPRIS");
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(%error, "Failed to create the MPRIS runtime");
+                return;
+            }
+        };
 
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
             // Start the MPRIS server
-            let server = LocalServer::new(APP_ID, player)
-                .await
-                .expect("Failed to create MPRIS server");
+            let server = match LocalServer::new(APP_ID, player).await {
+                Ok(server) => server,
+                Err(error) => {
+                    tracing::error!(%error, "Failed to create the MPRIS server");
+                    return;
+                }
+            };
 
             // Run server and handle state updates concurrently
             tokio::select! {
@@ -356,6 +366,12 @@ pub fn start() -> (LinuxMediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
             }
         });
     });
+    if let Err(error) = spawn_result {
+        tracing::error!(
+            error_kind = ?error.kind(),
+            "Failed to spawn the MPRIS worker"
+        );
+    }
 
     (LinuxMediaHandle { state, state_tx }, cmd_rx)
 }

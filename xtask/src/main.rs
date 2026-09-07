@@ -149,6 +149,7 @@ fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
+    verify_panic_boundary_contracts(root)?;
     run_cargo(root, &["fmt", "--all", "--check"])?;
     check_production_workspace(root)?;
     check_workspace(root)?;
@@ -161,6 +162,7 @@ fn check_production(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
+    verify_panic_boundary_contracts(root)?;
     check_production_workspace(root)
 }
 
@@ -301,10 +303,98 @@ fn observability_source_contract_violations(path: &str, contents: &str) -> Vec<S
         .collect()
 }
 
+fn verify_panic_boundary_contracts(root: &Path) -> XtaskResult<()> {
+    let source_root = root.join("src");
+    let mut source_paths = Vec::new();
+    collect_rust_source_paths(&source_root, &mut source_paths)?;
+    source_paths.sort();
+
+    let mut violations = Vec::new();
+    for path in source_paths {
+        let relative_path = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read_to_string(&path)?;
+        violations.extend(ffi_panic_boundary_violations(&relative_path, &contents));
+    }
+    violations.extend(release_panic_contract_violations(&fs::read_to_string(
+        root.join("Cargo.toml"),
+    )?));
+
+    if violations.is_empty() {
+        println!("panic boundary source contracts: ok");
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "panic boundary source contract violations:\n{}",
+            violations.join("\n")
+        )))
+    }
+}
+
+fn ffi_panic_boundary_violations(path: &str, contents: &str) -> Vec<String> {
+    let mut callbacks = contents
+        .match_indices("unsafe extern \"system\" fn")
+        .chain(contents.match_indices("unsafe extern \"C\" fn"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    callbacks.sort_unstable();
+
+    let mut violations = Vec::new();
+    for (callback_index, start) in callbacks.iter().copied().enumerate() {
+        let end = callbacks
+            .get(callback_index + 1)
+            .copied()
+            .unwrap_or(contents.len());
+        let callback = &contents[start..end];
+        if !callback.contains("crate::runtime::catch_ffi_unwind(") {
+            let line = contents[..start].lines().count() + 1;
+            violations.push(format!(
+                "{path}:{line} owns a Rust FFI callback without `crate::runtime::catch_ffi_unwind`"
+            ));
+        }
+    }
+    violations
+}
+
+fn release_panic_contract_violations(contents: &str) -> Vec<String> {
+    let mut in_release_profile = false;
+    let mut settings = Vec::new();
+    for line in contents.lines() {
+        let line = line.split_once('#').map_or(line, |(value, _)| value).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_release_profile = line == "[profile.release]";
+            continue;
+        }
+        if !in_release_profile {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "panic" {
+            settings.push(value.trim());
+        }
+    }
+
+    match settings.as_slice() {
+        ["\"unwind\""] => Vec::new(),
+        ["\"abort\""] => {
+            vec!["Cargo.toml restores forbidden release `panic = \"abort\"`".to_string()]
+        }
+        _ => vec![
+            "Cargo.toml [profile.release] must declare exactly one `panic = \"unwind\"`"
+                .to_string(),
+        ],
+    }
+}
+
 fn check_native(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     verify_error_source_contracts(root)?;
     verify_observability_source_contract(root)?;
+    verify_panic_boundary_contracts(root)?;
     check_workspace(root)?;
     clippy_workspace(root)?;
     test_workspace(root)
@@ -774,9 +864,9 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag,
-        observability_source_contract_violations, quoted_setting, source_contract_violations,
-        tool_version,
+        ffi_panic_boundary_violations, forbidden_packages_in_tree, inline_quoted_setting,
+        normalize_release_tag, observability_source_contract_violations, quoted_setting,
+        release_panic_contract_violations, source_contract_violations, tool_version,
     };
 
     #[test]
@@ -870,6 +960,47 @@ mod tests {
         );
         assert!(
             observability_source_contract_violations("src/app.rs", "tracing::info!(\"ok\");")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn panic_contracts_require_no_unwind_ffi_and_release_unwind() {
+        assert_eq!(
+            ffi_panic_boundary_violations(
+                "src/platform.rs",
+                "unsafe extern \"system\" fn callback() {}"
+            )
+            .len(),
+            1
+        );
+        assert!(
+            ffi_panic_boundary_violations(
+                "src/platform.rs",
+                "unsafe extern \"system\" fn callback() { crate::runtime::catch_ffi_unwind(\"fixture\", || (), || ()); }"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            ffi_panic_boundary_violations(
+                "src/platform.rs",
+                concat!(
+                    "unsafe extern \"system\" fn guarded() { ",
+                    "crate::runtime::catch_ffi_unwind(\"fixture\", || (), || ()); }\n",
+                    "unsafe extern \"C\" fn unguarded() {}"
+                )
+            )
+            .len(),
+            1
+        );
+        assert!(
+            !release_panic_contract_violations("[profile.release]\npanic = \"abort\"").is_empty()
+        );
+        assert!(
+            release_panic_contract_violations("[profile.release]\npanic = \"unwind\"").is_empty()
+        );
+        assert!(
+            !release_panic_contract_violations("panic = \"unwind\"\n[profile.release]\nlto = true")
                 .is_empty()
         );
     }

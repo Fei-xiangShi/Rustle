@@ -5,6 +5,8 @@ mod app;
 mod audio;
 mod cache;
 mod database;
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
 mod download;
 pub mod error;
 mod features;
@@ -14,6 +16,7 @@ mod metadata;
 mod observability;
 mod platform;
 mod protocol;
+mod runtime;
 mod ui;
 mod utils;
 
@@ -24,6 +27,7 @@ mod utils;
 /// every business module part of the executable target.
 pub fn run() -> iced::Result {
     let _observability = observability::initialize();
+    observability::set_runtime_phase(observability::RuntimePhase::SingleInstance);
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -56,10 +60,12 @@ pub fn run() -> iced::Result {
         }
     }
 
+    observability::set_runtime_phase(observability::RuntimePhase::Platform);
     platform::init();
 
     // Run the application as a daemon (keeps running when windows are closed).
     // This allows the app to run in the background with system tray.
+    observability::set_runtime_phase(observability::RuntimePhase::UiRuntime);
     iced::daemon(app::App::new, app::App::update, app::App::view)
         .title(app::App::title)
         .theme(app::App::theme)

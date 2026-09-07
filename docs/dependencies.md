@@ -54,6 +54,13 @@ cargo run --features devtools
 quality gate still uses all features so the opt-in developer path remains
 compiled, linted, and tested.
 
+The `zip` dependency is owned by the user-invoked diagnostic exporter and is
+optional behind the non-default `diagnostics` feature. The default desktop
+graph must not contain it. It uses only the reviewed deflate backend; expanding
+compression or crypto features requires a new size, license, and supply-chain
+review. Remove the dependency if diagnostics move to a separately distributed
+tool or a standard-library-compatible archive format becomes sufficient.
+
 ## Git source register
 
 Every direct git dependency in Cargo.toml uses a full `rev`. Some transitive git

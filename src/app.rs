@@ -101,6 +101,7 @@ mod subscription_logic {
 impl App {
     /// Create new application instance
     pub fn new() -> (Self, Task<Message>) {
+        crate::observability::set_runtime_phase(crate::observability::RuntimePhase::Application);
         // 0. Clean up orphan temp files from interrupted downloads
         crate::cache::cleanup_temp_files();
 

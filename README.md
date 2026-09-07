@@ -119,6 +119,14 @@ cargo build --release --locked
 仓库通过 `rust-toolchain.toml` 自动选择已验证的 Rust patch，并安装 rustfmt/Clippy。`cargo xtask check` 是本地与 CI 共用的完整源码质量入口；依赖策略使用 `.cargo-deny-version` 固定工具，并通过 `cargo xtask supply-chain` 复现。GitHub 的 `rust-quality`、`rust-supply-chain`、`rust-windows`、`rust-linux`、`rust-macos` 五个稳定门禁及 branch protection 配置见 [Rust CI 文档](docs/ci.md)，依赖例外和 git fork 台账见 [依赖治理文档](docs/dependencies.md)。Windows / macOS 安装好 [Rustup](https://rustup.rs) 后执行 `cargo build --release --locked` 即可；Windows 本地构建未生成临时 ICO 时不保证 EXE 带 PE 文件图标，正式 Release 由 CI 负责生成。
 
 Iced 调试工具不进入默认生产依赖图；需要调试渲染器或 widget 时显式使用 `cargo run --features devtools`。`cargo xtask check-production` 会验证默认图未重新引入 devtools-only 包。
+
+Rustle 会在本地写入有界、脱敏的运行日志和崩溃记录，不会自动上传遥测。需要向维护者提供诊断信息时，可显式构建并运行独立导出工具：
+
+```bash
+cargo run --locked --features diagnostics --bin rustle-diagnostics -- output.zip
+```
+
+导出的 ZIP 仅包含再次脱敏后的 Rustle 日志、崩溃记录和安全清单；不会包含设置、Cookie、数据库、缓存、媒体文件或环境变量。目标文件已存在时工具会拒绝覆盖。ZIP 支持不进入默认桌面生产依赖图。
 </details>
 
 ---

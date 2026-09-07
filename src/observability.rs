@@ -1,14 +1,18 @@
 //! Process-wide tracing initialization, redaction, rotation, and retention.
 
+use std::backtrace::Backtrace;
+use std::cell::Cell;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
@@ -23,9 +27,63 @@ const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const NON_BLOCKING_BUFFERED_LINES: usize = 4_096;
 const LOG_FILE_PREFIX: &str = "rustle-session-";
 const LOG_FILE_SUFFIX: &str = ".log";
+const CRASH_FILE_PREFIX: &str = "rustle-crash-";
+const CRASH_FILE_SUFFIX: &str = ".jsonl";
+const MAX_CRASH_FILES: usize = 4;
+const MAX_CRASH_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CRASH_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PANIC_PAYLOAD_BYTES: usize = 8 * 1024;
+const MAX_PANIC_LOCATION_BYTES: usize = 2 * 1024;
+const MAX_PANIC_BACKTRACE_BYTES: usize = 512 * 1024;
 const TOOLCHAIN_MANIFEST: &str = include_str!("../rust-toolchain.toml");
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CRASH_COUNTER: AtomicU64 = AtomicU64::new(1);
+static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+static RUNTIME_PHASE: AtomicU8 = AtomicU8::new(RuntimePhase::Observability as u8);
+
+thread_local! {
+    static IN_PANIC_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RuntimePhase {
+    Observability = 0,
+    SingleInstance = 1,
+    Platform = 2,
+    UiRuntime = 3,
+    Application = 4,
+    Shutdown = 5,
+}
+
+impl RuntimePhase {
+    fn current() -> Self {
+        match RUNTIME_PHASE.load(Ordering::Relaxed) {
+            1 => Self::SingleInstance,
+            2 => Self::Platform,
+            3 => Self::UiRuntime,
+            4 => Self::Application,
+            5 => Self::Shutdown,
+            _ => Self::Observability,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observability => "observability",
+            Self::SingleInstance => "single_instance",
+            Self::Platform => "platform",
+            Self::UiRuntime => "ui_runtime",
+            Self::Application => "application",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+pub(crate) fn set_runtime_phase(phase: RuntimePhase) {
+    RUNTIME_PHASE.store(phase as u8, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RotationPolicy {
@@ -74,6 +132,7 @@ impl Drop for ObservabilityGuard {
             return;
         }
 
+        set_runtime_phase(RuntimePhase::Shutdown);
         let dropped_lines = self
             .dropped_lines
             .as_ref()
@@ -142,12 +201,257 @@ struct FilterSelection {
     invalid_requested_filter: bool,
 }
 
+#[derive(Clone)]
+enum CrashSink {
+    Directory(PathBuf),
+    Stderr,
+}
+
+#[derive(Clone)]
+struct CrashRuntime {
+    session_id: String,
+    redactor: Arc<Redactor>,
+    sink: CrashSink,
+}
+
+impl CrashRuntime {
+    fn new(session_id: String, redactor: Arc<Redactor>, sink: CrashSink) -> Self {
+        Self {
+            session_id,
+            redactor,
+            sink,
+        }
+    }
+
+    fn record(&self, panic_info: &PanicHookInfo<'_>) {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let payload = panic_payload(panic_info);
+        let location = panic_info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let backtrace = backtrace_enabled().then(|| Backtrace::force_capture().to_string());
+        let record = format_crash_record(
+            &self.session_id,
+            thread_name,
+            &payload,
+            &location,
+            backtrace.as_deref(),
+            &self.redactor,
+        );
+        self.write(&record);
+    }
+
+    fn write(&self, record: &[u8]) {
+        match &self.sink {
+            CrashSink::Directory(directory) => {
+                if write_crash_file(directory, &self.session_id, record).is_err() {
+                    write_crash_stderr(record);
+                }
+            }
+            CrashSink::Stderr => write_crash_stderr(record),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CrashRecord<'a> {
+    event: &'static str,
+    timestamp_unix_ms: u128,
+    session_id: &'a str,
+    app_version: &'static str,
+    git_commit: &'static str,
+    rust_toolchain: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    phase: &'static str,
+    thread: &'a str,
+    location: &'a str,
+    payload: &'a str,
+    backtrace: Option<&'a str>,
+}
+
+fn install_panic_hook(runtime: CrashRuntime) {
+    if PANIC_HOOK_INSTALLED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let already_running = IN_PANIC_HOOK.with(|active| active.replace(true));
+        if already_running {
+            let _ = io::stderr().write_all(b"Rustle panic hook recursion detected\n");
+            return;
+        }
+
+        run_panic_hook(
+            || runtime.record(panic_info),
+            || {
+                let _ = io::stderr()
+                    .write_all(b"Rustle panic hook failed while writing a redacted record\n");
+            },
+        );
+        IN_PANIC_HOOK.with(|active| active.set(false));
+    }));
+}
+
+fn run_panic_hook<R, F>(record: R, fallback: F)
+where
+    R: FnOnce(),
+    F: FnOnce(),
+{
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(record)).is_err() {
+        fallback();
+    }
+}
+
+fn panic_payload(panic_info: &PanicHookInfo<'_>) -> String {
+    if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic_info.payload().downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn backtrace_enabled() -> bool {
+    env::var("RUST_BACKTRACE")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+}
+
+fn format_crash_record(
+    session_id: &str,
+    thread: &str,
+    payload: &str,
+    location: &str,
+    backtrace: Option<&str>,
+    redactor: &Redactor,
+) -> Vec<u8> {
+    let thread = bounded_redacted(redactor, thread, 256);
+    let payload = bounded_redacted(redactor, payload, MAX_PANIC_PAYLOAD_BYTES);
+    let location = bounded_redacted(redactor, location, MAX_PANIC_LOCATION_BYTES);
+    let backtrace =
+        backtrace.map(|value| bounded_redacted(redactor, value, MAX_PANIC_BACKTRACE_BYTES));
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let record = CrashRecord {
+        event: "panic",
+        timestamp_unix_ms,
+        session_id,
+        app_version: env!("CARGO_PKG_VERSION"),
+        git_commit: build_commit(),
+        rust_toolchain: pinned_toolchain(),
+        os: env::consts::OS,
+        arch: env::consts::ARCH,
+        phase: RuntimePhase::current().as_str(),
+        thread: &thread,
+        location: &location,
+        payload: &payload,
+        backtrace: backtrace.as_deref(),
+    };
+    serde_json::to_vec(&record).unwrap_or_else(|_| {
+        br#"{"event":"panic","payload":"crash record serialization failed"}"#.to_vec()
+    })
+}
+
+fn bounded_redacted(redactor: &Redactor, input: &str, max_bytes: usize) -> String {
+    let redacted = redactor.redact(input);
+    truncate_utf8(&redacted, max_bytes).to_string()
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn write_crash_file(directory: &Path, session_id: &str, record: &[u8]) -> io::Result<()> {
+    fs::create_dir_all(directory)?;
+    let index = CRASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = directory.join(format!(
+        "{CRASH_FILE_PREFIX}{session_id}-{index:03}{CRASH_FILE_SUFFIX}"
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let record = truncate_bytes(record, MAX_CRASH_FILE_BYTES.saturating_sub(1) as usize);
+    file.write_all(record)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    file.sync_data()?;
+    prune_owned_crashes(directory, &path)
+}
+
+fn truncate_bytes(value: &[u8], max_bytes: usize) -> &[u8] {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && std::str::from_utf8(&value[..end]).is_err() {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn write_crash_stderr(record: &[u8]) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(record);
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
+}
+
+fn prune_owned_crashes(directory: &Path, current_path: &Path) -> io::Result<()> {
+    let mut crashes = retained_files(directory, is_owned_crash_name)?;
+    crashes.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut total_bytes = crashes.iter().map(|crash| crash.bytes).sum::<u64>();
+
+    while crashes.len() > MAX_CRASH_FILES || total_bytes > MAX_CRASH_TOTAL_BYTES {
+        let Some(index) = crashes.iter().position(|crash| crash.path != current_path) else {
+            break;
+        };
+        let removed = crashes.remove(index);
+        match fs::remove_file(&removed.path) {
+            Ok(()) => total_bytes = total_bytes.saturating_sub(removed.bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                total_bytes = total_bytes.saturating_sub(removed.bytes);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Install Rustle's single process-wide tracing subscriber.
 ///
 /// File-system failures degrade through isolated directories and finally to a
 /// redacted stderr sink. A pre-existing external subscriber is treated as an
 /// already usable sink instead of causing application startup to panic.
 pub fn initialize() -> ObservabilityGuard {
+    set_runtime_phase(RuntimePhase::Observability);
     let session_id = new_session_id();
     let redactor = Arc::new(Redactor::new(home_directory()));
     let filter = select_filter();
@@ -160,6 +464,11 @@ pub fn initialize() -> ObservabilityGuard {
                 writer,
                 failures,
             } = file_sink;
+            install_panic_hook(CrashRuntime::new(
+                session_id.clone(),
+                redactor.clone(),
+                CrashSink::Directory(writer.directory().to_path_buf()),
+            ));
             let (non_blocking, worker_guard) = NonBlockingBuilder::default()
                 .buffered_lines_limit(NON_BLOCKING_BUFFERED_LINES)
                 .lossy(true)
@@ -191,6 +500,11 @@ pub fn initialize() -> ObservabilityGuard {
             }
         }
         Err(failures) => {
+            install_panic_hook(CrashRuntime::new(
+                session_id.clone(),
+                redactor.clone(),
+                CrashSink::Stderr,
+            ));
             let stderr_writer = RedactingMakeWriter::stderr(redactor);
             if install_stderr_subscriber(stderr_writer, &filter.directive).is_err() {
                 eprintln!(
@@ -355,6 +669,14 @@ fn configured_log_directories() -> Vec<DirectoryCandidate> {
     candidates
 }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn diagnostic_directories() -> Vec<PathBuf> {
+    configured_log_directories()
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
+}
+
 fn push_unique_candidate(candidates: &mut Vec<DirectoryCandidate>, candidate: DirectoryCandidate) {
     if !candidates
         .iter()
@@ -397,13 +719,13 @@ fn new_session_id() -> String {
     format!("{timestamp:x}-{:x}-{sequence:x}", std::process::id())
 }
 
-fn build_commit() -> &'static str {
+pub(crate) fn build_commit() -> &'static str {
     option_env!("RUSTLE_BUILD_COMMIT")
         .or(option_env!("GITHUB_SHA"))
         .unwrap_or("unknown")
 }
 
-fn pinned_toolchain() -> &'static str {
+pub(crate) fn pinned_toolchain() -> &'static str {
     TOOLCHAIN_MANIFEST
         .lines()
         .find_map(|line| {
@@ -417,6 +739,11 @@ fn home_directory() -> Option<PathBuf> {
     env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn diagnostic_redactor() -> Redactor {
+    Redactor::new(home_directory())
 }
 
 #[derive(Debug)]
@@ -458,6 +785,10 @@ impl RotatingFileWriter {
         self.current_len = 0;
         self.next_index = next_index;
         self.prune()
+    }
+
+    fn directory(&self) -> &Path {
+        &self.directory
     }
 
     fn prune(&mut self) -> io::Result<()> {
@@ -517,24 +848,32 @@ struct RetainedLog {
     bytes: u64,
 }
 
-fn prune_owned_logs(
+fn retained_files(
     directory: &Path,
-    current_path: &Path,
-    policy: RotationPolicy,
-) -> io::Result<()> {
-    let mut logs = Vec::new();
+    is_owned: fn(&std::ffi::OsStr) -> bool,
+) -> io::Result<Vec<RetainedLog>> {
+    let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || !is_owned_log_name(&entry.file_name()) {
+        if !entry.file_type()?.is_file() || !is_owned(&entry.file_name()) {
             continue;
         }
         let metadata = entry.metadata()?;
-        logs.push(RetainedLog {
+        files.push(RetainedLog {
             path: entry.path(),
             modified: metadata.modified().unwrap_or(UNIX_EPOCH),
             bytes: metadata.len(),
         });
     }
+    Ok(files)
+}
+
+fn prune_owned_logs(
+    directory: &Path,
+    current_path: &Path,
+    policy: RotationPolicy,
+) -> io::Result<()> {
+    let mut logs = retained_files(directory, is_owned_log_name)?;
 
     logs.sort_by(|left, right| {
         left.modified
@@ -559,7 +898,7 @@ fn prune_owned_logs(
     Ok(())
 }
 
-fn is_owned_log_name(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_owned_log_name(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -580,19 +919,40 @@ fn is_owned_log_name(name: &std::ffi::OsStr) -> bool {
         && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+pub(crate) fn is_owned_crash_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(stem) = name
+        .strip_prefix(CRASH_FILE_PREFIX)
+        .and_then(|name| name.strip_suffix(CRASH_FILE_SUFFIX))
+    else {
+        return false;
+    };
+    let Some((session_id, index)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        && index.len() >= 3
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 #[derive(Debug)]
-struct Redactor {
+pub(crate) struct Redactor {
     home: Option<String>,
 }
 
 impl Redactor {
-    fn new(home: Option<PathBuf>) -> Self {
+    pub(crate) fn new(home: Option<PathBuf>) -> Self {
         Self {
             home: home.map(|path| path.to_string_lossy().into_owned()),
         }
     }
 
-    fn redact(&self, input: &str) -> String {
+    pub(crate) fn redact(&self, input: &str) -> String {
         let mut output = input.to_string();
         if let Some(home) = self.home.as_deref().filter(|home| !home.is_empty()) {
             output = replace_ascii_case_insensitive(&output, home, "<user-home>");
@@ -605,6 +965,7 @@ impl Redactor {
             "music_u",
             "__csrf",
             "csrf_token",
+            "token",
             "access_token",
             "refresh_token",
             "session_token",
@@ -879,6 +1240,7 @@ impl Drop for RedactedEventWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     struct TestDirectory(PathBuf);
 
@@ -1037,6 +1399,118 @@ mod tests {
         assert!(!is_owned_log_name(std::ffi::OsStr::new(
             "rustle-session-a1-b2.log.bak"
         )));
+        assert!(is_owned_crash_name(std::ffi::OsStr::new(
+            "rustle-crash-a1-b2-001.jsonl"
+        )));
+        assert!(!is_owned_crash_name(std::ffi::OsStr::new(
+            "rustle-crash-notes-001.jsonl"
+        )));
+    }
+
+    #[test]
+    fn crash_record_is_bounded_json_and_reuses_privacy_redaction() {
+        let redactor = Redactor::new(Some(PathBuf::from(r"C:\Users\Alice")));
+        let payload = format!(
+            "token=hidden url=https://example.test/play?id=7 path={} {}",
+            r"C:\Users\Alice\Music\private.flac",
+            "x".repeat(MAX_PANIC_PAYLOAD_BYTES * 2)
+        );
+        let record = format_crash_record(
+            "abc123",
+            "worker-secret",
+            &payload,
+            r"C:\Users\Alice\src\main.rs:7:9",
+            Some(r"frame C:\Users\Alice\src\main.rs"),
+            &redactor,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&record).unwrap();
+        let serialized = String::from_utf8(record).unwrap();
+
+        for secret in ["hidden", "id=7", "Alice", "private.flac"] {
+            assert!(!serialized.contains(secret), "crash record leaked {secret}");
+        }
+        assert_eq!(value["event"], "panic");
+        assert_eq!(value["session_id"], "abc123");
+        assert!(value["payload"].as_str().unwrap().len() <= MAX_PANIC_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn crash_retention_is_bounded_and_preserves_unrelated_files() {
+        let directory = TestDirectory::new("crash-retention");
+        let unrelated = directory.0.join("user-crash-notes.jsonl");
+        fs::write(&unrelated, b"keep me").unwrap();
+
+        for index in 0..6 {
+            let session = format!("abc{index:x}");
+            write_crash_file(&directory.0, &session, b"{\"event\":\"panic\"}").unwrap();
+        }
+
+        let crashes = fs::read_dir(&directory.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| is_owned_crash_name(&entry.file_name()))
+            .collect::<Vec<_>>();
+        let total_bytes = crashes
+            .iter()
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(crashes.len() <= MAX_CRASH_FILES);
+        assert!(total_bytes <= MAX_CRASH_TOTAL_BYTES);
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn panic_fixture_entrypoint() {
+        let Some(directory) = env::var_os("RUSTLE_PANIC_FIXTURE_DIR") else {
+            return;
+        };
+        install_panic_hook(CrashRuntime::new(
+            "abc123".to_string(),
+            Arc::new(Redactor::new(None)),
+            CrashSink::Directory(PathBuf::from(directory)),
+        ));
+        set_runtime_phase(RuntimePhase::Application);
+        panic!("token=hidden url=https://example.test/?signed=yes path=/home/alice/private.flac");
+    }
+
+    #[test]
+    fn panic_hook_subprocess_writes_a_redacted_synchronous_record() {
+        let directory = TestDirectory::new("panic-subprocess");
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "observability::tests::panic_fixture_entrypoint",
+                "--test-threads=1",
+            ])
+            .env("RUSTLE_PANIC_FIXTURE_DIR", &directory.0)
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+
+        let record_path = fs::read_dir(&directory.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| is_owned_crash_name(&entry.file_name()))
+            .expect("panic hook crash record")
+            .path();
+        let record = fs::read_to_string(record_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(record.trim()).unwrap();
+        assert_eq!(value["event"], "panic");
+        assert_eq!(value["phase"], "application");
+        for secret in ["hidden", "signed=yes", "alice", "private.flac"] {
+            assert!(!record.contains(secret), "panic hook leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn panic_hook_failure_runs_the_fixed_fallback() {
+        let fallback_ran = AtomicBool::new(false);
+        run_panic_hook(
+            || panic!("sensitive panic-hook implementation failure"),
+            || fallback_ran.store(true, Ordering::Relaxed),
+        );
+        assert!(fallback_ran.load(Ordering::Relaxed));
     }
 
     #[test]

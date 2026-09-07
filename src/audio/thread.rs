@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rodio::{Player as Sink, Source};
@@ -226,9 +226,10 @@ impl StreamingSeekWorker {
             std::sync::mpsc::sync_channel::<StreamingSeekRequest>(STREAMING_SEEK_QUEUE_CAPACITY);
         let active_cancellation =
             std::sync::Arc::new(parking_lot::Mutex::new(None::<StreamingReaderCancellation>));
-        thread::Builder::new()
-            .name("audio-streaming-seek".to_string())
-            .spawn(move || {
+        crate::runtime::spawn_guarded(
+            "audio-streaming-seek",
+            "prepare_streaming_seek",
+            move || {
                 while let Ok(request) = request_rx.recv() {
                     let StreamingSeekRequest {
                         context,
@@ -280,8 +281,9 @@ impl StreamingSeekWorker {
                         break;
                     }
                 }
-            })
-            .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
+            },
+        )
+        .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
         Ok(Self {
             request_tx,
             active_cancellation,
@@ -340,9 +342,10 @@ impl StreamingPreparationPool {
         let active_playback_cancellation =
             std::sync::Arc::new(parking_lot::Mutex::new(None::<StreamingReaderCancellation>));
         let playback_result_tx = result_tx.clone();
-        thread::Builder::new()
-            .name("audio-playback-prepare".to_string())
-            .spawn(move || {
+        crate::runtime::spawn_guarded(
+            "audio-playback-prepare",
+            "prepare_streaming_playback",
+            move || {
                 while let Ok(request) = playback_rx.recv() {
                     let PlaybackPreparationRequest {
                         context,
@@ -388,14 +391,16 @@ impl StreamingPreparationPool {
                         break;
                     }
                 }
-            })
-            .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
+            },
+        )
+        .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
         let (preload_tx, preload_rx) =
             std::sync::mpsc::sync_channel(STREAMING_PREPARATION_QUEUE_CAPACITY);
-        thread::Builder::new()
-            .name("audio-preload-prepare".to_string())
-            .spawn(move || {
+        crate::runtime::spawn_guarded(
+            "audio-preload-prepare",
+            "prepare_streaming_preload",
+            move || {
                 while let Ok(request) = preload_rx.recv() {
                     let PreloadPreparationRequest {
                         identity,
@@ -428,8 +433,9 @@ impl StreamingPreparationPool {
                         break;
                     }
                 }
-            })
-            .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
+            },
+        )
+        .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
         Ok(Self {
             playback_tx,
@@ -551,9 +557,8 @@ pub fn spawn_audio_thread(
     let device_name_owned = device_name.map(|s| s.to_string());
 
     // Spawn audio thread
-    let thread_handle = thread::Builder::new()
-        .name("audio-player".to_string())
-        .spawn(move || {
+    let thread_handle =
+        crate::runtime::spawn_guarded("audio-player", "audio_control_actor", move || {
             // Create player in audio thread
             let player_result = if let Some(ref name) = device_name_owned {
                 AudioPlayer::with_device(Some(name), chain)
