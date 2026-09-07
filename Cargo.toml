@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/rustle-application",
+    "crates/rustle-audio",
     "crates/rustle-domain",
     "crates/rustle-media",
     "crates/rustle-ncm",
@@ -33,6 +34,7 @@ zip = { version = "8.1.0", default-features = false, features = ["deflate-flate2
 fs4 = "1.1.0"
 regex = "1.13"
 rustle-application = { path = "crates/rustle-application" }
+rustle-audio = { path = "crates/rustle-audio" }
 rustle-domain = { path = "crates/rustle-domain" }
 rustle-media = { path = "crates/rustle-media" }
 rustle-ncm = { path = "crates/rustle-ncm" }
@@ -79,9 +81,6 @@ iced = { version = "=0.15.0-dev", features = ["tokio", "advanced", "canvas", "im
 iced_runtime = { version = "=0.15.0-dev" }
 bytemuck = { version = "1.25", features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"] }
-rodio = { version = "0.22.2", features = ["symphonia-all"] }
-spectrum-analyzer = "1.8.0"
-
 lofty = "0.25.1"
 walkdir = "2.5.0"
 directories = "6.0.0"
@@ -95,6 +94,7 @@ zip = { workspace = true, optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 rustle-application.workspace = true
+rustle-audio.workspace = true
 rustle-domain.workspace = true
 rustle-media.workspace = true
 rustle-ncm.workspace = true

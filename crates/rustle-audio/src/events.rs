@@ -732,6 +732,9 @@ mod tests {
             panic!("constructed the wrong audio event variant");
         };
         assert!(matches!(error, PlaybackError::Cancelled(_)));
-        assert_eq!(error.code(), crate::error::ErrorCode::OperationCancelled);
+        assert_eq!(
+            error.code(),
+            rustle_application::error::ErrorCode::OperationCancelled
+        );
     }
 }

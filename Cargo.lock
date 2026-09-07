@@ -5313,8 +5313,8 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rfd",
- "rodio",
  "rustle-application",
+ "rustle-audio",
  "rustle-domain",
  "rustle-media",
  "rustle-ncm",
@@ -5323,7 +5323,6 @@ dependencies = [
  "serde",
  "serde_json",
  "souvlaki",
- "spectrum-analyzer",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5343,6 +5342,22 @@ name = "rustle-application"
 version = "0.5.2"
 dependencies = [
  "rustle-domain",
+]
+
+[[package]]
+name = "rustle-audio"
+version = "0.5.2"
+dependencies = [
+ "parking_lot",
+ "reqwest 0.13.4",
+ "rodio",
+ "rustle-application",
+ "rustle-domain",
+ "serde",
+ "serde_json",
+ "spectrum-analyzer",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

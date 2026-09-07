@@ -26,7 +26,7 @@ struct SourceContractRule {
 
 const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
     SourceContractRule {
-        path: "src/audio/player.rs",
+        path: "crates/rustle-audio/src/player.rs",
         forbidden: "classify_playback_error",
         rationale: "playback failures must be classified by the producer, never by parsing text",
     },
@@ -76,22 +76,22 @@ const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
         rationale: "application error messages must carry AppError",
     },
     SourceContractRule {
-        path: "src/audio/events.rs",
+        path: "crates/rustle-audio/src/events.rs",
         forbidden: "error: String",
         rationale: "audio events must transport PlaybackError without a parallel text classifier",
     },
     SourceContractRule {
-        path: "src/audio/streaming.rs",
+        path: "crates/rustle-audio/src/streaming.rs",
         forbidden: "Error(String)",
         rationale: "streaming terminal events must retain PlaybackError",
     },
     SourceContractRule {
-        path: "src/audio/streaming.rs",
+        path: "crates/rustle-audio/src/streaming.rs",
         forbidden: "    Failed(String),",
         rationale: "streaming health must retain PlaybackError",
     },
     SourceContractRule {
-        path: "src/audio/streaming.rs",
+        path: "crates/rustle-audio/src/streaming.rs",
         forbidden: "Fatal(String)",
         rationale: "range failures must be classified at production",
     },
@@ -465,6 +465,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
     for package_name in [
         "rustle-domain",
         "rustle-application",
+        "rustle-audio",
         "rustle-media",
         "rustle-storage",
         "rustle-ncm",
@@ -491,6 +492,18 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         let allowed: &[&str] = match package_name {
             "rustle-domain" => &["regex", "serde", "serde_json"],
             "rustle-application" => &["rustle-domain"],
+            "rustle-audio" => &[
+                "parking_lot",
+                "reqwest",
+                "rodio",
+                "rustle-application",
+                "rustle-domain",
+                "serde",
+                "serde_json",
+                "spectrum-analyzer",
+                "tokio",
+                "tracing",
+            ],
             "rustle-media" => &[
                 "encoding_rs",
                 "image",
@@ -558,7 +571,10 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
             violations
                 .push("package `rustle-application` must depend on `rustle-domain`".to_string());
         }
-        if matches!(package_name, "rustle-media" | "rustle-storage") {
+        if matches!(
+            package_name,
+            "rustle-audio" | "rustle-media" | "rustle-storage"
+        ) {
             for required_dependency in ["rustle-domain", "rustle-application"] {
                 if !metadata_array(package, "dependencies")?
                     .iter()
@@ -599,6 +615,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
     for dependency in [
         "rustle-domain",
         "rustle-application",
+        "rustle-audio",
         "rustle-media",
         "rustle-storage",
         "rustle-ncm",
@@ -849,6 +866,51 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "media must not depend on sibling adapters",
             ),
             ("rustle_ui", "media must not depend on sibling adapters"),
+        ]);
+    }
+    if path.starts_with("crates/rustle-audio/src/") {
+        forbidden.extend([
+            ("iced::", "audio must be UI-framework free"),
+            ("sqlx::", "audio must not own database adapters"),
+            ("ncm_api_rs", "audio must not own NCM protocol types"),
+            ("crate::api", "audio must not depend on the root NCM facade"),
+            ("crate::cache", "audio must consume application cache ports"),
+            (
+                "crate::database",
+                "audio must not depend on root storage facades",
+            ),
+            ("crate::features", "audio must not depend on root features"),
+            (
+                "crate::platform",
+                "audio must not depend on platform adapters",
+            ),
+            ("crate::ui", "audio must not depend on UI adapters"),
+            (
+                "crate::app::",
+                "audio must not depend on the composition root",
+            ),
+            ("crate::runtime", "audio worker spawning must be injected"),
+            ("crate::error", "audio must use application errors directly"),
+            ("crate::domain", "audio must use domain contracts directly"),
+            (
+                "crate::application",
+                "audio must use application contracts directly",
+            ),
+            (
+                "rustle_storage",
+                "audio must not depend on sibling adapters",
+            ),
+            ("rustle_ncm", "audio must not depend on sibling adapters"),
+            ("rustle_media", "audio must not depend on sibling adapters"),
+            (
+                "rustle_platform",
+                "audio must not depend on sibling adapters",
+            ),
+            (
+                "rustle_observability",
+                "audio must not depend on sibling adapters",
+            ),
+            ("rustle_ui", "audio must not depend on sibling adapters"),
         ]);
     }
 
@@ -1391,7 +1453,7 @@ mod tests {
     fn typed_error_source_contracts_reject_string_regressions() {
         assert!(
             !source_contract_violations(
-                "src/audio/player.rs",
+                "crates/rustle-audio/src/player.rs",
                 "fn classify_playback_error(message: &str) {}"
             )
             .is_empty()
@@ -1424,7 +1486,7 @@ mod tests {
         );
         assert!(
             architecture_source_contract_violations(
-                "src/audio/streaming.rs",
+                "crates/rustle-audio/src/streaming.rs",
                 "crate::cache::publish_or_reuse(); crate::api::NcmQualityLevel;",
             )
             .len()
@@ -1484,12 +1546,20 @@ mod tests {
             .len(),
             2
         );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-audio/src/thread.rs",
+                "use crate::runtime::spawn_guarded; use rustle_storage::AudioManifest;",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "media-id", "storage-id", "ncm-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "audio-id", "media-id", "storage-id", "ncm-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1504,6 +1574,22 @@ mod tests {
                     "name": "rustle-application",
                     "id": "application-id",
                     "dependencies": [{"name": "rustle-domain"}]
+                },
+                {
+                    "name": "rustle-audio",
+                    "id": "audio-id",
+                    "dependencies": [
+                        {"name": "parking_lot"},
+                        {"name": "reqwest"},
+                        {"name": "rodio"},
+                        {"name": "rustle-application"},
+                        {"name": "rustle-domain"},
+                        {"name": "serde"},
+                        {"name": "serde_json"},
+                        {"name": "spectrum-analyzer"},
+                        {"name": "tokio"},
+                        {"name": "tracing"}
+                    ]
                 },
                 {
                     "name": "rustle-media",
@@ -1569,6 +1655,7 @@ mod tests {
                     "dependencies": [
                         {"name": "rustle-domain"},
                         {"name": "rustle-application"},
+                        {"name": "rustle-audio"},
                         {"name": "rustle-media"},
                         {"name": "rustle-storage"},
                         {"name": "rustle-ncm"}

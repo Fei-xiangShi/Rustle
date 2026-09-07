@@ -29,6 +29,13 @@ use super::streaming::{
     SharedBuffer, SharedBufferHealth, StreamingBuffer, StreamingReaderCancellation,
 };
 
+pub type WorkerTask = Box<dyn FnOnce() + Send + 'static>;
+pub type WorkerSpawner = fn(
+    thread_name: &'static str,
+    operation: &'static str,
+    worker: WorkerTask,
+) -> std::io::Result<JoinHandle<()>>;
+
 const STREAMING_PREPARATION_QUEUE_CAPACITY: usize = 4;
 const STREAMING_PREPARATION_RESULT_CAPACITY: usize = 8;
 const STREAMING_SEEK_QUEUE_CAPACITY: usize = 1;
@@ -221,15 +228,18 @@ fn cancel_streaming_seek_runtime(
 }
 
 impl StreamingSeekWorker {
-    fn new(result_tx: tokio::sync::mpsc::Sender<StreamingSeekResult>) -> PlaybackResult<Self> {
+    fn new(
+        result_tx: tokio::sync::mpsc::Sender<StreamingSeekResult>,
+        spawn_worker: WorkerSpawner,
+    ) -> PlaybackResult<Self> {
         let (request_tx, request_rx) =
             std::sync::mpsc::sync_channel::<StreamingSeekRequest>(STREAMING_SEEK_QUEUE_CAPACITY);
         let active_cancellation =
             std::sync::Arc::new(parking_lot::Mutex::new(None::<StreamingReaderCancellation>));
-        crate::runtime::spawn_guarded(
+        spawn_worker(
             "audio-streaming-seek",
             "prepare_streaming_seek",
-            move || {
+            Box::new(move || {
                 while let Ok(request) = request_rx.recv() {
                     let StreamingSeekRequest {
                         context,
@@ -281,7 +291,7 @@ impl StreamingSeekWorker {
                         break;
                     }
                 }
-            },
+            }),
         )
         .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
         Ok(Self {
@@ -336,16 +346,17 @@ struct StreamingPreparationPool {
 impl StreamingPreparationPool {
     fn new(
         result_tx: tokio::sync::mpsc::Sender<StreamingPreparationResult>,
+        spawn_worker: WorkerSpawner,
     ) -> PlaybackResult<Self> {
         let (playback_tx, playback_rx) =
             std::sync::mpsc::sync_channel(STREAMING_PREPARATION_QUEUE_CAPACITY);
         let active_playback_cancellation =
             std::sync::Arc::new(parking_lot::Mutex::new(None::<StreamingReaderCancellation>));
         let playback_result_tx = result_tx.clone();
-        crate::runtime::spawn_guarded(
+        spawn_worker(
             "audio-playback-prepare",
             "prepare_streaming_playback",
-            move || {
+            Box::new(move || {
                 while let Ok(request) = playback_rx.recv() {
                     let PlaybackPreparationRequest {
                         context,
@@ -391,16 +402,16 @@ impl StreamingPreparationPool {
                         break;
                     }
                 }
-            },
+            }),
         )
         .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
         let (preload_tx, preload_rx) =
             std::sync::mpsc::sync_channel(STREAMING_PREPARATION_QUEUE_CAPACITY);
-        crate::runtime::spawn_guarded(
+        spawn_worker(
             "audio-preload-prepare",
             "prepare_streaming_preload",
-            move || {
+            Box::new(move || {
                 while let Ok(request) = preload_rx.recv() {
                     let PreloadPreparationRequest {
                         identity,
@@ -433,7 +444,7 @@ impl StreamingPreparationPool {
                         break;
                     }
                 }
-            },
+            }),
         )
         .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
@@ -526,9 +537,10 @@ impl Drop for AudioThreadHandle {
 ///
 /// # Returns
 /// * `AudioThreadHandle` containing the handle and event receiver
-pub fn spawn_audio_thread(
+pub fn spawn_audio_thread_with(
     device_name: Option<&str>,
     chain: AudioProcessingChain,
+    spawn_worker: WorkerSpawner,
 ) -> PlaybackResult<AudioThreadHandle> {
     // Create channels
     let (command_tx, command_rx) = audio_command_channel();
@@ -536,10 +548,10 @@ pub fn spawn_audio_thread(
     let latest_controls = LatestControlMailbox::new(command_tx.clone());
     let (preparation_result_tx, preparation_result_rx) =
         tokio::sync::mpsc::channel(STREAMING_PREPARATION_RESULT_CAPACITY);
-    let preparation_pool = StreamingPreparationPool::new(preparation_result_tx)?;
+    let preparation_pool = StreamingPreparationPool::new(preparation_result_tx, spawn_worker)?;
     let (seek_result_tx, seek_result_rx) =
         tokio::sync::mpsc::channel(STREAMING_SEEK_RESULT_CAPACITY);
-    let seek_worker = StreamingSeekWorker::new(seek_result_tx)?;
+    let seek_worker = StreamingSeekWorker::new(seek_result_tx, spawn_worker)?;
 
     // Create shared state
     let state = SharedPlaybackState::new();
@@ -557,8 +569,10 @@ pub fn spawn_audio_thread(
     let device_name_owned = device_name.map(|s| s.to_string());
 
     // Spawn audio thread
-    let thread_handle =
-        crate::runtime::spawn_guarded("audio-player", "audio_control_actor", move || {
+    let thread_handle = spawn_worker(
+        "audio-player",
+        "audio_control_actor",
+        Box::new(move || {
             // Create player in audio thread
             let player_result = if let Some(ref name) = device_name_owned {
                 AudioPlayer::with_device(Some(name), chain)
@@ -594,8 +608,9 @@ pub fn spawn_audio_thread(
                     tracing::error!("Failed to create audio player: {}", e);
                 }
             }
-        })
-        .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
+        }),
+    )
+    .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
     Ok(AudioThreadHandle {
         handle,
@@ -2985,6 +3000,16 @@ fn check_playback_finished(
 mod tests {
     use super::*;
 
+    fn test_worker_spawner(
+        thread_name: &'static str,
+        _operation: &'static str,
+        worker: WorkerTask,
+    ) -> std::io::Result<JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(worker)
+    }
+
     #[test]
     fn maintenance_deadline_wakes_without_a_critical_command() {
         let (critical_tx, mut critical_rx) = audio_command_channel();
@@ -3023,8 +3048,8 @@ mod tests {
 
         let (seek_result_tx, mut seek_result_rx) =
             tokio::sync::mpsc::channel(STREAMING_SEEK_RESULT_CAPACITY);
-        let worker = StreamingSeekWorker::new(seek_result_tx).unwrap();
-        let generation = crate::audio::identity::PlaybackGenerationController::new();
+        let worker = StreamingSeekWorker::new(seek_result_tx, test_worker_spawner).unwrap();
+        let generation = crate::identity::PlaybackGenerationController::new();
         let context = generation.activate_generation();
         let (_, nonce) = generation.seek_context().unwrap();
         let streaming_buffer = StreamingBuffer::new(buffer.clone());
@@ -3089,7 +3114,7 @@ mod tests {
 
     #[test]
     fn pause_intent_is_consumed_only_by_its_preparation_context() {
-        let generation = crate::audio::identity::PlaybackGenerationController::new();
+        let generation = crate::identity::PlaybackGenerationController::new();
         let first = generation.activate_generation();
         let second = generation.activate_generation();
         let mut pending = Some(first.clone());
@@ -3104,7 +3129,7 @@ mod tests {
     fn completed_preparation_token_cannot_cancel_an_installed_reader() {
         let (result_tx, _result_rx) =
             tokio::sync::mpsc::channel(STREAMING_PREPARATION_RESULT_CAPACITY);
-        let pool = StreamingPreparationPool::new(result_tx).unwrap();
+        let pool = StreamingPreparationPool::new(result_tx, test_worker_spawner).unwrap();
         let shared = SharedBuffer::new(16);
         let reader = StreamingBuffer::new(shared);
         let cancellation = reader.reader_cancellation();
@@ -3182,8 +3207,8 @@ mod tests {
     fn stalled_streaming_preparation_does_not_consume_critical_capacity() {
         let (result_tx, mut result_rx) =
             tokio::sync::mpsc::channel(STREAMING_PREPARATION_RESULT_CAPACITY);
-        let pool = StreamingPreparationPool::new(result_tx).unwrap();
-        let generation = crate::audio::identity::PlaybackGenerationController::new();
+        let pool = StreamingPreparationPool::new(result_tx, test_worker_spawner).unwrap();
+        let generation = crate::identity::PlaybackGenerationController::new();
         let context = generation.activate_generation();
         let shared = SharedBuffer::new(1024);
         shared.set_coordinator_active_for_test(true);
@@ -3237,37 +3262,31 @@ mod tests {
     #[test]
     fn finished_guard_is_exactly_once_per_generation() {
         let mut guard = FinishedGuard::default();
+        assert!(!guard.try_mark(crate::identity::PlaybackGeneration(1), FinishReason::Stop));
         assert!(!guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(1),
-            FinishReason::Stop
-        ));
-        assert!(!guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(1),
+            crate::identity::PlaybackGeneration(1),
             FinishReason::SeekRebuild
         ));
         assert!(!guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(1),
+            crate::identity::PlaybackGeneration(1),
             FinishReason::TransitionDisposed
         ));
-        assert!(!guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(1),
-            FinishReason::Stale
-        ));
+        assert!(!guard.try_mark(crate::identity::PlaybackGeneration(1), FinishReason::Stale));
         assert!(guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(1),
+            crate::identity::PlaybackGeneration(1),
             FinishReason::Natural
         ));
         assert!(!guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(1),
+            crate::identity::PlaybackGeneration(1),
             FinishReason::Natural
         ));
         assert!(guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(2),
+            crate::identity::PlaybackGeneration(2),
             FinishReason::Natural
         ));
         guard.reset();
         assert!(guard.try_mark(
-            crate::audio::identity::PlaybackGeneration(2),
+            crate::identity::PlaybackGeneration(2),
             FinishReason::Natural
         ));
     }

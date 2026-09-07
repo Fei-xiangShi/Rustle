@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::application::ports::cache::CachePublisher;
 use rodio::Source;
+use rustle_application::ports::cache::CachePublisher;
 use serde::{Deserialize, Serialize};
 
 pub const ANALYSIS_SCHEMA_VERSION: u32 = 3;
@@ -1262,7 +1262,7 @@ mod tests {
             temp_path: &Path,
             final_path: &Path,
             expected_size: Option<u64>,
-        ) -> std::io::Result<crate::application::ports::cache::PublishOutcome> {
+        ) -> std::io::Result<rustle_application::ports::cache::PublishOutcome> {
             let temp_size = fs::metadata(temp_path)?.len();
             if let Some(expected_size) = expected_size
                 && expected_size != temp_size
@@ -1276,10 +1276,10 @@ mod tests {
                 .is_ok_and(|metadata| metadata.is_file() && metadata.len() == temp_size)
             {
                 self.cleanup_temp_file(temp_path);
-                return Ok(crate::application::ports::cache::PublishOutcome::Reused);
+                return Ok(rustle_application::ports::cache::PublishOutcome::Reused);
             }
             fs::rename(temp_path, final_path)?;
-            Ok(crate::application::ports::cache::PublishOutcome::Published)
+            Ok(rustle_application::ports::cache::PublishOutcome::Published)
         }
     }
 

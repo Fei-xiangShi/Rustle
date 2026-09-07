@@ -1,37 +1,19 @@
-//! Audio playback module
-//!
-//! This module provides audio playback with real-time processing:
-//! - `AudioHandle`: Non-blocking audio control from UI thread
-//! - `AudioPlayer`: Playback control
-//! - `AudioProcessingChain`: Unified audio processing (preamp, EQ, analyzer)
-//! - `AudioAnalysisData`: Real-time visualization data
-//! - `streaming`: Streaming buffer and download utilities
-//! - `events`: Commands and events for audio thread communication
-//! - `thread`: Audio thread spawning and management
-//!
-//! ## Architecture
-//! ```text
-//! UI Thread (AudioHandle) --[AudioCommand]--> Audio Thread (AudioPlayer)
-//! UI Thread              <--[AudioEvent]---- Audio Thread
-//! UI Thread              <--[SharedState]--- Audio Thread (non-blocking reads)
-//! ```
+//! Compatibility facade and desktop worker-spawn composition for `rustle-audio`.
 
-pub mod analyzer;
-pub mod automix;
-pub mod chain;
-mod equalizer;
-pub mod events;
-mod fade;
-mod handle;
-pub mod identity;
-mod player;
-pub mod streaming;
-pub mod thread;
+pub use rustle_audio::*;
 
-pub use analyzer::AudioAnalysisData;
-pub use chain::AudioProcessingChain;
-pub use events::AudioEvent;
-pub use handle::AudioHandle;
-pub use player::{PlaybackError, PlaybackInfo, PlaybackResult, PlaybackStatus, get_audio_devices};
-pub use streaming::{SharedBuffer, StreamingBuffer};
-pub use thread::{AudioThreadHandle, spawn_audio_thread};
+/// Spawn the audio subsystem using the process-wide guarded worker boundary.
+pub fn spawn_audio_thread(
+    device_name: Option<&str>,
+    chain: AudioProcessingChain,
+) -> PlaybackResult<AudioThreadHandle> {
+    rustle_audio::spawn_audio_thread_with(device_name, chain, guarded_audio_worker)
+}
+
+fn guarded_audio_worker(
+    thread_name: &'static str,
+    operation: &'static str,
+    worker: rustle_audio::WorkerTask,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    crate::runtime::spawn_guarded(thread_name, operation, worker)
+}

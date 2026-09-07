@@ -1294,11 +1294,11 @@ impl AudioPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::automix::{AdvancedAutomation, ScheduleGroup};
+    use crate::automix::{AdvancedAutomation, ScheduleGroup};
 
     #[test]
     fn streaming_preparation_rejects_missing_validated_length_without_waiting() {
-        let shared = crate::audio::streaming::SharedBuffer::new(0);
+        let shared = crate::streaming::SharedBuffer::new(0);
         let started = std::time::Instant::now();
         let error = match prepare_streaming_source(StreamingBuffer::new(shared)) {
             Ok(_) => panic!("source without validated length must be rejected"),
@@ -1537,31 +1537,37 @@ impl std::fmt::Display for PlaybackError {
 impl std::error::Error for PlaybackError {}
 
 impl PlaybackError {
-    pub const fn code(&self) -> crate::error::ErrorCode {
+    pub const fn code(&self) -> rustle_application::error::ErrorCode {
         match self {
-            Self::Cancelled(_) => crate::error::ErrorCode::OperationCancelled,
+            Self::Cancelled(_) => rustle_application::error::ErrorCode::OperationCancelled,
             Self::FileNotFound(_) | Self::SourceUnavailable(_) | Self::UnhealthyPreload(_) => {
-                crate::error::ErrorCode::AudioSourceUnavailable
+                rustle_application::error::ErrorCode::AudioSourceUnavailable
             }
-            Self::UnsupportedStreaming(_) => crate::error::ErrorCode::ProtocolUnsupported,
+            Self::UnsupportedStreaming(_) => {
+                rustle_application::error::ErrorCode::ProtocolUnsupported
+            }
             Self::UnsupportedFormat(_) | Self::SeekUnsupported(_) => {
-                crate::error::ErrorCode::MediaUnsupportedFormat
+                rustle_application::error::ErrorCode::MediaUnsupportedFormat
             }
-            Self::NetworkError(_) => crate::error::ErrorCode::NetworkRequestFailed,
-            Self::IoError(_) => crate::error::ErrorCode::MediaReadFailed,
-            Self::DecodeError(_) => crate::error::ErrorCode::AudioDecodeFailed,
-            Self::StreamingFailed(_) => crate::error::ErrorCode::AudioStreamingFailed,
-            Self::DeviceUnavailable(_) => crate::error::ErrorCode::AudioDeviceUnavailable,
-            Self::ControlUnavailable(_) => crate::error::ErrorCode::AudioControlUnavailable,
-            Self::InvariantViolation(_) => crate::error::ErrorCode::InvariantViolation,
+            Self::NetworkError(_) => rustle_application::error::ErrorCode::NetworkRequestFailed,
+            Self::IoError(_) => rustle_application::error::ErrorCode::MediaReadFailed,
+            Self::DecodeError(_) => rustle_application::error::ErrorCode::AudioDecodeFailed,
+            Self::StreamingFailed(_) => rustle_application::error::ErrorCode::AudioStreamingFailed,
+            Self::DeviceUnavailable(_) => {
+                rustle_application::error::ErrorCode::AudioDeviceUnavailable
+            }
+            Self::ControlUnavailable(_) => {
+                rustle_application::error::ErrorCode::AudioControlUnavailable
+            }
+            Self::InvariantViolation(_) => rustle_application::error::ErrorCode::InvariantViolation,
         }
     }
 }
 
-impl From<PlaybackError> for crate::error::AppError {
+impl From<PlaybackError> for rustle_application::error::AppError {
     fn from(error: PlaybackError) -> Self {
         let code = error.code();
-        crate::error::AppError::with_source(code, code.default_summary(), error)
+        rustle_application::error::AppError::with_source(code, code.default_summary(), error)
     }
 }
 
@@ -1571,7 +1577,7 @@ mod error_tests {
 
     #[test]
     fn every_playback_error_variant_has_a_stable_application_code() {
-        use crate::error::ErrorCode;
+        use rustle_application::error::ErrorCode;
 
         let cases = [
             (

@@ -67,9 +67,44 @@ impl QualityLevel {
     }
 }
 
+/// Detect a supported audio container/codec from its leading bytes.
+///
+/// The returned value is the stable cache-file extension used by download and
+/// streaming adapters. Detection is content-based and independent of filenames.
+pub fn detect_audio_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("flac");
+    }
+    if bytes.starts_with(&[0xFF, 0xFB])
+        || bytes.starts_with(&[0xFF, 0xFA])
+        || bytes.starts_with(&[0xFF, 0xF3])
+        || bytes.starts_with(&[0xFF, 0xF2])
+        || bytes.starts_with(b"ID3")
+    {
+        return Some("mp3");
+    }
+    if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
+        return Some("m4a");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some(if bytes.windows(8).any(|window| window == b"OpusHead") {
+            "opus"
+        } else {
+            "ogg"
+        });
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("wav");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::QualityLevel;
+    use super::{QualityLevel, detect_audio_format};
 
     #[test]
     fn serialized_values_preserve_the_existing_manifest_contract() {
@@ -87,5 +122,13 @@ mod tests {
                 quality
             );
         }
+    }
+
+    #[test]
+    fn format_detection_uses_content_signatures() {
+        assert_eq!(detect_audio_format(b"fLaCfixture"), Some("flac"));
+        assert_eq!(detect_audio_format(b"OggSxxxxOpusHead"), Some("opus"));
+        assert_eq!(detect_audio_format(b"xxxxftypfixture"), Some("m4a"));
+        assert_eq!(detect_audio_format(b"not audio"), None);
     }
 }

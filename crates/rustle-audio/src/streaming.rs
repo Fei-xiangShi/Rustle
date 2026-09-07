@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use crate::application::ports::cache::{AudioCacheStore, PublishOutcome};
-use crate::audio::identity::{PlaybackContext, PreloadIdentity};
-use crate::audio::player::{PlaybackError, PlaybackResult};
+use rustle_application::ports::cache::{AudioCacheStore, PublishOutcome};
+
+use crate::identity::{PlaybackContext, PreloadIdentity};
+use crate::player::{PlaybackError, PlaybackResult};
 use parking_lot::{Condvar, Mutex, RwLock};
 
 // ============ Constants ============
@@ -273,7 +274,7 @@ pub enum StreamingIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioCacheKey {
     pub song_id: u64,
-    pub actual_quality: crate::domain::audio::QualityLevel,
+    pub actual_quality: rustle_domain::audio::QualityLevel,
 }
 
 #[derive(Debug, Clone)]
@@ -572,7 +573,6 @@ impl std::fmt::Debug for SharedBuffer {
 
 impl SharedBuffer {
     /// Create a fixed-capacity retained-window buffer.
-    #[cfg(test)]
     pub fn new(total_size: u64) -> Self {
         Self::with_policy(total_size, StreamingBufferPolicy::default())
     }
@@ -2044,7 +2044,7 @@ pub fn start_buffer_download(
             Ok(mut reader) => {
                 let mut prefix = vec![0u8; FORMAT_DETECTION_PREFIX_BYTES];
                 let len = std::io::Read::read(&mut reader, &mut prefix).unwrap_or(0);
-                match crate::utils::detect_audio_format(&prefix[..len]) {
+                match rustle_domain::audio::detect_audio_format(&prefix[..len]) {
                     Some(extension) => extension.to_string(),
                     None => {
                         let error = PlaybackError::UnsupportedFormat(
@@ -2210,7 +2210,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestCacheStore;
 
-    impl crate::application::ports::cache::CachePublisher for TestCacheStore {
+    impl rustle_application::ports::cache::CachePublisher for TestCacheStore {
         fn unique_temp_path(&self, final_path: &std::path::Path) -> PathBuf {
             static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -2252,7 +2252,7 @@ mod tests {
             &self,
             _path: &std::path::Path,
             _song_id: u64,
-            _actual_quality: crate::domain::audio::QualityLevel,
+            _actual_quality: rustle_domain::audio::QualityLevel,
             _size: u64,
             _format: &str,
         ) -> std::io::Result<()> {
@@ -2337,14 +2337,14 @@ mod tests {
     fn audio_downloads_are_deduplicated_by_song_and_actual_quality() {
         let key = AudioCacheKey {
             song_id: 991,
-            actual_quality: crate::domain::audio::QualityLevel::Lossless,
+            actual_quality: rustle_domain::audio::QualityLevel::Lossless,
         };
         let existing = SharedBuffer::new(100);
         existing.set_coordinator_active_for_test(true);
         audio_in_flight()
             .lock()
             .insert(key, Arc::downgrade(&existing.inner));
-        let controller = crate::audio::identity::PlaybackGenerationController::new();
+        let controller = crate::identity::PlaybackGenerationController::new();
         controller.activate_generation();
 
         let reused = start_buffer_download(
@@ -2423,7 +2423,7 @@ mod tests {
             buffer: buffer.clone(),
             key: AudioCacheKey {
                 song_id: 1,
-                actual_quality: crate::domain::audio::QualityLevel::Standard,
+                actual_quality: rustle_domain::audio::QualityLevel::Standard,
             },
         });
 
@@ -2728,7 +2728,7 @@ mod tests {
             buffer: buffer.clone(),
             key: AudioCacheKey {
                 song_id: 1,
-                actual_quality: crate::domain::audio::QualityLevel::Standard,
+                actual_quality: rustle_domain::audio::QualityLevel::Standard,
             },
         });
         assert!(!buffer.inner.coordinator_active.load(Ordering::Acquire));
@@ -2853,14 +2853,14 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&cache_dir).unwrap();
-        let controller = crate::audio::identity::PlaybackGenerationController::new();
+        let controller = crate::identity::PlaybackGenerationController::new();
         let context = controller.activate_generation();
         let buffer = start_buffer_download(
             format!("http://{address}/audio.mp3"),
             cache_dir.join("range-cache"),
             AudioCacheKey {
                 song_id: unique as u64,
-                actual_quality: crate::domain::audio::QualityLevel::Standard,
+                actual_quality: rustle_domain::audio::QualityLevel::Standard,
             },
             test_cache_store(),
             Some(320_000),

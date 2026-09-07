@@ -302,45 +302,7 @@ pub fn find_cached_audio(dir: &Path, stem: &str) -> Option<PathBuf> {
 /// Detect audio format from magic bytes
 /// Returns the correct file extension (without dot)
 pub fn detect_audio_format(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() < 4 {
-        return None;
-    }
-
-    // FLAC: fLaC
-    if bytes.starts_with(b"fLaC") {
-        return Some("flac");
-    }
-
-    // MP3: MPEG audio frame sync or ID3 tag
-    if bytes.starts_with(&[0xFF, 0xFB])
-        || bytes.starts_with(&[0xFF, 0xFA])
-        || bytes.starts_with(&[0xFF, 0xF3])
-        || bytes.starts_with(&[0xFF, 0xF2])
-        || bytes.starts_with(b"ID3")
-    {
-        return Some("mp3");
-    }
-
-    // M4A/AAC: ISO-BMFF ftyp box
-    if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
-        return Some("m4a");
-    }
-
-    // OGG: OggS; identify Opus when the codec marker is present.
-    if bytes.starts_with(b"OggS") {
-        return Some(if bytes.windows(8).any(|w| w == b"OpusHead") {
-            "opus"
-        } else {
-            "ogg"
-        });
-    }
-
-    // WAV: RIFF....WAVE
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
-        return Some("wav");
-    }
-
-    None
+    crate::domain::audio::detect_audio_format(bytes)
 }
 
 // ============================================================================

@@ -1841,7 +1841,6 @@ mod tests {
     #[test]
     fn preloaded_handoff_does_not_cancel_the_outgoing_stream() {
         let outgoing = SharedBuffer::new(16);
-        outgoing.set_coordinator_active_for_test(true);
         let outgoing_observer = outgoing.clone();
         let incoming = SharedBuffer::new(32);
         let incoming_observer = incoming.clone();
