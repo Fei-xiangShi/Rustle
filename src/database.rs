@@ -3,6 +3,7 @@
 
 mod connection;
 mod error;
+mod legacy;
 mod migrations;
 mod models;
 mod ops;

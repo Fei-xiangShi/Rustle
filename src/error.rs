@@ -40,6 +40,7 @@ pub enum ErrorCode {
     BusinessRejected,
     StorageOpenFailed,
     StorageMigrationFailed,
+    StorageSchemaUnsupported,
     StorageQueryFailed,
     StorageTransactionFailed,
     StorageNotFound,
@@ -61,7 +62,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Exhaustive stable code list used by compatibility tests and diagnostics.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::OperationCancelled,
         Self::NetworkRequestFailed,
         Self::NetworkTimeout,
@@ -72,6 +73,7 @@ impl ErrorCode {
         Self::BusinessRejected,
         Self::StorageOpenFailed,
         Self::StorageMigrationFailed,
+        Self::StorageSchemaUnsupported,
         Self::StorageQueryFailed,
         Self::StorageTransactionFailed,
         Self::StorageNotFound,
@@ -103,6 +105,7 @@ impl ErrorCode {
             Self::BusinessRejected => "business.rejected",
             Self::StorageOpenFailed => "storage.open_failed",
             Self::StorageMigrationFailed => "storage.migration_failed",
+            Self::StorageSchemaUnsupported => "storage.schema_unsupported",
             Self::StorageQueryFailed => "storage.query_failed",
             Self::StorageTransactionFailed => "storage.transaction_failed",
             Self::StorageNotFound => "storage.not_found",
@@ -134,6 +137,7 @@ impl ErrorCode {
             Self::BusinessRejected => ErrorCategory::Business,
             Self::StorageOpenFailed
             | Self::StorageMigrationFailed
+            | Self::StorageSchemaUnsupported
             | Self::StorageQueryFailed
             | Self::StorageTransactionFailed
             | Self::StorageNotFound
@@ -164,6 +168,7 @@ impl ErrorCode {
             Self::ProtocolInvalidResponse
             | Self::ProtocolUnsupported
             | Self::StorageMigrationFailed
+            | Self::StorageSchemaUnsupported
             | Self::InvariantViolation => RecoveryHint::ExportDiagnostics,
             Self::BusinessRejected | Self::StorageNotFound => RecoveryHint::None,
             Self::StoragePermissionDenied

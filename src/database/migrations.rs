@@ -3,6 +3,7 @@
 use sqlx::SqlitePool;
 
 use super::error::StorageError;
+use super::legacy::{self, LegacySchemaVersion, SchemaFingerprint};
 use super::{StorageResult as Result, schema};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -11,7 +12,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub(crate) enum SchemaState {
     Empty,
     Managed,
-    Legacy,
+    Legacy(LegacySchemaVersion),
+    UnknownLegacy(SchemaFingerprint),
 }
 
 impl SchemaState {
@@ -19,7 +21,8 @@ impl SchemaState {
         match self {
             Self::Empty => "empty",
             Self::Managed => "managed",
-            Self::Legacy => "legacy",
+            Self::Legacy(_) => "legacy",
+            Self::UnknownLegacy(_) => "unknown_legacy",
         }
     }
 }
@@ -28,19 +31,35 @@ pub(crate) async fn initialize(pool: &SqlitePool) -> Result<SchemaState> {
     let state = classify(pool).await?;
     match state {
         SchemaState::Empty | SchemaState::Managed => MIGRATOR.run(pool).await?,
-        SchemaState::Legacy => schema::run_migrations(pool).await?,
+        SchemaState::Legacy(_) => schema::run_migrations(pool).await?,
+        SchemaState::UnknownLegacy(fingerprint) => {
+            tracing::error!(
+                event = "database_schema_unsupported",
+                schema_state = state.as_str(),
+                schema_fingerprint = %fingerprint,
+                "Database schema is not a recognized Rustle release"
+            );
+            return Err(StorageError::UnsupportedSchema {
+                fingerprint: fingerprint.to_string(),
+            });
+        }
     }
 
-    let version = if state == SchemaState::Legacy {
+    let version = if matches!(state, SchemaState::Legacy(_)) {
         None
     } else {
         Some(current_version(pool).await?)
+    };
+    let legacy_version = match state {
+        SchemaState::Legacy(version) => Some(version.as_str()),
+        _ => None,
     };
     tracing::info!(
         event = "database_schema_ready",
         schema_state = state.as_str(),
         migration_version = version,
-        legacy_compatibility = state == SchemaState::Legacy,
+        legacy_version,
+        legacy_compatibility = matches!(state, SchemaState::Legacy(_)),
         "Database schema initialization completed"
     );
     Ok(state)
@@ -59,7 +78,11 @@ pub(crate) async fn classify(pool: &SqlitePool) -> Result<SchemaState> {
     } else if tables.iter().any(|name| name == "_sqlx_migrations") {
         Ok(SchemaState::Managed)
     } else {
-        Ok(SchemaState::Legacy)
+        let (version, fingerprint) = legacy::identify(pool).await?;
+        Ok(match version {
+            Some(version) => SchemaState::Legacy(version),
+            None => SchemaState::UnknownLegacy(fingerprint),
+        })
     }
 }
 
@@ -92,7 +115,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::database::connection;
+    use crate::database::{connection, legacy};
     use sqlx::Row;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -299,8 +322,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(classify(&pool).await.unwrap(), SchemaState::Legacy);
-        assert_eq!(initialize(&pool).await.unwrap(), SchemaState::Legacy);
+        assert_eq!(
+            classify(&pool).await.unwrap(),
+            SchemaState::Legacy(LegacySchemaVersion::V5)
+        );
+        assert_eq!(
+            initialize(&pool).await.unwrap(),
+            SchemaState::Legacy(LegacySchemaVersion::V5)
+        );
         let playlist_name =
             sqlx::query_scalar::<_, String>("SELECT name FROM playlists WHERE name = 'kept'")
                 .fetch_one(&pool)
@@ -314,6 +343,95 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        assert_eq!(ledger_exists, 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn every_released_fixture_upgrades_without_losing_synthetic_data() {
+        for version in LegacySchemaVersion::ALL {
+            let database = TestDatabase::new(&format!("upgrade-{}", version.as_str()));
+            let pool = connection::connect(&database.path).await.unwrap();
+            legacy::apply_fixture(&pool, version).await.unwrap();
+
+            assert_eq!(
+                initialize(&pool).await.unwrap(),
+                SchemaState::Legacy(version)
+            );
+            assert_eq!(
+                classify(&pool).await.unwrap(),
+                SchemaState::Legacy(LegacySchemaVersion::V5)
+            );
+            assert_eq!(
+                initialize(&pool).await.unwrap(),
+                SchemaState::Legacy(LegacySchemaVersion::V5)
+            );
+
+            let song_title =
+                sqlx::query_scalar::<_, String>("SELECT title FROM songs WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let playlist_relation = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM playlist_songs WHERE playlist_id = 1 AND song_id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let playback_position = sqlx::query_scalar::<_, f64>(
+                "SELECT position_secs FROM playback_state WHERE id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let ledger_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = '_sqlx_migrations'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(song_title, "Fixture Song");
+            assert_eq!(playlist_relation, 1);
+            assert_eq!(playback_position, 12.5);
+            assert_eq!(ledger_exists, 0);
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_schema_is_rejected_before_any_ddl_or_data_change() {
+        let database = TestDatabase::new("unknown");
+        let pool = connection::connect(&database.path).await.unwrap();
+        legacy::apply_fixture(&pool, LegacySchemaVersion::V5)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE songs ADD COLUMN unexpected TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = legacy::fingerprint(&pool).await.unwrap();
+
+        let error = initialize(&pool).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            crate::error::ErrorCode::StorageSchemaUnsupported
+        );
+        assert!(matches!(error, StorageError::UnsupportedSchema { .. }));
+        assert_eq!(legacy::fingerprint(&pool).await.unwrap(), before);
+        let song_title = sqlx::query_scalar::<_, String>("SELECT title FROM songs WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let ledger_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(song_title, "Fixture Song");
         assert_eq!(ledger_exists, 0);
         pool.close().await;
     }

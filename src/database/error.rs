@@ -13,6 +13,8 @@ pub enum StorageError {
     Sqlx(#[from] sqlx::Error),
     #[error("database migration failed")]
     Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("database schema is not a recognized Rustle release ({fingerprint})")]
+    UnsupportedSchema { fingerprint: String },
     #[error("storage operation failed")]
     Operation(#[from] anyhow::Error),
     #[error("{entity} `{identity}` was not found")]
@@ -54,6 +56,7 @@ impl StorageError {
             }
             Self::Transaction { .. } => ErrorCode::StorageTransactionFailed,
             Self::Migration(_) => ErrorCode::StorageMigrationFailed,
+            Self::UnsupportedSchema { .. } => ErrorCode::StorageSchemaUnsupported,
             Self::Sqlx(_) | Self::Operation(_) => ErrorCode::StorageQueryFailed,
         }
     }
@@ -90,5 +93,10 @@ mod tests {
 
         let migration = StorageError::Migration(sqlx::migrate::MigrateError::VersionMismatch(1));
         assert_eq!(migration.code(), ErrorCode::StorageMigrationFailed);
+
+        let unsupported = StorageError::UnsupportedSchema {
+            fingerprint: "fixture".to_string(),
+        };
+        assert_eq!(unsupported.code(), ErrorCode::StorageSchemaUnsupported);
     }
 }
