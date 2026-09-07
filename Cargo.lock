@@ -5314,6 +5314,7 @@ dependencies = [
  "rustle-observability",
  "rustle-platform",
  "rustle-storage",
+ "rustle-ui",
  "sdf_glyph_renderer",
  "serde",
  "serde_json",
@@ -5347,6 +5348,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "rustle-cleanup"
+version = "0.5.2"
 
 [[package]]
 name = "rustle-domain"
@@ -5452,6 +5457,18 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rustle-ui"
+version = "0.5.2"
+dependencies = [
+ "bytemuck",
+ "iced",
+ "iced_runtime",
+ "image",
+ "rand 0.10.2",
+ "tracing",
 ]
 
 [[package]]

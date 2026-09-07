@@ -1,0 +1,78 @@
+[package]
+name = "rustle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A modern music player built with Rust and iced, supporting NetEase Cloud Music"
+default-run = "rustle"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["music", "player", "netease", "iced", "gui"]
+categories = ["multimedia::audio"]
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+devtools = ["iced/debug"]
+diagnostics = ["rustle-observability/diagnostics"]
+
+[[bin]]
+name = "rustle-diagnostics"
+path = "src/bin/rustle-diagnostics.rs"
+required-features = ["diagnostics"]
+
+[dependencies]
+iced = { version = "=0.15.0-dev", features = ["tokio", "advanced", "canvas", "image", "svg"] }
+iced_runtime = { version = "=0.15.0-dev" }
+bytemuck = { version = "1.25", features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"] }
+lofty = "0.25.1"
+walkdir = "2.5.0"
+directories = "6.0.0"
+
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rustle-application.workspace = true
+rustle-audio.workspace = true
+rustle-domain.workspace = true
+rustle-media.workspace = true
+rustle-ncm.workspace = true
+rustle-observability.workspace = true
+rustle-platform.workspace = true
+rustle-storage.workspace = true
+rustle-ui.workspace = true
+
+# Local playlist import
+rayon = "1.12.0"
+encoding_rs = "0.8.35"
+notify = { version = "8.2", features = ["serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rfd = "0.17.2"
+async-stream = "0.3.6"
+rand = "0.10.2"
+cosmic-text = "0.19.0"
+parking_lot = "0.12"
+
+# SDF text rendering
+sdf_glyph_renderer = "1.1.0"
+ab_glyph = "0.2"
+quick-xml = "0.42.0"
+futures-util = "0.3.34"
+
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "gzip", "stream"] }
+
+regex.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"

@@ -31,12 +31,12 @@ const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
         rationale: "playback failures must be classified by the producer, never by parsing text",
     },
     SourceContractRule {
-        path: "src/app/update/song_resolver.rs",
+        path: "apps/rustle-desktop/src/app/update/song_resolver.rs",
         forbidden: "Result<ResolvedAudioSource, String>",
         rationale: "audio-source resolution is a stable typed application boundary",
     },
     SourceContractRule {
-        path: "src/app/update/song_resolver.rs",
+        path: "apps/rustle-desktop/src/app/update/song_resolver.rs",
         forbidden: "Result<ResolvedSong, String>",
         rationale: "song resolution must preserve stable codes and source chains",
     },
@@ -51,27 +51,27 @@ const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
         rationale: "platform errors must select an explicit typed kind",
     },
     SourceContractRule {
-        path: "src/app/message.rs",
+        path: "apps/rustle-desktop/src/app/message.rs",
         forbidden: "DatabaseError(String)",
         rationale: "application error messages must carry AppError",
     },
     SourceContractRule {
-        path: "src/app/message.rs",
+        path: "apps/rustle-desktop/src/app/message.rs",
         forbidden: "SongResolveFailed(PlaybackContext, String)",
         rationale: "application error messages must carry AppError",
     },
     SourceContractRule {
-        path: "src/app/message.rs",
+        path: "apps/rustle-desktop/src/app/message.rs",
         forbidden: "DownloadError(i64, String)",
         rationale: "application error messages must carry AppError",
     },
     SourceContractRule {
-        path: "src/app/message.rs",
+        path: "apps/rustle-desktop/src/app/message.rs",
         forbidden: "LyricsLoadFailed(i64, String)",
         rationale: "application error messages must carry AppError",
     },
     SourceContractRule {
-        path: "src/app/message.rs",
+        path: "apps/rustle-desktop/src/app/message.rs",
         forbidden: "NcmPlaylistLoadFailed(u64, i64, String)",
         rationale: "application error messages must carry AppError",
     },
@@ -253,7 +253,7 @@ fn source_contract_violations(path: &str, contents: &str) -> Vec<String> {
 
 fn verify_observability_source_contract(root: &Path) -> XtaskResult<()> {
     let mut source_paths = Vec::new();
-    for source_root in [root.join("src"), root.join("crates")] {
+    for source_root in [root.join("apps"), root.join("src"), root.join("crates")] {
         if source_root.is_dir() {
             collect_rust_source_paths(&source_root, &mut source_paths)?;
         }
@@ -317,7 +317,7 @@ fn observability_source_contract_violations(path: &str, contents: &str) -> Vec<S
 
 fn verify_panic_boundary_contracts(root: &Path) -> XtaskResult<()> {
     let mut source_paths = Vec::new();
-    for source_root in [root.join("src"), root.join("crates")] {
+    for source_root in [root.join("apps"), root.join("src"), root.join("crates")] {
         if source_root.is_dir() {
             collect_rust_source_paths(&source_root, &mut source_paths)?;
         }
@@ -419,7 +419,7 @@ fn check_native(root: &Path) -> XtaskResult<()> {
 
 fn verify_architecture_source_contracts(root: &Path) -> XtaskResult<()> {
     let mut source_paths = Vec::new();
-    for source_root in [root.join("src"), root.join("crates")] {
+    for source_root in [root.join("apps"), root.join("src"), root.join("crates")] {
         if source_root.is_dir() {
             collect_rust_source_paths(&source_root, &mut source_paths)?;
         }
@@ -477,11 +477,13 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         "rustle-domain",
         "rustle-application",
         "rustle-audio",
+        "rustle-cleanup",
         "rustle-media",
         "rustle-observability",
         "rustle-platform",
         "rustle-storage",
         "rustle-ncm",
+        "rustle-ui",
     ] {
         let Some(package) = packages
             .iter()
@@ -517,6 +519,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 "tokio",
                 "tracing",
             ],
+            "rustle-cleanup" => &[],
             "rustle-media" => &[
                 "encoding_rs",
                 "image",
@@ -594,6 +597,14 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 "thiserror",
                 "tracing",
             ],
+            "rustle-ui" => &[
+                "bytemuck",
+                "iced",
+                "iced_runtime",
+                "image",
+                "rand",
+                "tracing",
+            ],
             _ => unreachable!(),
         };
 
@@ -665,6 +676,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         "rustle-platform",
         "rustle-storage",
         "rustle-ncm",
+        "rustle-ui",
     ] {
         if !root_dependencies
             .iter()
@@ -680,6 +692,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
 }
 
 fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<String> {
+    let path = path.strip_prefix("apps/rustle-desktop/").unwrap_or(path);
     let mut forbidden = Vec::new();
 
     if path.starts_with("src/features/lyrics/") || path == "src/features/media/lyrics.rs" {
@@ -1051,6 +1064,54 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "observability must not depend on storage adapters",
             ),
             ("rustle_ui", "observability must not depend on UI adapters"),
+        ]);
+    }
+    if path.starts_with("crates/rustle-ui/src/") {
+        forbidden.extend([
+            (
+                "crate::app",
+                "UI infrastructure must not depend on the desktop app",
+            ),
+            (
+                "crate::features",
+                "UI infrastructure must not depend on desktop feature owners",
+            ),
+            (
+                "crate::platform",
+                "UI infrastructure must not depend on platform adapters",
+            ),
+            (
+                "rustle_domain",
+                "UI infrastructure must remain business-neutral",
+            ),
+            (
+                "rustle_application",
+                "UI infrastructure must remain presentation infrastructure",
+            ),
+            (
+                "rustle_audio",
+                "UI infrastructure must not depend on audio adapters",
+            ),
+            (
+                "rustle_media",
+                "UI infrastructure must not depend on media adapters",
+            ),
+            (
+                "rustle_ncm",
+                "UI infrastructure must not depend on NCM adapters",
+            ),
+            (
+                "rustle_observability",
+                "UI infrastructure must not initialize observability",
+            ),
+            (
+                "rustle_platform",
+                "UI infrastructure must not depend on platform adapters",
+            ),
+            (
+                "rustle_storage",
+                "UI infrastructure must not depend on storage adapters",
+            ),
         ]);
     }
 
@@ -1600,14 +1661,14 @@ mod tests {
         );
         assert!(
             !source_contract_violations(
-                "src/app/message.rs",
+                "apps/rustle-desktop/src/app/message.rs",
                 "SongResolveFailed(PlaybackContext, String),"
             )
             .is_empty()
         );
         assert!(
             source_contract_violations(
-                "src/app/message.rs",
+                "apps/rustle-desktop/src/app/message.rs",
                 "SongResolveFailed(PlaybackContext, AppError),"
             )
             .is_empty()
@@ -1710,12 +1771,20 @@ mod tests {
             .len(),
             2
         );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-ui/src/lib.rs",
+                "use crate::app::Message; use rustle_platform::theme;",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "audio-id", "media-id", "observability-id", "platform-id", "storage-id", "ncm-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "audio-id", "cleanup-id", "media-id", "observability-id", "platform-id", "storage-id", "ncm-id", "ui-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1746,6 +1815,11 @@ mod tests {
                         {"name": "tokio"},
                         {"name": "tracing"}
                     ]
+                },
+                {
+                    "name": "rustle-cleanup",
+                    "id": "cleanup-id",
+                    "dependencies": []
                 },
                 {
                     "name": "rustle-media",
@@ -1845,6 +1919,18 @@ mod tests {
                     ]
                 },
                 {
+                    "name": "rustle-ui",
+                    "id": "ui-id",
+                    "dependencies": [
+                        {"name": "bytemuck"},
+                        {"name": "iced"},
+                        {"name": "iced_runtime"},
+                        {"name": "image"},
+                        {"name": "rand"},
+                        {"name": "tracing"}
+                    ]
+                },
+                {
                     "name": "rustle",
                     "id": "root-id",
                     "dependencies": [
@@ -1855,7 +1941,8 @@ mod tests {
                         {"name": "rustle-observability"},
                         {"name": "rustle-platform"},
                         {"name": "rustle-storage"},
-                        {"name": "rustle-ncm"}
+                        {"name": "rustle-ncm"},
+                        {"name": "rustle-ui"}
                     ]
                 }
             ]

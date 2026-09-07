@@ -283,7 +283,7 @@ jobs:
           save-if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build Windows release
-        run: cargo build --release --bin rustle --bin rustle-cleanup
+        run: cargo build --release --workspace --bin rustle --bin rustle-cleanup
 
       - name: Stage portable executable
         shell: pwsh

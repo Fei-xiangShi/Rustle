@@ -1,0 +1,24 @@
+[package]
+name = "rustle-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Business-neutral Iced UI infrastructure for Rustle"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+iced = { version = "=0.15.0-dev", features = ["advanced", "canvas", "image", "svg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rand = "0.10.2"
+tracing.workspace = true
+
+[dev-dependencies]
+iced_runtime = { version = "=0.15.0-dev" }
