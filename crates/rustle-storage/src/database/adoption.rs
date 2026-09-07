@@ -1063,7 +1063,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.code(), crate::error::ErrorCode::StorageBackupFailed);
+        assert_eq!(
+            error.code(),
+            rustle_application::error::ErrorCode::StorageBackupFailed
+        );
         assert_eq!(legacy::fingerprint(pool.clone()).await.unwrap(), before);
         pool.close().await;
     }
@@ -1085,7 +1088,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.code(),
-            crate::error::ErrorCode::StorageAdoptionFailed,
+            rustle_application::error::ErrorCode::StorageAdoptionFailed,
             "{error:?}"
         );
         assert_eq!(
@@ -1117,7 +1120,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.code(),
-            crate::error::ErrorCode::StorageAdoptionFailed,
+            rustle_application::error::ErrorCode::StorageAdoptionFailed,
             "{error:?}"
         );
         assert!(pool.is_closed());
@@ -1148,7 +1151,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.code(), crate::error::ErrorCode::StorageAdoptionFailed);
+        assert_eq!(
+            error.code(),
+            rustle_application::error::ErrorCode::StorageAdoptionFailed
+        );
         assert_eq!(legacy::identify(pool.clone()).await.unwrap().0, None);
         let ledger = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM sqlite_master \

@@ -347,7 +347,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.code(),
-            crate::error::ErrorCode::StorageMigrationFailed
+            rustle_application::error::ErrorCode::StorageMigrationFailed
         );
         assert!(matches!(
             error,
@@ -518,7 +518,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.code(),
-            crate::error::ErrorCode::StorageSchemaUnsupported
+            rustle_application::error::ErrorCode::StorageSchemaUnsupported
         );
         assert!(matches!(error, StorageError::UnsupportedSchema { .. }));
         assert_eq!(legacy::fingerprint(pool.clone()).await.unwrap(), before);

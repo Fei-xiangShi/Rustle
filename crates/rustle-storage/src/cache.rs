@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::application::ports::cache::{AudioCacheStore, CachePublisher};
-use crate::domain::audio::QualityLevel as NcmQualityLevel;
-use crate::utils::{
+use rustle_application::ports::cache::{AudioCacheStore, CachePublisher};
+use rustle_domain::audio::QualityLevel as NcmQualityLevel;
+
+use crate::paths::{
     automix_cache_dir, avatars_cache_dir, banners_cache_dir, cache_dir, covers_cache_dir,
     lyrics_cache_dir, songs_cache_dir, vip_badges_cache_dir,
 };
@@ -19,7 +20,8 @@ use crate::utils::{
 const AUDIO_MANIFEST_VERSION: u8 = 1;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub use crate::application::ports::cache::PublishOutcome as PublishResult;
+pub use crate::paths::playlists_cache_dir;
+pub use rustle_application::ports::cache::PublishOutcome as PublishResult;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileCacheStore;
@@ -287,81 +289,6 @@ pub fn write_audio_manifest(
         return Err(error);
     }
     publish_replace(&temp_path, &manifest_path)
-}
-
-/// Directory for serialized remote playlist snapshots.
-pub fn playlists_cache_dir() -> PathBuf {
-    cache_dir().join("playlists")
-}
-
-/// Load a cached NCM playlist snapshot.
-pub async fn load_ncm_playlist_cache(playlist_id: u64) -> Option<crate::api::PlaylistDetail> {
-    let path = playlists_cache_dir().join(format!("{playlist_id}.json"));
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::debug!(playlist_id, ?error, "NCM playlist cache miss");
-            return None;
-        }
-    };
-    match serde_json::from_slice(&bytes) {
-        Ok(detail) => {
-            tracing::info!(playlist_id, bytes = bytes.len(), "NCM playlist cache hit");
-            Some(detail)
-        }
-        Err(error) => {
-            tracing::warn!(playlist_id, ?error, "NCM playlist cache is invalid");
-            None
-        }
-    }
-}
-
-/// Save a complete NCM playlist snapshot for fast subsequent entry.
-pub async fn save_ncm_playlist_cache(detail: &crate::api::PlaylistDetail) {
-    let dir = playlists_cache_dir();
-    if tokio::fs::create_dir_all(&dir).await.is_err() {
-        tracing::warn!(
-            playlist_id = detail.id,
-            "Failed to create NCM playlist cache directory"
-        );
-        return;
-    }
-    let path = dir.join(format!("{}.json", detail.id));
-    let bytes = match serde_json::to_vec(detail) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(
-                playlist_id = detail.id,
-                ?error,
-                "Failed to serialize NCM playlist cache"
-            );
-            return;
-        }
-    };
-    let tmp = unique_temp_path(&path);
-    if let Err(error) = tokio::fs::write(&tmp, &bytes).await {
-        tracing::warn!(
-            playlist_id = detail.id,
-            ?error,
-            "Failed to write NCM playlist cache"
-        );
-        cleanup_temp_file(&tmp);
-        return;
-    }
-
-    if let Err(error) = crate::cache::publish_replace(&tmp, &path) {
-        tracing::warn!(
-            playlist_id = detail.id,
-            ?error,
-            "Failed to replace NCM playlist cache"
-        );
-        return;
-    }
-    tracing::info!(
-        playlist_id = detail.id,
-        tracks = detail.tracks.len(),
-        "NCM playlist cache saved"
-    );
 }
 
 /// Information about a cached file
@@ -676,7 +603,7 @@ impl ClearResult {
 ///
 /// This should be called at application startup to remove any temp files
 /// left behind from interrupted downloads.
-pub fn cleanup_temp_files() -> ClearResult {
+pub fn cleanup_temp_files(download_dir: Option<&Path>) -> ClearResult {
     let mut result = ClearResult::default();
 
     // Clean cache directories
@@ -685,12 +612,9 @@ pub fn cleanup_temp_files() -> ClearResult {
     }
     cleanup_temp_files_in_dir(&cache_dir(), &mut result);
 
-    // Also clean download directory
-    let default_dl = {
-        let default_settings = crate::features::Settings::default();
-        default_settings.storage.effective_download_dir()
-    };
-    cleanup_temp_files_in_dir(&default_dl, &mut result);
+    if let Some(download_dir) = download_dir {
+        cleanup_temp_files_in_dir(download_dir, &mut result);
+    }
 
     if result.files_deleted > 0 {
         info!(
@@ -702,7 +626,7 @@ pub fn cleanup_temp_files() -> ClearResult {
     result
 }
 
-fn cleanup_temp_files_in_dir(dir: &std::path::PathBuf, result: &mut ClearResult) {
+fn cleanup_temp_files_in_dir(dir: &Path, result: &mut ClearResult) {
     if !dir.exists() {
         return;
     }
@@ -723,7 +647,7 @@ fn cleanup_temp_files_in_dir(dir: &std::path::PathBuf, result: &mut ClearResult)
 
         // Check if it's a .tmp file
         let is_tmp = path.extension().map(|e| e == "tmp").unwrap_or(false);
-        let is_qr = dir == &cache_dir()
+        let is_qr = dir == cache_dir()
             && path
                 .file_name()
                 .and_then(|value| value.to_str())

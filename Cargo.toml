@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/rustle-application",
     "crates/rustle-domain",
+    "crates/rustle-storage",
     "xtask",
 ]
 default-members = ["."]
@@ -31,6 +32,7 @@ fs4 = "1.1.0"
 regex = "1.13"
 rustle-application = { path = "crates/rustle-application" }
 rustle-domain = { path = "crates/rustle-domain" }
+rustle-storage = { path = "crates/rustle-storage" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -76,7 +78,6 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
 spectrum-analyzer = "1.8.0"
 
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-rustls", "macros"] }
 lofty = "0.25.1"
 walkdir = "2.5.0"
 directories = "6.0.0"
@@ -89,9 +90,9 @@ tracing-appender.workspace = true
 zip = { workspace = true, optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
-fs4.workspace = true
 rustle-application.workspace = true
 rustle-domain.workspace = true
+rustle-storage.workspace = true
 
 # Local playlist import
 rayon = "1.12.0"
@@ -145,7 +146,6 @@ souvlaki = "0.8.3"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
-    "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",

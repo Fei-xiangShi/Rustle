@@ -462,7 +462,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         .collect::<Vec<_>>();
     let mut violations = Vec::new();
 
-    for package_name in ["rustle-domain", "rustle-application"] {
+    for package_name in ["rustle-domain", "rustle-application", "rustle-storage"] {
         let Some(package) = packages
             .iter()
             .find(|package| package.get("name").and_then(Value::as_str) == Some(package_name))
@@ -485,6 +485,22 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         let allowed: &[&str] = match package_name {
             "rustle-domain" => &["regex", "serde", "serde_json"],
             "rustle-application" => &["rustle-domain"],
+            "rustle-storage" => &[
+                "anyhow",
+                "directories",
+                "fs4",
+                "futures-util",
+                "rustle-application",
+                "rustle-domain",
+                "serde",
+                "serde_json",
+                "sqlx",
+                "thiserror",
+                "tokio",
+                "tracing",
+                "windows-sys",
+                "xxhash-rust",
+            ],
             _ => unreachable!(),
         };
 
@@ -506,6 +522,20 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
             violations
                 .push("package `rustle-application` must depend on `rustle-domain`".to_string());
         }
+        if package_name == "rustle-storage" {
+            for required_dependency in ["rustle-domain", "rustle-application"] {
+                if !metadata_array(package, "dependencies")?
+                    .iter()
+                    .any(|dependency| {
+                        dependency.get("name").and_then(Value::as_str) == Some(required_dependency)
+                    })
+                {
+                    violations.push(format!(
+                        "package `rustle-storage` must depend on `{required_dependency}`"
+                    ));
+                }
+            }
+        }
     }
 
     let Some(root_package) = packages
@@ -516,7 +546,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         return Ok(violations);
     };
     let root_dependencies = metadata_array(root_package, "dependencies")?;
-    for dependency in ["rustle-domain", "rustle-application"] {
+    for dependency in ["rustle-domain", "rustle-application", "rustle-storage"] {
         if !root_dependencies
             .iter()
             .any(|candidate| candidate.get("name").and_then(Value::as_str) == Some(dependency))
@@ -639,6 +669,57 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "rustle_ui",
                 "application must not depend on concrete adapters",
             ),
+        ]);
+    }
+    if path.starts_with("crates/rustle-storage/src/") {
+        forbidden.extend([
+            ("iced::", "storage must be UI-framework free"),
+            ("reqwest::", "storage must not own network transport"),
+            ("rodio::", "storage must not own audio backends"),
+            (
+                "ncm_api_rs",
+                "storage must not depend on NCM protocol types",
+            ),
+            ("crate::api", "storage must not depend on the NCM adapter"),
+            (
+                "crate::features",
+                "storage must not depend on root features",
+            ),
+            (
+                "crate::audio",
+                "storage must not depend on the audio adapter",
+            ),
+            (
+                "crate::platform",
+                "storage must not depend on platform adapters",
+            ),
+            ("crate::ui", "storage must not depend on UI adapters"),
+            (
+                "crate::app::",
+                "storage must not depend on the composition root",
+            ),
+            (
+                "crate::error",
+                "storage must use application error contracts directly",
+            ),
+            ("rustle_ncm", "storage must not depend on sibling adapters"),
+            (
+                "rustle_media",
+                "storage must not depend on sibling adapters",
+            ),
+            (
+                "rustle_audio",
+                "storage must not depend on sibling adapters",
+            ),
+            (
+                "rustle_platform",
+                "storage must not depend on sibling adapters",
+            ),
+            (
+                "rustle_observability",
+                "storage must not depend on sibling adapters",
+            ),
+            ("rustle_ui", "storage must not depend on sibling adapters"),
         ]);
     }
 
@@ -1243,12 +1324,27 @@ mod tests {
             )
             .is_empty()
         );
+        assert!(
+            architecture_source_contract_violations(
+                "crates/rustle-storage/src/database.rs",
+                "use rustle_application::error::AppError; use sqlx::SqlitePool;",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-storage/src/cache.rs",
+                "use crate::api::PlaylistDetail; use rustle_audio::Player;",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "storage-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1265,11 +1361,32 @@ mod tests {
                     "dependencies": [{"name": "rustle-domain"}]
                 },
                 {
+                    "name": "rustle-storage",
+                    "id": "storage-id",
+                    "dependencies": [
+                        {"name": "anyhow"},
+                        {"name": "directories"},
+                        {"name": "fs4"},
+                        {"name": "futures-util"},
+                        {"name": "rustle-application"},
+                        {"name": "rustle-domain"},
+                        {"name": "serde"},
+                        {"name": "serde_json"},
+                        {"name": "sqlx"},
+                        {"name": "thiserror"},
+                        {"name": "tokio"},
+                        {"name": "tracing"},
+                        {"name": "windows-sys"},
+                        {"name": "xxhash-rust"}
+                    ]
+                },
+                {
                     "name": "rustle",
                     "id": "root-id",
                     "dependencies": [
                         {"name": "rustle-domain"},
-                        {"name": "rustle-application"}
+                        {"name": "rustle-application"},
+                        {"name": "rustle-storage"}
                     ]
                 }
             ]

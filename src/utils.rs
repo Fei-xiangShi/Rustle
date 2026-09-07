@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::error;
 
+pub use rustle_storage::paths::{
+    automix_cache_dir, avatars_cache_dir, cache_dir, covers_cache_dir, lyrics_cache_dir,
+    songs_cache_dir, vip_badges_cache_dir,
+};
+
 // ============================================================================
 // Image Extensions
 // ============================================================================
@@ -268,45 +273,6 @@ pub fn format_relative_time(timestamp: i64) -> String {
     } else {
         "刚刚".to_string()
     }
-}
-
-/// Get the base cache directory for rustle
-pub fn cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("life", "fxs", "rustle")
-        .map(|dirs| dirs.cache_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("~/.cache/rustle"))
-}
-
-/// Get the covers cache directory
-pub fn covers_cache_dir() -> PathBuf {
-    cache_dir().join("covers")
-}
-
-/// Get the songs cache directory
-pub fn songs_cache_dir() -> PathBuf {
-    cache_dir().join("songs")
-}
-
-/// Get the banners cache directory
-pub fn banners_cache_dir() -> PathBuf {
-    cache_dir().join("banners")
-}
-
-/// Get the avatars cache directory
-pub fn avatars_cache_dir() -> PathBuf {
-    cache_dir().join("avatars")
-}
-
-pub fn vip_badges_cache_dir() -> PathBuf {
-    cache_dir().join("vip_badges")
-}
-
-pub fn automix_cache_dir() -> PathBuf {
-    cache_dir().join("automix")
-}
-
-pub fn lyrics_cache_dir() -> PathBuf {
-    cache_dir().join("lyrics")
 }
 
 // ============================================================================

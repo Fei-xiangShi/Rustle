@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::error::{AppError, ErrorCode};
+use rustle_application::error::{AppError, ErrorCode};
 
 pub type StorageResult<T> = Result<T, StorageError>;
 

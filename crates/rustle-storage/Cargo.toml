@@ -1,0 +1,32 @@
+[package]
+name = "rustle-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SQLite and filesystem cache adapters for Rustle"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories = "6.0.0"
+fs4.workspace = true
+futures-util = "0.3.34"
+rustle-application.workspace = true
+rustle-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-rustls", "macros"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tracing.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

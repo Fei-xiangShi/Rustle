@@ -5294,7 +5294,6 @@ dependencies = [
  "directories",
  "discord-rich-presence",
  "encoding_rs",
- "fs4",
  "futures-util",
  "global-hotkey",
  "iced",
@@ -5319,12 +5318,12 @@ dependencies = [
  "rodio",
  "rustle-application",
  "rustle-domain",
+ "rustle-storage",
  "sdf_glyph_renderer",
  "serde",
  "serde_json",
  "souvlaki",
  "spectrum-analyzer",
- "sqlx",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5353,6 +5352,26 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustle-storage"
+version = "0.5.2"
+dependencies = [
+ "anyhow",
+ "directories",
+ "fs4",
+ "futures-util",
+ "rustle-application",
+ "rustle-domain",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "xxhash-rust",
 ]
 
 [[package]]
