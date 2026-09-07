@@ -5311,6 +5311,7 @@ dependencies = [
  "rustle-domain",
  "rustle-media",
  "rustle-ncm",
+ "rustle-observability",
  "rustle-platform",
  "rustle-storage",
  "sdf_glyph_renderer",
@@ -5319,12 +5320,9 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "walkdir",
  "winresource",
  "xxhash-rust",
- "zip",
 ]
 
 [[package]]
@@ -5395,6 +5393,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tracing",
+]
+
+[[package]]
+name = "rustle-observability"
+version = "0.5.2"
+dependencies = [
+ "directories",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

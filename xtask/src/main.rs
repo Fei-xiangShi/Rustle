@@ -252,9 +252,12 @@ fn source_contract_violations(path: &str, contents: &str) -> Vec<String> {
 }
 
 fn verify_observability_source_contract(root: &Path) -> XtaskResult<()> {
-    let source_root = root.join("src");
     let mut source_paths = Vec::new();
-    collect_rust_source_paths(&source_root, &mut source_paths)?;
+    for source_root in [root.join("src"), root.join("crates")] {
+        if source_root.is_dir() {
+            collect_rust_source_paths(&source_root, &mut source_paths)?;
+        }
+    }
     source_paths.sort();
 
     let mut violations = Vec::new();
@@ -295,7 +298,7 @@ fn collect_rust_source_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> io::
 }
 
 fn observability_source_contract_violations(path: &str, contents: &str) -> Vec<String> {
-    if path == "src/observability.rs" {
+    if path == "crates/rustle-observability/src/lib.rs" {
         return Vec::new();
     }
 
@@ -305,7 +308,7 @@ fn observability_source_contract_violations(path: &str, contents: &str) -> Vec<S
         .filter(|(_, line)| line.contains("tracing_subscriber"))
         .map(|(line_index, _)| {
             format!(
-                "{path}:{} references `tracing_subscriber`; subscriber configuration belongs to src/observability.rs",
+                "{path}:{} references `tracing_subscriber`; subscriber configuration belongs to crates/rustle-observability/src/lib.rs",
                 line_index + 1
             )
         })
@@ -475,6 +478,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         "rustle-application",
         "rustle-audio",
         "rustle-media",
+        "rustle-observability",
         "rustle-platform",
         "rustle-storage",
         "rustle-ncm",
@@ -549,6 +553,16 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 "tray-icon",
                 "windows-sys",
                 "x11rb",
+            ],
+            "rustle-observability" => &[
+                "directories",
+                "serde",
+                "serde_json",
+                "thiserror",
+                "tracing",
+                "tracing-appender",
+                "tracing-subscriber",
+                "zip",
             ],
             "rustle-storage" => &[
                 "anyhow",
@@ -647,6 +661,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         "rustle-application",
         "rustle-audio",
         "rustle-media",
+        "rustle-observability",
         "rustle-platform",
         "rustle-storage",
         "rustle-ncm",
@@ -1000,6 +1015,42 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "tracing_subscriber",
                 "platform must not initialize observability",
             ),
+        ]);
+    }
+    if path.starts_with("crates/rustle-observability/src/") {
+        forbidden.extend([
+            ("iced::", "observability must be UI-framework free"),
+            (
+                "crate::app",
+                "observability must not depend on the composition root",
+            ),
+            ("crate::ui", "observability must not depend on UI adapters"),
+            ("rustle_domain", "observability must not depend on domain"),
+            (
+                "rustle_application",
+                "observability must not depend on application contracts",
+            ),
+            (
+                "rustle_audio",
+                "observability must not depend on audio adapters",
+            ),
+            (
+                "rustle_media",
+                "observability must not depend on media adapters",
+            ),
+            (
+                "rustle_ncm",
+                "observability must not depend on NCM adapters",
+            ),
+            (
+                "rustle_platform",
+                "observability must not depend on platform adapters",
+            ),
+            (
+                "rustle_storage",
+                "observability must not depend on storage adapters",
+            ),
+            ("rustle_ui", "observability must not depend on UI adapters"),
         ]);
     }
 
@@ -1651,12 +1702,20 @@ mod tests {
             .len(),
             2
         );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-observability/src/lib.rs",
+                "use rustle_storage::database; use iced::widget;",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "audio-id", "media-id", "platform-id", "storage-id", "ncm-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "audio-id", "media-id", "observability-id", "platform-id", "storage-id", "ncm-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1706,6 +1765,20 @@ mod tests {
                         {"name": "tracing"},
                         {"name": "walkdir"},
                         {"name": "xxhash-rust"}
+                    ]
+                },
+                {
+                    "name": "rustle-observability",
+                    "id": "observability-id",
+                    "dependencies": [
+                        {"name": "directories"},
+                        {"name": "serde"},
+                        {"name": "serde_json"},
+                        {"name": "thiserror"},
+                        {"name": "tracing"},
+                        {"name": "tracing-appender"},
+                        {"name": "tracing-subscriber"},
+                        {"name": "zip"}
                     ]
                 },
                 {
@@ -1779,6 +1852,7 @@ mod tests {
                         {"name": "rustle-application"},
                         {"name": "rustle-audio"},
                         {"name": "rustle-media"},
+                        {"name": "rustle-observability"},
                         {"name": "rustle-platform"},
                         {"name": "rustle-storage"},
                         {"name": "rustle-ncm"}
@@ -1817,7 +1891,7 @@ mod tests {
         );
         assert!(
             observability_source_contract_violations(
-                "src/observability.rs",
+                "crates/rustle-observability/src/lib.rs",
                 "tracing_subscriber::registry();"
             )
             .is_empty()

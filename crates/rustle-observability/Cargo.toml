@@ -1,0 +1,28 @@
+[package]
+name = "rustle-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Tracing, panic containment, redaction, and diagnostics for Rustle"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+diagnostics = ["dep:thiserror", "dep:zip"]
+
+[dependencies]
+directories = "6.0.0"
+serde.workspace = true
+serde_json.workspace = true
+thiserror = { workspace = true, optional = true }
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+zip = { workspace = true, optional = true }
