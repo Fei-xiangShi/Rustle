@@ -178,12 +178,18 @@ mod tests {
 
     impl TestDatabase {
         fn new(name: &str) -> Self {
-            let directory = std::env::temp_dir().join(format!(
-                "rustle-migration-{name}-{}-{}",
-                std::process::id(),
-                TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&directory).unwrap();
+            let directory = loop {
+                let directory = std::env::temp_dir().join(format!(
+                    "rustle-migration-{name}-{}-{}",
+                    std::process::id(),
+                    TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&directory) {
+                    Ok(()) => break directory,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("failed to create test directory: {error}"),
+                }
+            };
             let path = directory.join("rustle.db");
             Self { directory, path }
         }
