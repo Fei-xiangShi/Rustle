@@ -10,6 +10,10 @@ inputs:
     description: Install the repository-pinned cargo-deny and cargo-machete versions.
     required: false
     default: "false"
+  targets:
+    description: Optional comma-separated Rust target triples to install.
+    required: false
+    default: ""
 
 outputs:
   toolchain:
@@ -65,6 +69,7 @@ runs:
       with:
         toolchain: ${{ steps.toolchain.outputs.channel }}
         components: rustfmt, clippy
+        targets: ${{ inputs.targets }}
 
     - name: Install pinned supply-chain tools
       if: inputs.install-supply-chain-tools == 'true'

@@ -1,12 +1,17 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use semver::Version;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 type XtaskResult<T> = Result<T, Box<dyn Error>>;
 
@@ -17,6 +22,44 @@ const SUPPLY_CHAIN_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
 ];
 const FORBIDDEN_PRODUCTION_PACKAGES: &[&str] = &["iced_beacon", "iced_devtools"];
+const RELEASE_METADATA_SCHEMA_VERSION: u32 = 1;
+const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const RELEASE_PACKAGE: &str = "rustle";
+const RELEASE_METADATA_FILE: &str = "release-metadata.json";
+const RELEASE_MANIFEST_FILE: &str = "release-manifest.json";
+const RELEASE_CHECKSUMS_FILE: &str = "SHA256SUMS.txt";
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseMetadata {
+    schema_version: u32,
+    package: String,
+    version: String,
+    tag: Option<String>,
+    channel: String,
+    commit: String,
+    commit_timestamp: String,
+    toolchain: String,
+    cargo_lock_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseArtifact {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseManifest {
+    schema_version: u32,
+    package: String,
+    version: String,
+    tag: Option<String>,
+    channel: String,
+    commit: String,
+    artifacts: Vec<ReleaseArtifact>,
+}
 
 struct SourceContractRule {
     path: &'static str,
@@ -135,6 +178,7 @@ fn run() -> XtaskResult<()> {
             print_metadata(&root)
         }
         Some("release-preflight") => release_preflight(&root, args),
+        Some("release-manifest") => release_manifest(&root, args),
         Some("help" | "-h" | "--help") | None => {
             print_usage();
             Ok(())
@@ -1353,49 +1397,615 @@ fn print_metadata(root: &Path) -> XtaskResult<()> {
     Ok(())
 }
 
-fn release_preflight(root: &Path, mut args: impl Iterator<Item = String>) -> XtaskResult<()> {
-    let tag = match args.next() {
-        None => None,
-        Some(flag) if flag == "--tag" => Some(
-            args.next()
-                .ok_or_else(|| failure("`--tag` requires a value"))?,
-        ),
-        Some(other) => {
-            return Err(failure(format!(
-                "unexpected release-preflight argument `{other}`"
-            )));
-        }
-    };
-    reject_extra_args(args)?;
+struct ReleasePreflightArgs {
+    commit: String,
+    tag: Option<String>,
+    output: PathBuf,
+}
 
+struct ReleaseManifestArgs {
+    metadata: PathBuf,
+    artifacts_dir: PathBuf,
+    output: PathBuf,
+    checksums_output: PathBuf,
+}
+
+fn release_preflight(root: &Path, args: impl Iterator<Item = String>) -> XtaskResult<()> {
+    let args = parse_release_preflight_args(root, args)?;
     let toolchain = verify_toolchain(root)?;
     verify_production_dependency_graph(root)?;
-    let lockfile = root.join("Cargo.lock");
-    if !lockfile.is_file() {
+    verify_required_lockfile(root)?;
+
+    let metadata = build_release_metadata(root, &args.commit, args.tag.as_deref(), &toolchain)?;
+    write_json_atomic(&args.output, &metadata)?;
+
+    println!("release package: {}", metadata.package);
+    println!("release version: {}", metadata.version);
+    println!(
+        "release tag: {}",
+        metadata.tag.as_deref().unwrap_or("not supplied")
+    );
+    println!("release channel: {}", metadata.channel);
+    println!("release commit: {}", metadata.commit);
+    println!("release metadata: {}", args.output.display());
+    println!("release preflight: ok");
+    Ok(())
+}
+
+fn release_manifest(root: &Path, args: impl Iterator<Item = String>) -> XtaskResult<()> {
+    let args = parse_release_manifest_args(root, args)?;
+    let metadata: ReleaseMetadata = serde_json::from_slice(&fs::read(&args.metadata)?)?;
+    validate_release_metadata_against_checkout(root, &metadata)?;
+
+    let manifest = build_release_manifest(&metadata, &args.artifacts_dir)?;
+    write_json_atomic(&args.output, &manifest)?;
+    write_release_checksums(
+        &manifest,
+        &args.artifacts_dir,
+        &args.metadata,
+        &args.output,
+        &args.checksums_output,
+    )?;
+
+    println!("release manifest: {}", args.output.display());
+    println!("release checksums: {}", args.checksums_output.display());
+    println!("release artifact count: {}", manifest.artifacts.len());
+    println!("release manifest: ok");
+    Ok(())
+}
+
+fn parse_release_preflight_args(
+    root: &Path,
+    mut args: impl Iterator<Item = String>,
+) -> XtaskResult<ReleasePreflightArgs> {
+    let mut commit = None;
+    let mut tag = None;
+    let mut output = None;
+
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--commit" => set_once(&mut commit, "--commit", next_value(&mut args, "--commit")?)?,
+            "--tag" => set_once(&mut tag, "--tag", next_value(&mut args, "--tag")?)?,
+            "--output" => set_once(
+                &mut output,
+                "--output",
+                resolve_cli_path(root, next_value(&mut args, "--output")?),
+            )?,
+            _ => {
+                return Err(failure(format!(
+                    "unexpected release-preflight argument `{flag}`"
+                )));
+            }
+        }
+    }
+
+    Ok(ReleasePreflightArgs {
+        commit: commit.ok_or_else(|| failure("release-preflight requires `--commit`"))?,
+        tag,
+        output: output.unwrap_or_else(|| root.join("target").join(RELEASE_METADATA_FILE)),
+    })
+}
+
+fn parse_release_manifest_args(
+    root: &Path,
+    mut args: impl Iterator<Item = String>,
+) -> XtaskResult<ReleaseManifestArgs> {
+    let mut metadata = None;
+    let mut artifacts_dir = None;
+    let mut output = None;
+    let mut checksums_output = None;
+
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--metadata" => set_once(
+                &mut metadata,
+                "--metadata",
+                resolve_cli_path(root, next_value(&mut args, "--metadata")?),
+            )?,
+            "--artifacts-dir" => set_once(
+                &mut artifacts_dir,
+                "--artifacts-dir",
+                resolve_cli_path(root, next_value(&mut args, "--artifacts-dir")?),
+            )?,
+            "--output" => set_once(
+                &mut output,
+                "--output",
+                resolve_cli_path(root, next_value(&mut args, "--output")?),
+            )?,
+            "--checksums-output" => set_once(
+                &mut checksums_output,
+                "--checksums-output",
+                resolve_cli_path(root, next_value(&mut args, "--checksums-output")?),
+            )?,
+            _ => {
+                return Err(failure(format!(
+                    "unexpected release-manifest argument `{flag}`"
+                )));
+            }
+        }
+    }
+
+    Ok(ReleaseManifestArgs {
+        metadata: metadata.ok_or_else(|| failure("release-manifest requires `--metadata`"))?,
+        artifacts_dir: artifacts_dir
+            .ok_or_else(|| failure("release-manifest requires `--artifacts-dir`"))?,
+        output: output.unwrap_or_else(|| root.join("target").join(RELEASE_MANIFEST_FILE)),
+        checksums_output: checksums_output
+            .unwrap_or_else(|| root.join("target").join(RELEASE_CHECKSUMS_FILE)),
+    })
+}
+
+fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> XtaskResult<String> {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| failure(format!("`{flag}` requires a value")))
+}
+
+fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> XtaskResult<()> {
+    if slot.replace(value).is_some() {
+        Err(failure(format!("`{flag}` may be supplied only once")))
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_cli_path(root: &Path, value: String) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn build_release_metadata(
+    root: &Path,
+    expected_commit: &str,
+    tag: Option<&str>,
+    toolchain: &str,
+) -> XtaskResult<ReleaseMetadata> {
+    validate_commit_sha(expected_commit)?;
+    let actual_commit = capture_program(root, "git", &["rev-parse", "HEAD"])?;
+    if actual_commit != expected_commit {
         return Err(failure(format!(
-            "required lockfile is missing: {}",
-            lockfile.display()
+            "checked-out commit `{actual_commit}` does not match expected release commit `{expected_commit}`"
+        )));
+    }
+    verify_tracked_worktree_clean(root)?;
+
+    let cargo_metadata = load_metadata(root)?;
+    let package_version = package_version(&cargo_metadata, RELEASE_PACKAGE)?;
+    let version = Version::parse(package_version)?;
+    if version.to_string() != package_version {
+        return Err(failure(format!(
+            "Cargo version `{package_version}` is not canonical semver"
+        )));
+    }
+    if let Some(tag) = tag {
+        let tag_commit = resolve_release_tag(root, tag)?;
+        validate_release_tag_identity(tag, package_version, &tag_commit, expected_commit)?;
+    }
+
+    let commit_timestamp = capture_program(
+        root,
+        "git",
+        &["show", "-s", "--format=%cI", expected_commit],
+    )?;
+    let cargo_lock_sha256 = sha256_file(&verify_required_lockfile(root)?)?;
+
+    Ok(ReleaseMetadata {
+        schema_version: RELEASE_METADATA_SCHEMA_VERSION,
+        package: RELEASE_PACKAGE.to_owned(),
+        version: package_version.to_owned(),
+        tag: tag.map(str::to_owned),
+        channel: release_channel(&version).to_owned(),
+        commit: expected_commit.to_owned(),
+        commit_timestamp,
+        toolchain: toolchain.to_owned(),
+        cargo_lock_sha256,
+    })
+}
+
+fn validate_release_metadata_against_checkout(
+    root: &Path,
+    metadata: &ReleaseMetadata,
+) -> XtaskResult<()> {
+    if metadata.schema_version != RELEASE_METADATA_SCHEMA_VERSION {
+        return Err(failure(format!(
+            "unsupported release metadata schema {}; expected {}",
+            metadata.schema_version, RELEASE_METADATA_SCHEMA_VERSION
+        )));
+    }
+    if metadata.package != RELEASE_PACKAGE {
+        return Err(failure(format!(
+            "release metadata package `{}` is not `{RELEASE_PACKAGE}`",
+            metadata.package
+        )));
+    }
+    validate_commit_sha(&metadata.commit)?;
+    let actual_commit = capture_program(root, "git", &["rev-parse", "HEAD"])?;
+    if metadata.commit != actual_commit {
+        return Err(failure(format!(
+            "release metadata commit `{}` does not match checkout `{actual_commit}`",
+            metadata.commit
+        )));
+    }
+    verify_tracked_worktree_clean(root)?;
+
+    let toolchain = verify_toolchain(root)?;
+    if metadata.toolchain != toolchain {
+        return Err(failure(format!(
+            "release metadata toolchain `{}` does not match checkout `{toolchain}`",
+            metadata.toolchain
         )));
     }
 
-    let metadata = load_metadata(root)?;
-    let version = package_version(&metadata, "rustle")?;
-    if let Some(tag) = tag {
-        let tag_version = normalize_release_tag(&tag);
-        if tag_version != version {
-            return Err(failure(format!(
-                "release tag `{tag}` does not match Cargo version `{version}`"
-            )));
-        }
-        println!("release tag: {tag}");
-    } else {
-        println!("release tag: not supplied (version-only preflight)");
+    let cargo_metadata = load_metadata(root)?;
+    let package_version = package_version(&cargo_metadata, RELEASE_PACKAGE)?;
+    if metadata.version != package_version {
+        return Err(failure(format!(
+            "release metadata version `{}` does not match Cargo version `{package_version}`",
+            metadata.version
+        )));
+    }
+    let version = Version::parse(package_version)?;
+    let expected_channel = release_channel(&version);
+    if metadata.channel != expected_channel {
+        return Err(failure(format!(
+            "release metadata channel `{}` does not match semver channel `{expected_channel}`",
+            metadata.channel
+        )));
     }
 
-    println!("toolchain: {toolchain}");
-    println!("package version: {version}");
-    println!("lockfile: {}", lockfile.display());
-    println!("release preflight: ok");
+    if let Some(tag) = metadata.tag.as_deref() {
+        let tag_commit = resolve_release_tag(root, tag)?;
+        validate_release_tag_identity(tag, package_version, &tag_commit, &metadata.commit)?;
+    }
+
+    let commit_timestamp = capture_program(
+        root,
+        "git",
+        &["show", "-s", "--format=%cI", &metadata.commit],
+    )?;
+    if metadata.commit_timestamp != commit_timestamp {
+        return Err(failure(format!(
+            "release metadata timestamp `{}` does not match checkout `{commit_timestamp}`",
+            metadata.commit_timestamp
+        )));
+    }
+
+    let lock_hash = sha256_file(&verify_required_lockfile(root)?)?;
+    if metadata.cargo_lock_sha256 != lock_hash {
+        return Err(failure(
+            "release metadata Cargo.lock SHA-256 does not match checkout",
+        ));
+    }
+    Ok(())
+}
+
+fn release_channel(version: &Version) -> &'static str {
+    if version.pre.is_empty() {
+        "stable"
+    } else {
+        "preview"
+    }
+}
+
+fn validate_commit_sha(commit: &str) -> XtaskResult<()> {
+    if commit.len() == 40
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "release commit must be exactly 40 lowercase hexadecimal characters: `{commit}`"
+        )))
+    }
+}
+
+fn resolve_release_tag(root: &Path, tag: &str) -> XtaskResult<String> {
+    let reference = format!("refs/tags/{tag}^{{commit}}");
+    capture_program(root, "git", &["rev-parse", "--verify", &reference])
+        .map_err(|_| failure(format!("release tag `{tag}` does not resolve to a commit")))
+}
+
+fn validate_release_tag_identity(
+    tag: &str,
+    package_version: &str,
+    tag_commit: &str,
+    expected_commit: &str,
+) -> XtaskResult<()> {
+    let version_text = tag
+        .strip_prefix('v')
+        .ok_or_else(|| failure(format!("release tag `{tag}` must start with `v`")))?;
+    let parsed = Version::parse(version_text)?;
+    let canonical = format!("v{parsed}");
+    if tag != canonical {
+        return Err(failure(format!(
+            "release tag `{tag}` is not canonical; expected `{canonical}`"
+        )));
+    }
+    if parsed.to_string() != package_version {
+        return Err(failure(format!(
+            "release tag `{tag}` does not match Cargo version `{package_version}`"
+        )));
+    }
+    if tag_commit != expected_commit {
+        return Err(failure(format!(
+            "release tag `{tag}` resolves to `{tag_commit}`, expected `{expected_commit}`"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_tracked_worktree_clean(root: &Path) -> XtaskResult<()> {
+    let status = capture_program(
+        root,
+        "git",
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "release checkout has tracked modifications:\n{status}"
+        )))
+    }
+}
+
+fn verify_required_lockfile(root: &Path) -> XtaskResult<PathBuf> {
+    let lockfile = root.join("Cargo.lock");
+    if lockfile.is_file() {
+        Ok(lockfile)
+    } else {
+        Err(failure(format!(
+            "required lockfile is missing: {}",
+            lockfile.display()
+        )))
+    }
+}
+
+fn build_release_manifest(
+    metadata: &ReleaseMetadata,
+    artifacts_dir: &Path,
+) -> XtaskResult<ReleaseManifest> {
+    let files = collect_release_artifacts(artifacts_dir)?;
+    let expected = expected_release_artifact_names(&metadata.version);
+    let actual = files.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+        let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
+        return Err(failure(format!(
+            "release artifact set mismatch; missing=[{}], unexpected=[{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        )));
+    }
+
+    let artifacts = files
+        .into_iter()
+        .map(|(name, path)| {
+            Ok(ReleaseArtifact {
+                name,
+                size: fs::metadata(&path)?.len(),
+                sha256: sha256_file(&path)?,
+            })
+        })
+        .collect::<XtaskResult<Vec<_>>>()?;
+
+    Ok(ReleaseManifest {
+        schema_version: RELEASE_MANIFEST_SCHEMA_VERSION,
+        package: metadata.package.clone(),
+        version: metadata.version.clone(),
+        tag: metadata.tag.clone(),
+        channel: metadata.channel.clone(),
+        commit: metadata.commit.clone(),
+        artifacts,
+    })
+}
+
+fn expected_release_artifact_names(version: &str) -> BTreeSet<String> {
+    [
+        "rustle-linux-x86_64.AppImage".to_owned(),
+        "rustle-macos-arm64.dmg".to_owned(),
+        "rustle-macos-x86_64.dmg".to_owned(),
+        format!("rustle-{version}-windows-x86_64.msi"),
+        "rustle-windows-x86_64.exe".to_owned(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn collect_release_artifacts(directory: &Path) -> XtaskResult<BTreeMap<String, PathBuf>> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(failure(format!(
+            "release artifacts directory must be a real directory: {}",
+            directory.display()
+        )));
+    }
+
+    let mut files = BTreeMap::new();
+    collect_release_artifacts_recursive(directory, &mut files)?;
+    Ok(files)
+}
+
+fn collect_release_artifacts_recursive(
+    directory: &Path,
+    files: &mut BTreeMap<String, PathBuf>,
+) -> XtaskResult<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(failure(format!(
+                "release artifact tree contains a symlink: {}",
+                path.display()
+            )));
+        }
+        if file_type.is_dir() {
+            collect_release_artifacts_recursive(&path, files)?;
+        } else if file_type.is_file() {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| failure("release artifact basename is not valid UTF-8"))?;
+            if let Some(previous) = files.insert(name.clone(), path.clone()) {
+                return Err(failure(format!(
+                    "duplicate release artifact basename `{name}`: {} and {}",
+                    previous.display(),
+                    path.display()
+                )));
+            }
+        } else {
+            return Err(failure(format!(
+                "release artifact tree contains an unsupported file type: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_release_checksums(
+    manifest: &ReleaseManifest,
+    artifacts_dir: &Path,
+    metadata_path: &Path,
+    manifest_path: &Path,
+    output: &Path,
+) -> XtaskResult<()> {
+    let files = collect_release_artifacts(artifacts_dir)?;
+    let mut checksums = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        let path = files.get(&artifact.name).ok_or_else(|| {
+            failure(format!(
+                "release artifact disappeared before checksum publication: {}",
+                artifact.name
+            ))
+        })?;
+        let actual = sha256_file(path)?;
+        if actual != artifact.sha256 {
+            return Err(failure(format!(
+                "release artifact changed before checksum publication: {}",
+                artifact.name
+            )));
+        }
+        checksums.insert(artifact.name.clone(), actual);
+    }
+    insert_checksum_file(&mut checksums, metadata_path)?;
+    insert_checksum_file(&mut checksums, manifest_path)?;
+
+    let contents = checksums
+        .into_iter()
+        .map(|(name, hash)| format!("{hash}  {name}\n"))
+        .collect::<String>();
+    write_atomic(output, contents.as_bytes())
+}
+
+fn insert_checksum_file(checksums: &mut BTreeMap<String, String>, path: &Path) -> XtaskResult<()> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            failure(format!(
+                "checksum path has no UTF-8 basename: {}",
+                path.display()
+            ))
+        })?
+        .to_owned();
+    if checksums.insert(name.clone(), sha256_file(path)?).is_some() {
+        return Err(failure(format!("duplicate checksum basename `{name}`")));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> XtaskResult<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> XtaskResult<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_atomic(path, &bytes)
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> XtaskResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| failure(format!("output path has no parent: {}", path.display())))?;
+    fs::create_dir_all(parent)?;
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            failure(format!(
+                "output path has no UTF-8 basename: {}",
+                path.display()
+            ))
+        })?;
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp-{}-{sequence}",
+        std::process::id()
+    ));
+
+    let result = (|| -> XtaskResult<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        replace_complete_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_complete_file(temporary: &Path, destination: &Path) -> XtaskResult<()> {
+    fs::rename(temporary, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_complete_file(temporary: &Path, destination: &Path) -> XtaskResult<()> {
+    if !destination.exists() {
+        fs::rename(temporary, destination)?;
+        return Ok(());
+    }
+
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| failure("release output has no UTF-8 basename"))?;
+    let backup = destination.with_file_name(format!(
+        ".{file_name}.previous-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::rename(destination, &backup)?;
+    if let Err(error) = fs::rename(temporary, destination) {
+        let _ = fs::rename(&backup, destination);
+        return Err(error.into());
+    }
+    fs::remove_file(backup)?;
     Ok(())
 }
 
@@ -1571,10 +2181,6 @@ fn tool_version<'a>(output: &'a str, tool: &str) -> Option<&'a str> {
     fields.next()
 }
 
-fn normalize_release_tag(tag: &str) -> &str {
-    tag.strip_prefix('v').unwrap_or(tag)
-}
-
 fn failure(message: impl Into<String>) -> Box<dyn Error> {
     io::Error::other(message.into()).into()
 }
@@ -1590,18 +2196,82 @@ fn usage() -> &'static str {
      \n  cargo xtask check-production\
      \n  cargo xtask supply-chain\
      \n  cargo xtask metadata\
-     \n  cargo xtask release-preflight [--tag vX.Y.Z]"
+     \n  cargo xtask release-preflight --commit <40-lowercase-hex> [--tag vX.Y.Z] [--output PATH]\
+     \n  cargo xtask release-manifest --metadata PATH --artifacts-dir DIR [--output PATH] [--checksums-output PATH]"
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
+        RELEASE_CHECKSUMS_FILE, RELEASE_MANIFEST_FILE, RELEASE_METADATA_FILE,
+        RELEASE_METADATA_SCHEMA_VERSION, RELEASE_PACKAGE, ReleaseMetadata,
         architecture_dependency_violations, architecture_source_contract_violations,
-        ffi_panic_boundary_violations, forbidden_packages_in_tree, inline_quoted_setting,
-        normalize_release_tag, observability_source_contract_violations, quoted_setting,
+        build_release_manifest, ffi_panic_boundary_violations, forbidden_packages_in_tree,
+        inline_quoted_setting, observability_source_contract_violations, quoted_setting,
         release_panic_contract_violations, source_contract_violations, tool_version,
+        validate_commit_sha, validate_release_tag_identity, write_json_atomic,
+        write_release_checksums,
     };
     use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rustle-xtask-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_release_metadata(version: &str) -> ReleaseMetadata {
+        ReleaseMetadata {
+            schema_version: RELEASE_METADATA_SCHEMA_VERSION,
+            package: RELEASE_PACKAGE.to_owned(),
+            version: version.to_owned(),
+            tag: Some(format!("v{version}")),
+            channel: "stable".to_owned(),
+            commit: "0123456789012345678901234567890123456789".to_owned(),
+            commit_timestamp: "2026-09-08T00:00:00+00:00".to_owned(),
+            toolchain: "1.98.0".to_owned(),
+            cargo_lock_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                .to_owned(),
+        }
+    }
+
+    fn write_expected_release_artifacts(directory: &Path, version: &str) {
+        let names = [
+            "rustle-linux-x86_64.AppImage".to_owned(),
+            "rustle-macos-arm64.dmg".to_owned(),
+            "rustle-macos-x86_64.dmg".to_owned(),
+            format!("rustle-{version}-windows-x86_64.msi"),
+            "rustle-windows-x86_64.exe".to_owned(),
+        ];
+        for (index, name) in names.into_iter().enumerate() {
+            let nested = directory.join(format!("job-{index}"));
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join(name), format!("artifact-{index}")).unwrap();
+        }
+    }
 
     #[test]
     fn reads_quoted_toolchain_setting() {
@@ -1611,9 +2281,121 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_release_tag_prefix() {
-        assert_eq!(normalize_release_tag("v0.5.2"), "0.5.2");
-        assert_eq!(normalize_release_tag("0.5.2"), "0.5.2");
+    fn release_identity_requires_canonical_tag_commit_and_version() {
+        let commit = "0123456789012345678901234567890123456789";
+        assert!(validate_commit_sha(commit).is_ok());
+        assert!(validate_commit_sha("ABC").is_err());
+        assert!(validate_release_tag_identity("v0.5.2", "0.5.2", commit, commit).is_ok());
+        assert!(validate_release_tag_identity("0.5.2", "0.5.2", commit, commit).is_err());
+        assert!(validate_release_tag_identity("v0.5.02", "0.5.2", commit, commit).is_err());
+        assert!(validate_release_tag_identity("v0.5.3", "0.5.2", commit, commit).is_err());
+        assert!(
+            validate_release_tag_identity(
+                "v0.5.2",
+                "0.5.2",
+                "1111111111111111111111111111111111111111",
+                commit
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn release_artifact_manifest_is_exact_sorted_and_deterministic() {
+        let directory = TestDirectory::new("manifest");
+        let products = directory.path().join("products");
+        fs::create_dir(&products).unwrap();
+        let metadata = sample_release_metadata("0.5.2");
+        write_expected_release_artifacts(&products, &metadata.version);
+
+        let first = build_release_manifest(&metadata, &products).unwrap();
+        let second = build_release_manifest(&metadata, &products).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.artifacts.len(), 5);
+        assert!(
+            first
+                .artifacts
+                .windows(2)
+                .all(|pair| pair[0].name < pair[1].name)
+        );
+        assert_eq!(
+            serde_json::to_vec_pretty(&first).unwrap(),
+            serde_json::to_vec_pretty(&second).unwrap()
+        );
+
+        let metadata_path = directory.path().join(RELEASE_METADATA_FILE);
+        let manifest_path = directory.path().join(RELEASE_MANIFEST_FILE);
+        let checksums_path = directory.path().join(RELEASE_CHECKSUMS_FILE);
+        write_json_atomic(&metadata_path, &metadata).unwrap();
+        write_json_atomic(&manifest_path, &first).unwrap();
+        write_release_checksums(
+            &first,
+            &products,
+            &metadata_path,
+            &manifest_path,
+            &checksums_path,
+        )
+        .unwrap();
+        let first_checksums = fs::read_to_string(&checksums_path).unwrap();
+        write_release_checksums(
+            &first,
+            &products,
+            &metadata_path,
+            &manifest_path,
+            &checksums_path,
+        )
+        .unwrap();
+        let second_checksums = fs::read_to_string(&checksums_path).unwrap();
+        assert_eq!(first_checksums, second_checksums);
+        let names = first_checksums
+            .lines()
+            .map(|line| line.split_once("  ").unwrap().1)
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 7);
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn release_artifact_manifest_rejects_missing_unexpected_and_duplicate_names() {
+        let metadata = sample_release_metadata("0.5.2");
+
+        let missing = TestDirectory::new("missing");
+        write_expected_release_artifacts(missing.path(), &metadata.version);
+        fs::remove_file(
+            missing
+                .path()
+                .join("job-0")
+                .join("rustle-linux-x86_64.AppImage"),
+        )
+        .unwrap();
+        assert!(
+            build_release_manifest(&metadata, missing.path())
+                .unwrap_err()
+                .to_string()
+                .contains("missing=[rustle-linux-x86_64.AppImage]")
+        );
+
+        let unexpected = TestDirectory::new("unexpected");
+        write_expected_release_artifacts(unexpected.path(), &metadata.version);
+        fs::write(unexpected.path().join("notes.txt"), "unexpected").unwrap();
+        assert!(
+            build_release_manifest(&metadata, unexpected.path())
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected=[notes.txt]")
+        );
+
+        let duplicate = TestDirectory::new("duplicate");
+        write_expected_release_artifacts(duplicate.path(), &metadata.version);
+        let duplicate_dir = duplicate.path().join("duplicate-job");
+        fs::create_dir(&duplicate_dir).unwrap();
+        fs::write(duplicate_dir.join("rustle-windows-x86_64.exe"), "duplicate").unwrap();
+        assert!(
+            build_release_manifest(&metadata, duplicate.path())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate release artifact basename")
+        );
     }
 
     #[test]

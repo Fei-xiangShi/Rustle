@@ -5292,18 +5292,13 @@ dependencies = [
  "chrono",
  "cosmic-text",
  "directories",
- "encoding_rs",
  "futures-util",
  "iced",
  "iced_runtime",
  "image",
  "lofty",
- "notify",
  "parking_lot",
- "quick-xml 0.42.0",
  "rand 0.10.2",
- "rayon",
- "regex",
  "reqwest 0.13.4",
  "rfd",
  "rustle-application",
@@ -5321,9 +5316,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "walkdir",
  "winresource",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -8612,7 +8605,10 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "semver",
+ "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

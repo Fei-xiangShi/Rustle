@@ -13,4 +13,7 @@ publish = false
 workspace = true
 
 [dependencies]
+semver = "1.0.27"
+serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10.9"

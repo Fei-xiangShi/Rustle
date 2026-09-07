@@ -23,16 +23,50 @@ Every Cargo resolution/build command inside these entry points uses
 reads that file instead of copying the version into workflow YAML.
 
 The full quality/native commands compile and test all features, including the
-feature-gated diagnostic exporter. Release preflight must additionally build
-the default desktop graph and the explicit diagnostics binary separately:
+feature-gated diagnostic exporter. The product release matrix intentionally
+keeps diagnostics out of the default desktop graph and publishes only the
+existing AppImage, two DMGs, portable EXE, and MSI:
 
 ```bash
 cargo build --release --locked
-cargo build --release --locked --features diagnostics --bin rustle-diagnostics
 ```
 
 This separation proves ZIP support remains absent from the ordinary desktop
-feature graph while the support tool remains releasable.
+feature graph while the support tool stays covered by CI.
+
+## Release identity and artifact contract
+
+Release starts with one clean, full-history checkout. The preflight command
+binds the build to an exact lowercase commit SHA, the pinned toolchain, Cargo
+package version, optional canonical tag, commit timestamp, and Cargo.lock
+SHA-256:
+
+```bash
+head="$(git rev-parse HEAD)"
+cargo xtask release-preflight --commit "$head" --output target/release-metadata.json
+```
+
+Tag builds additionally pass `--tag vX.Y.Z`; the tag must be canonical,
+match the Cargo semver, and resolve to the same commit. Stable versions use the
+`stable` channel and prerelease semver uses `preview`. Manual workflow runs
+produce a verified bundle but never create a GitHub Release or update package
+managers.
+
+Each platform job checks out the commit exported by preflight and builds with
+`--locked`. Aggregation revalidates the metadata against its checkout and
+accepts exactly these product basenames:
+
+- `rustle-linux-x86_64.AppImage`
+- `rustle-macos-x86_64.dmg`
+- `rustle-macos-arm64.dmg`
+- `rustle-windows-x86_64.exe`
+- `rustle-<version>-windows-x86_64.msi`
+
+`cargo xtask release-manifest` rejects missing, unexpected, duplicate, or
+symlinked products and emits deterministic `release-manifest.json` plus
+`SHA256SUMS.txt`. The checksum file covers all five products, metadata, and
+manifest. GitHub Release consumes only the verified bundle; AUR runs only for
+stable tags, and WinGet remains downstream of a successful Release workflow.
 
 ## Stable required-check contract
 

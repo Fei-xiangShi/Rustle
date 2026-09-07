@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   APP_NAME: rustle
@@ -16,22 +20,68 @@ permissions:
   contents: read
 
 jobs:
-  linux-appimage:
+  release-preflight:
+    name: Release preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      channel: ${{ steps.metadata.outputs.channel }}
+      commit: ${{ steps.metadata.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Install dependencies
+      - name: Install pinned Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          install-native-dependencies: 'false'
+
+      - name: Validate release source
+        shell: bash
+        run: |
+          args=(--commit "$GITHUB_SHA" --output target/release-metadata.json)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            args+=(--tag "$GITHUB_REF_NAME")
+          fi
+          cargo xtask release-preflight "${args[@]}"
+
+      - name: Export release metadata
+        id: metadata
+        shell: bash
+        run: |
+          echo "version=$(jq -r '.version' target/release-metadata.json)" >> "$GITHUB_OUTPUT"
+          echo "tag=$(jq -r '.tag // ""' target/release-metadata.json)" >> "$GITHUB_OUTPUT"
+          echo "channel=$(jq -r '.channel' target/release-metadata.json)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(jq -r '.commit' target/release-metadata.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-metadata
+          path: target/release-metadata.json
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-appimage:
+    name: Linux x86_64 AppImage
+    needs: release-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
+
+      - name: Install pinned Rust and native dependencies
+        uses: ./.github/actions/setup-rust
+
+      - name: Install packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libfuse2 \
-            fuse \
-            imagemagick
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+          sudo apt-get install --no-install-recommends -y fuse imagemagick libfuse2
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -41,7 +91,7 @@ jobs:
           save-if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release --package rustle --bin rustle
 
       - name: Create AppImage directory structure
         run: |
@@ -65,8 +115,6 @@ jobs:
             convert -size 256x256 xc:pink AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png 2>/dev/null || touch AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png
           fi
 
-      - name: Create AppRun script
-        run: |
           cat > AppDir/AppRun << APPRUN
           #!/bin/bash
           SELF=\$(readlink -f "\$0")
@@ -95,11 +143,16 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: linux-appimage
+          name: release-product-linux-x86_64
           path: ${{ env.APP_NAME }}-linux-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 7
 
   macos:
+    name: macOS ${{ matrix.arch }} DMG
+    needs: release-preflight
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-apple-darwin
@@ -109,12 +162,16 @@ jobs:
             os: macos-26
             arch: arm64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
+
+      - name: Install pinned Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          install-native-dependencies: 'false'
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo dependencies
@@ -125,7 +182,7 @@ jobs:
           save-if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --package rustle --bin rustle --target ${{ matrix.target }}
 
       - name: Create app bundle directories
         run: |
@@ -133,13 +190,9 @@ jobs:
           mkdir -p "${{ env.APP_DISPLAY_NAME }}.app/Contents/Resources"
           cp target/${{ matrix.target }}/release/${{ env.APP_NAME }} "${{ env.APP_DISPLAY_NAME }}.app/Contents/MacOS/"
 
-      - name: Get version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Create Info.plist
+        env:
+          VERSION: ${{ needs.release-preflight.outputs.version }}
         run: |
           cat > "${{ env.APP_DISPLAY_NAME }}.app/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -157,9 +210,9 @@ jobs:
               <key>CFBundleIconName</key>
               <string>AppIcon</string>
               <key>CFBundleVersion</key>
-              <string>${{ steps.version.outputs.version }}</string>
+              <string>$VERSION</string>
               <key>CFBundleShortVersionString</key>
-              <string>${{ steps.version.outputs.version }}</string>
+              <string>$VERSION</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>LSMinimumSystemVersion</key>
@@ -193,18 +246,18 @@ jobs:
             "groups" : [
               {
                 "layers" : [
-                {
-                  "blend-mode" : "normal",
-                  "fill" : "automatic",
-                  "glass" : false,
-                  "hidden" : false,
-                  "image-name" : "icon.png",
-                  "name" : "icon",
-                  "position" : {
-                    "scale" : 0.725,
-                    "translation-in-points" : [
-                      0,
-                      0
+                  {
+                    "blend-mode" : "normal",
+                    "fill" : "automatic",
+                    "glass" : false,
+                    "hidden" : false,
+                    "image-name" : "icon.png",
+                    "name" : "icon",
+                    "position" : {
+                      "scale" : 0.725,
+                      "translation-in-points" : [
+                        0,
+                        0
                       ]
                     }
                   }
@@ -227,21 +280,7 @@ jobs:
             }
           }
           JSON
-          xcrun actool \
-            build/macos/AppIcon.icon \
-            --compile "${{ env.APP_DISPLAY_NAME }}.app/Contents/Resources" \
-            --output-format human-readable-text \
-            --notices \
-            --warnings \
-            --errors \
-            --output-partial-info-plist build/macos/appicon-partial.plist \
-            --app-icon AppIcon \
-            --include-all-app-icons \
-            --enable-on-demand-resources NO \
-            --development-region en \
-            --target-device mac \
-            --minimum-deployment-target 26.0 \
-            --platform macosx
+          xcrun actool build/macos/AppIcon.icon --compile "${{ env.APP_DISPLAY_NAME }}.app/Contents/Resources" --output-format human-readable-text --notices --warnings --errors --output-partial-info-plist build/macos/appicon-partial.plist --app-icon AppIcon --include-all-app-icons --enable-on-demand-resources NO --development-region en --target-device mac --minimum-deployment-target 26.0 --platform macosx
 
       - name: Create DMG
         run: |
@@ -250,23 +289,30 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: macos-${{ matrix.arch }}
+          name: release-product-macos-${{ matrix.arch }}
           path: ${{ env.APP_NAME }}-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+          retention-days: 7
 
   windows:
+    name: Windows x86_64 EXE and MSI
+    needs: release-preflight
     runs-on: windows-latest
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          install-native-dependencies: 'false'
 
-      - name: Install ImageMagick
+      - name: Install packaging tools
+        shell: pwsh
         run: |
           choco install imagemagick --no-progress -y
-
-      - name: Install WiX Toolset
-        run: |
           choco install wixtoolset --version=3.14.1 --no-progress -y
           cargo install cargo-wix --version 0.3.9 --locked
 
@@ -283,7 +329,10 @@ jobs:
           save-if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build Windows release
-        run: cargo build --release --workspace --bin rustle --bin rustle-cleanup
+        shell: pwsh
+        run: |
+          cargo build --locked --release --package rustle --bin rustle
+          cargo build --locked --release --package rustle-cleanup --bin rustle-cleanup
 
       - name: Stage portable executable
         shell: pwsh
@@ -292,75 +341,107 @@ jobs:
 
       - name: Build MSI
         shell: pwsh
+        env:
+          VERSION: ${{ needs.release-preflight.outputs.version }}
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          cargo wix --no-build --target-bin-dir target/release `
+          cargo wix --package rustle --include wix/main.wxs --no-build --target-bin-dir target/release `
             --culture zh-cn --locale wix/zh-CN.wxl `
-            --output "rustle-$version-windows-x86_64.msi"
+            --output "rustle-$env:VERSION-windows-x86_64.msi"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: windows-x86_64
+          name: release-product-windows-x86_64
           path: |
             ${{ env.APP_NAME }}-windows-x86_64.exe
-            rustle-*-windows-x86_64*.msi
+            rustle-${{ needs.release-preflight.outputs.version }}-windows-x86_64.msi
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-artifacts:
+    name: Verify release artifacts
+    needs: [release-preflight, linux-appimage, macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
+
+      - name: Install pinned Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          install-native-dependencies: 'false'
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: release-input
+
+      - name: Download product artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-product-*
+          path: release-input/products
+          merge-multiple: true
+
+      - name: Build verified release bundle
+        shell: bash
+        run: |
+          mkdir -p release-bundle
+          cargo xtask release-manifest --metadata release-input/release-metadata.json --artifacts-dir release-input/products --output release-bundle/release-manifest.json --checksums-output release-bundle/SHA256SUMS.txt
+          cp release-input/release-metadata.json release-bundle/
+          cp release-input/products/* release-bundle/
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-bundle
+          path: release-bundle
+          if-no-files-found: error
+          retention-days: 7
 
   release:
-    needs: [linux-appimage, macos, windows]
+    name: Publish GitHub Release
+    needs: [release-preflight, verify-artifacts]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
+      - name: Download verified release bundle
         uses: actions/download-artifact@v8
         with:
-          path: artifacts
-
-      - name: Display structure
-        run: ls -R artifacts
-
-      - name: Generate release checksums
-        run: |
-          # Emit checksums keyed by basename so users can verify next to the
-          # downloaded (flat) release assets.
-          (
-            cd artifacts
-            find . -type f -not -name 'SHA256SUMS.txt' -print0 \
-              | sort -z \
-              | xargs -0 -n1 sha256sum \
-              | awk '{ n = split($2, p, "/"); printf "%s  %s\n", $1, p[n] }'
-          ) > artifacts/SHA256SUMS.txt
+          name: release-bundle
+          path: release-bundle
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          files: |
-            artifacts/linux-appimage/*
-            artifacts/macos-x86_64/*
-            artifacts/macos-arm64/*
-            artifacts/windows-x86_64/*
-            artifacts/SHA256SUMS.txt
+          files: release-bundle/*
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.release-preflight.outputs.channel == 'preview' }}
           generate_release_notes: true
 
   aur:
-    needs: [release]
+    name: Publish stable AUR packages
+    needs: [release-preflight, release]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/') && needs.release-preflight.outputs.channel == 'stable'
     steps:
       - uses: actions/checkout@v6
-
-      - name: Get version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
 
       - name: Update PKGBUILD versions
+        env:
+          VERSION: ${{ needs.release-preflight.outputs.version }}
         run: |
-          sed -i "s/pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" aur/PKGBUILD
-          sed -i "s/pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" aur-bin/PKGBUILD
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" aur-bin/PKGBUILD
 
       - name: Publish rustle to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.2
@@ -370,7 +451,7 @@ jobs:
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update to ${{ steps.version.outputs.version }}"
+          commit_message: "Update to ${{ needs.release-preflight.outputs.version }}"
           force_push: true
 
       - name: Publish rustle-bin to AUR
@@ -381,5 +462,5 @@ jobs:
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update to ${{ steps.version.outputs.version }}"
+          commit_message: "Update to ${{ needs.release-preflight.outputs.version }}"
           force_push: true
