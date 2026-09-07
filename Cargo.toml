@@ -42,6 +42,7 @@ homepage.workspace = true
 readme = "README.md"
 keywords = ["music", "player", "netease", "iced", "gui"]
 categories = ["multimedia::audio"]
+publish = false
 
 [lints]
 workspace = true

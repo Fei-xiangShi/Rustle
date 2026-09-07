@@ -20,6 +20,45 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  rust-supply-chain:
+    name: rust-supply-chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Rust and cargo-deny
+        id: rust
+        uses: ./.github/actions/setup-rust
+        with:
+          install-native-dependencies: "false"
+          install-cargo-deny: "true"
+
+      - name: Cache Cargo dependency data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}-${{ steps.rust.outputs.cargo-deny-version }}
+          cache-on-failure: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Enforce dependency policy
+        shell: bash
+        run: |
+          mkdir -p target/ci-logs
+          set -o pipefail
+          cargo xtask supply-chain 2>&1 | tee target/ci-logs/rust-supply-chain.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-supply-chain-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
   rust-quality:
     name: rust-quality
     runs-on: ubuntu-latest

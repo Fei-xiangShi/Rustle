@@ -10,6 +10,13 @@ use serde_json::Value;
 
 type XtaskResult<T> = Result<T, Box<dyn Error>>;
 
+const SUPPLY_CHAIN_TARGETS: &[&str] = &[
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+];
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("xtask error: {error}");
@@ -29,6 +36,10 @@ fn run() -> XtaskResult<()> {
         Some("check-native") => {
             reject_extra_args(args)?;
             check_native(&root)
+        }
+        Some("supply-chain") => {
+            reject_extra_args(args)?;
+            supply_chain(&root)
         }
         Some("metadata") => {
             reject_extra_args(args)?;
@@ -129,6 +140,105 @@ fn doc_workspace(root: &Path) -> XtaskResult<()> {
             args.join(" ")
         )))
     }
+}
+
+fn supply_chain(root: &Path) -> XtaskResult<()> {
+    verify_toolchain(root)?;
+    verify_manifest_git_revisions(root)?;
+    let version_file = root.join(".cargo-deny-version");
+    let expected = fs::read_to_string(&version_file)?.trim().to_owned();
+    if expected.is_empty() {
+        return Err(failure(format!(
+            "cargo-deny version file is empty: {}",
+            version_file.display()
+        )));
+    }
+
+    let output = capture_cargo(root, &["deny", "--version"])?;
+    let actual = tool_version(&output, "cargo-deny").ok_or_else(|| {
+        failure(format!(
+            "unexpected cargo-deny version output `{output}`; install {expected} with `cargo install cargo-deny --version {expected} --locked`"
+        ))
+    })?;
+    if actual != expected {
+        return Err(failure(format!(
+            "cargo-deny version `{actual}` does not match pinned version `{expected}`; install it with `cargo install cargo-deny --version {expected} --locked --force`"
+        )));
+    }
+
+    for target in SUPPLY_CHAIN_TARGETS {
+        println!("supply-chain target: {target}");
+        run_cargo(
+            root,
+            &[
+                "deny",
+                "--locked",
+                "--workspace",
+                "--all-features",
+                "--target",
+                target,
+                "check",
+                "--allow",
+                "license-not-encountered",
+                "--allow",
+                "unmatched-source",
+                "--hide-inclusion-graph",
+                "advisories",
+                "licenses",
+                "bans",
+                "sources",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_manifest_git_revisions(root: &Path) -> XtaskResult<()> {
+    let mut manifests = Vec::new();
+    collect_manifests(root, &mut manifests)?;
+    manifests.sort();
+
+    for manifest in manifests {
+        let contents = fs::read_to_string(&manifest)?;
+        for (line_index, line) in contents.lines().enumerate() {
+            if inline_quoted_setting(line, "git").is_none() {
+                continue;
+            }
+            let revision = inline_quoted_setting(line, "rev").filter(|revision| {
+                revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if revision.is_none()
+                || inline_quoted_setting(line, "branch").is_some()
+                || inline_quoted_setting(line, "tag").is_some()
+            {
+                return Err(failure(format!(
+                    "{}:{} git dependencies and patches must use one inline table with a full 40-character `rev` and no branch/tag selector",
+                    manifest.display(),
+                    line_index + 1
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_manifests(directory: &Path, manifests: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            if matches!(name.to_str(), Some(".git" | ".trellis" | "target")) {
+                continue;
+            }
+            collect_manifests(&path, manifests)?;
+        } else if file_type.is_file() && entry.file_name() == "Cargo.toml" {
+            manifests.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn print_metadata(root: &Path) -> XtaskResult<()> {
@@ -351,6 +461,25 @@ fn quoted_setting<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+fn inline_quoted_setting<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split([',', '{', '}']).find_map(|field| {
+        let (candidate, value) = field.split_once('=')?;
+        if candidate.trim() != key {
+            return None;
+        }
+        let value = value.trim();
+        value.strip_prefix('"')?.strip_suffix('"')
+    })
+}
+
+fn tool_version<'a>(output: &'a str, tool: &str) -> Option<&'a str> {
+    let mut fields = output.split_whitespace();
+    if fields.next()? != tool {
+        return None;
+    }
+    fields.next()
+}
+
 fn normalize_release_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
@@ -367,13 +496,14 @@ fn usage() -> &'static str {
     "Rustle engineering tasks:\n\
      \n  cargo xtask check\
      \n  cargo xtask check-native\
+     \n  cargo xtask supply-chain\
      \n  cargo xtask metadata\
      \n  cargo xtask release-preflight [--tag vX.Y.Z]"
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_release_tag, quoted_setting};
+    use super::{inline_quoted_setting, normalize_release_tag, quoted_setting, tool_version};
 
     #[test]
     fn reads_quoted_toolchain_setting() {
@@ -386,5 +516,29 @@ mod tests {
     fn normalizes_release_tag_prefix() {
         assert_eq!(normalize_release_tag("v0.5.2"), "0.5.2");
         assert_eq!(normalize_release_tag("0.5.2"), "0.5.2");
+    }
+
+    #[test]
+    fn parses_exact_tool_version_output() {
+        assert_eq!(
+            tool_version("cargo-deny 0.20.2", "cargo-deny"),
+            Some("0.20.2")
+        );
+        assert_eq!(tool_version("other 0.20.2", "cargo-deny"), None);
+        assert_eq!(tool_version("cargo-deny", "cargo-deny"), None);
+    }
+
+    #[test]
+    fn parses_inline_git_dependency_settings() {
+        let dependency = r#"iced = { git = "https://example.invalid/iced", rev = "0123456789012345678901234567890123456789" }"#;
+        assert_eq!(
+            inline_quoted_setting(dependency, "git"),
+            Some("https://example.invalid/iced")
+        );
+        assert_eq!(
+            inline_quoted_setting(dependency, "rev"),
+            Some("0123456789012345678901234567890123456789")
+        );
+        assert_eq!(inline_quoted_setting(dependency, "branch"), None);
     }
 }

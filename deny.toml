@@ -1,0 +1,56 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "ncm-api-rs uses rsa for client-side public-key protocol encryption, not attacker-observable private-key operations; remove when the protocol adapter replaces rsa or upstream ships a constant-time release" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive through current media/image dependencies; remove when the owning crates migrate to maintained macro support" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3 is reachable only through the current Iced debug/devtools graph; remove with the production feature-hygiene migration or an upstream Iced serialization change" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is required by the current text stack and direct glyph parsing; replace with maintained fontations-based APIs in the dependency convergence task" },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = [
+    { allow = ["WTFPL"], crate = "ncm-api-rs@0.1.0" },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/Fei-xiangShi/client-toolkit.git",
+    "https://github.com/Fei-xiangShi/iced.git",
+    "https://github.com/Fei-xiangShi/winit.git",
+    "https://github.com/SPlayer-Dev/ncm-api-rs.git",
+    "https://github.com/iced-rs/cryoglyph.git",
+]

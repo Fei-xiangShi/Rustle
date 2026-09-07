@@ -13,6 +13,9 @@ cargo xtask check
 
 # Native runner gate: toolchain, check, Clippy, and tests for the host OS.
 cargo xtask check-native
+
+# Dependency policy: advisories, licenses, bans, registries, and git sources.
+cargo xtask supply-chain
 ```
 
 Every Cargo resolution/build command inside these entry points uses
@@ -24,6 +27,7 @@ reads that file instead of copying the version into workflow YAML.
 The workflow name is `Rust CI`. Its stable job names are:
 
 - `rust-quality`
+- `rust-supply-chain`
 - `rust-windows`
 - `rust-linux`
 - `rust-macos`
@@ -35,7 +39,9 @@ Each job has an explicit timeout, participates in concurrency cancellation,
 and runs with only `contents: read`. Pull-request jobs receive no release or
 package-manager secrets. Cargo caches are saved only from successful `main`
 pushes, and failure artifacts contain only the captured build log under
-`target/ci-logs` with seven-day retention.
+`target/ci-logs` with seven-day retention. The supply-chain job installs the
+exact cargo-deny version from `.cargo-deny-version` and delegates policy
+arguments to xtask.
 
 ## Enabling branch protection
 
@@ -45,13 +51,13 @@ workflow has completed successfully at least once on GitHub:
 1. Open repository **Settings → Rules → Rulesets** (or Branches/branch
    protection on repositories without rulesets).
 2. Target the `main` branch and require a pull request before merging.
-3. Require the four check names listed above and require branches to be up to
+3. Require the five check names listed above and require branches to be up to
    date before merging.
 4. Do not enable “allow specified actors to bypass” unless the repository has a
    separately reviewed emergency policy.
 5. Save the rule, open a test pull request, and confirm a deliberately failing
    formatting/test change blocks merge while a documentation-only change still
-   runs all four jobs.
+   runs all five jobs.
 
 Changing branch protection is an external administrator action. It is not
 performed by the workflow or xtask and must be reviewed separately.
