@@ -1,10 +1,10 @@
 //! Database repository - main entry point
 //! Delegates to ops modules for actual operations
 
-use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
+use sqlx::{Pool, Sqlite};
 use std::path::Path;
 
-use super::{StorageResult as Result, models::*, ops, schema};
+use super::{StorageResult as Result, connection, migrations, models::*, ops};
 
 /// Database connection pool wrapper
 #[derive(Debug)]
@@ -20,30 +20,8 @@ impl Database {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
-
-        // Enable WAL mode for better concurrent read/write performance
-        // This prevents UI reads from being blocked by background writes
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&pool)
-            .await?;
-
-        // Optimize SQLite for better performance
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&pool)
-            .await?;
-
-        // Increase cache size (default is 2000 pages = ~8MB, set to ~32MB)
-        sqlx::query("PRAGMA cache_size = -32000")
-            .execute(&pool)
-            .await?;
-
-        schema::run_migrations(&pool).await?;
+        let pool = connection::connect(db_path).await?;
+        migrations::initialize(&pool).await?;
 
         Ok(Self { pool })
     }

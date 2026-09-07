@@ -1,7 +1,9 @@
 //! Database module for persistent storage
 //! Uses SQLite via sqlx for storing playlists, songs, and playback state
 
+mod connection;
 mod error;
+mod migrations;
 mod models;
 mod ops;
 mod repository;

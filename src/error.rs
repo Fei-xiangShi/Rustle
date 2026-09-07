@@ -39,6 +39,7 @@ pub enum ErrorCode {
     ProtocolUnsupported,
     BusinessRejected,
     StorageOpenFailed,
+    StorageMigrationFailed,
     StorageQueryFailed,
     StorageTransactionFailed,
     StorageNotFound,
@@ -60,7 +61,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Exhaustive stable code list used by compatibility tests and diagnostics.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::OperationCancelled,
         Self::NetworkRequestFailed,
         Self::NetworkTimeout,
@@ -70,6 +71,7 @@ impl ErrorCode {
         Self::ProtocolUnsupported,
         Self::BusinessRejected,
         Self::StorageOpenFailed,
+        Self::StorageMigrationFailed,
         Self::StorageQueryFailed,
         Self::StorageTransactionFailed,
         Self::StorageNotFound,
@@ -100,6 +102,7 @@ impl ErrorCode {
             Self::ProtocolUnsupported => "protocol.unsupported",
             Self::BusinessRejected => "business.rejected",
             Self::StorageOpenFailed => "storage.open_failed",
+            Self::StorageMigrationFailed => "storage.migration_failed",
             Self::StorageQueryFailed => "storage.query_failed",
             Self::StorageTransactionFailed => "storage.transaction_failed",
             Self::StorageNotFound => "storage.not_found",
@@ -130,6 +133,7 @@ impl ErrorCode {
             Self::ProtocolInvalidResponse | Self::ProtocolUnsupported => ErrorCategory::Protocol,
             Self::BusinessRejected => ErrorCategory::Business,
             Self::StorageOpenFailed
+            | Self::StorageMigrationFailed
             | Self::StorageQueryFailed
             | Self::StorageTransactionFailed
             | Self::StorageNotFound
@@ -159,6 +163,7 @@ impl ErrorCode {
             }
             Self::ProtocolInvalidResponse
             | Self::ProtocolUnsupported
+            | Self::StorageMigrationFailed
             | Self::InvariantViolation => RecoveryHint::ExportDiagnostics,
             Self::BusinessRejected | Self::StorageNotFound => RecoveryHint::None,
             Self::StoragePermissionDenied

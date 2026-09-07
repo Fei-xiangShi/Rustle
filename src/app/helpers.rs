@@ -85,7 +85,10 @@ pub async fn init_database() -> crate::database::StorageResult<Database> {
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("rustle.db");
 
-    tracing::info!("Initializing database at: {}", db_path.display());
+    tracing::info!(
+        event = "database_initializing",
+        "Initializing database storage"
+    );
     Database::new(&db_path).await
 }
 

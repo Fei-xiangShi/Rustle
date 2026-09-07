@@ -11,6 +11,8 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("SQLite operation failed")]
     Sqlx(#[from] sqlx::Error),
+    #[error("database migration failed")]
+    Migration(#[from] sqlx::migrate::MigrateError),
     #[error("storage operation failed")]
     Operation(#[from] anyhow::Error),
     #[error("{entity} `{identity}` was not found")]
@@ -51,6 +53,7 @@ impl StorageError {
                 ErrorCode::StorageNotFound
             }
             Self::Transaction { .. } => ErrorCode::StorageTransactionFailed,
+            Self::Migration(_) => ErrorCode::StorageMigrationFailed,
             Self::Sqlx(_) | Self::Operation(_) => ErrorCode::StorageQueryFailed,
         }
     }
@@ -84,5 +87,8 @@ mod tests {
         let app_error: AppError = transaction.into();
         assert!(app_error.source().is_some());
         assert_eq!(app_error.code(), ErrorCode::StorageTransactionFailed);
+
+        let migration = StorageError::Migration(sqlx::migrate::MigrateError::VersionMismatch(1));
+        assert_eq!(migration.code(), ErrorCode::StorageMigrationFailed);
     }
 }
