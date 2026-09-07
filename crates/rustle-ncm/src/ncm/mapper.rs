@@ -567,7 +567,7 @@ mod quality_tests {
         legacy_track_urls, login_info, merge_membership_vip, normalized_audio_url,
         song_quality_detail, track_urls,
     };
-    use crate::api::ncm::models::{NcmQualityLevel, VipTier};
+    use crate::ncm::models::{NcmQualityLevel, VipTier};
     use serde_json::json;
 
     #[test]

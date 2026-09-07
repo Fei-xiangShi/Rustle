@@ -1,8 +1,12 @@
-//! Root compatibility facade for the physical NCM adapter crate.
+//! Netease Cloud Music API module
+//!
+//! Provides NCM client with cookie management, QR login, and API wrappers.
 
-pub(crate) use rustle_ncm::quality_api_level;
+mod ncm;
+
+pub use ncm::quality_api_level;
 #[allow(unused_imports)]
-pub use rustle_ncm::{
+pub use ncm::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LoginInfo, NcmClient, NcmError,
     NcmQualityLevel, NcmResult, PRIVATE_RADAR_PLAYLIST_ID, PlaylistDetail, PlaylistSummary,
     RadioSummary, SearchType, SongQualityDetail, SongQualityOption, Track, TrackAvailability,

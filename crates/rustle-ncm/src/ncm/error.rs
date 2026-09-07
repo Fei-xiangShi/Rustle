@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::io;
 
-use crate::error::{AppError, ErrorCode, RecoveryHint};
+use rustle_application::error::{AppError, ErrorCode, RecoveryHint};
 
 pub type NcmResult<T> = Result<T, NcmError>;
 

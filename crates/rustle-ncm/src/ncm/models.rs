@@ -82,7 +82,7 @@ impl VipInfo {
 }
 
 /// Compatibility name retained at the NCM adapter boundary.
-pub type NcmQualityLevel = crate::domain::audio::QualityLevel;
+pub type NcmQualityLevel = rustle_domain::audio::QualityLevel;
 
 pub fn quality_api_level(level: NcmQualityLevel) -> &'static str {
     match level {

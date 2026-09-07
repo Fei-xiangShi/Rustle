@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/rustle-application",
     "crates/rustle-domain",
+    "crates/rustle-ncm",
     "crates/rustle-storage",
     "xtask",
 ]
@@ -32,6 +33,7 @@ fs4 = "1.1.0"
 regex = "1.13"
 rustle-application = { path = "crates/rustle-application" }
 rustle-domain = { path = "crates/rustle-domain" }
+rustle-ncm = { path = "crates/rustle-ncm" }
 rustle-storage = { path = "crates/rustle-storage" }
 
 [workspace.lints.rust]
@@ -92,6 +94,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 rustle-application.workspace = true
 rustle-domain.workspace = true
+rustle-ncm.workspace = true
 rustle-storage.workspace = true
 
 # Local playlist import
@@ -114,10 +117,6 @@ ab_glyph = "0.2"
 quick-xml = "0.42.0"
 futures-util = "0.3.34"
 discord-rich-presence = "1.1.0"
-
-# Netease Cloud Music API
-ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs.git", rev = "133b65bfe482e41ebccf018870d3fce07bf58eb3" }
-qrcode-generator = "6.0"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "gzip", "stream"] }
 

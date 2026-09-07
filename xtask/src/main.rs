@@ -462,7 +462,12 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         .collect::<Vec<_>>();
     let mut violations = Vec::new();
 
-    for package_name in ["rustle-domain", "rustle-application", "rustle-storage"] {
+    for package_name in [
+        "rustle-domain",
+        "rustle-application",
+        "rustle-storage",
+        "rustle-ncm",
+    ] {
         let Some(package) = packages
             .iter()
             .find(|package| package.get("name").and_then(Value::as_str) == Some(package_name))
@@ -501,6 +506,20 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 "windows-sys",
                 "xxhash-rust",
             ],
+            "rustle-ncm" => &[
+                "directories",
+                "futures-util",
+                "ncm-api-rs",
+                "parking_lot",
+                "qrcode-generator",
+                "reqwest",
+                "rustle-application",
+                "rustle-domain",
+                "serde",
+                "serde_json",
+                "thiserror",
+                "tracing",
+            ],
             _ => unreachable!(),
         };
 
@@ -536,6 +555,20 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 }
             }
         }
+        if package_name == "rustle-ncm" {
+            for required_dependency in ["rustle-domain", "rustle-application"] {
+                if !metadata_array(package, "dependencies")?
+                    .iter()
+                    .any(|dependency| {
+                        dependency.get("name").and_then(Value::as_str) == Some(required_dependency)
+                    })
+                {
+                    violations.push(format!(
+                        "package `rustle-ncm` must depend on `{required_dependency}`"
+                    ));
+                }
+            }
+        }
     }
 
     let Some(root_package) = packages
@@ -546,7 +579,12 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         return Ok(violations);
     };
     let root_dependencies = metadata_array(root_package, "dependencies")?;
-    for dependency in ["rustle-domain", "rustle-application", "rustle-storage"] {
+    for dependency in [
+        "rustle-domain",
+        "rustle-application",
+        "rustle-storage",
+        "rustle-ncm",
+    ] {
         if !root_dependencies
             .iter()
             .any(|candidate| candidate.get("name").and_then(Value::as_str) == Some(dependency))
@@ -720,6 +758,39 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "storage must not depend on sibling adapters",
             ),
             ("rustle_ui", "storage must not depend on sibling adapters"),
+        ]);
+    }
+    if path.starts_with("crates/rustle-ncm/src/") {
+        forbidden.extend([
+            ("iced::", "NCM must be UI-framework free"),
+            ("sqlx::", "NCM must not own database adapters"),
+            ("rodio::", "NCM must not own audio backends"),
+            ("crate::api", "NCM must not depend on the root API facade"),
+            ("crate::features", "NCM must not depend on root features"),
+            ("crate::audio", "NCM must not depend on the audio adapter"),
+            (
+                "crate::platform",
+                "NCM must not depend on platform adapters",
+            ),
+            ("crate::ui", "NCM must not depend on UI adapters"),
+            (
+                "crate::app::",
+                "NCM must not depend on the composition root",
+            ),
+            (
+                "crate::error",
+                "NCM must use application error contracts directly",
+            ),
+            ("crate::domain", "NCM must use domain contracts directly"),
+            ("rustle_storage", "NCM must not depend on sibling adapters"),
+            ("rustle_media", "NCM must not depend on sibling adapters"),
+            ("rustle_audio", "NCM must not depend on sibling adapters"),
+            ("rustle_platform", "NCM must not depend on sibling adapters"),
+            (
+                "rustle_observability",
+                "NCM must not depend on sibling adapters",
+            ),
+            ("rustle_ui", "NCM must not depend on sibling adapters"),
         ]);
     }
 
@@ -1339,12 +1410,20 @@ mod tests {
             .len(),
             2
         );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-ncm/src/client.rs",
+                "use crate::error::AppError; use rustle_storage::paths::cache_dir;",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "storage-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "storage-id", "ncm-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1381,12 +1460,31 @@ mod tests {
                     ]
                 },
                 {
+                    "name": "rustle-ncm",
+                    "id": "ncm-id",
+                    "dependencies": [
+                        {"name": "directories"},
+                        {"name": "futures-util"},
+                        {"name": "ncm-api-rs"},
+                        {"name": "parking_lot"},
+                        {"name": "qrcode-generator"},
+                        {"name": "reqwest"},
+                        {"name": "rustle-application"},
+                        {"name": "rustle-domain"},
+                        {"name": "serde"},
+                        {"name": "serde_json"},
+                        {"name": "thiserror"},
+                        {"name": "tracing"}
+                    ]
+                },
+                {
                     "name": "rustle",
                     "id": "root-id",
                     "dependencies": [
                         {"name": "rustle-domain"},
                         {"name": "rustle-application"},
-                        {"name": "rustle-storage"}
+                        {"name": "rustle-storage"},
+                        {"name": "rustle-ncm"}
                     ]
                 }
             ]

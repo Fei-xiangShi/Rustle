@@ -1,0 +1,28 @@
+[package]
+name = "rustle-ncm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "NetEase Cloud Music protocol and transport adapter for Rustle"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+directories = "6.0.0"
+futures-util = "0.3.34"
+ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs.git", rev = "133b65bfe482e41ebccf018870d3fce07bf58eb3" }
+parking_lot = "0.12"
+qrcode-generator = "6.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "gzip", "stream"] }
+rustle-application.workspace = true
+rustle-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

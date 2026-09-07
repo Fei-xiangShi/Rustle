@@ -5303,12 +5303,10 @@ dependencies = [
  "ksni",
  "lofty",
  "mpris-server",
- "ncm-api-rs",
  "notify",
  "objc2 0.6.4",
  "objc2-foundation",
  "parking_lot",
- "qrcode-generator",
  "quick-xml 0.42.0",
  "rand 0.10.2",
  "rayon",
@@ -5318,6 +5316,7 @@ dependencies = [
  "rodio",
  "rustle-application",
  "rustle-domain",
+ "rustle-ncm",
  "rustle-storage",
  "sdf_glyph_renderer",
  "serde",
@@ -5352,6 +5351,24 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustle-ncm"
+version = "0.5.2"
+dependencies = [
+ "directories",
+ "futures-util",
+ "ncm-api-rs",
+ "parking_lot",
+ "qrcode-generator",
+ "reqwest 0.13.4",
+ "rustle-application",
+ "rustle-domain",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

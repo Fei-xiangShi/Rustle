@@ -87,6 +87,12 @@ impl NcmClient {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    fn cache_dir() -> PathBuf {
+        directories::ProjectDirs::from("life", "fxs", "rustle")
+            .map(|dirs| dirs.cache_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("~/.cache/rustle"))
+    }
+
     pub fn cookie_file_path() -> PathBuf {
         let data_dir = Self::data_dir();
         fs::create_dir_all(&data_dir).ok();
@@ -244,7 +250,7 @@ impl NcmClient {
             .to_string();
         let qr_url = format!("https://music.163.com/login?codekey={}", unikey);
 
-        let cache_dir = crate::utils::cache_dir();
+        let cache_dir = Self::cache_dir();
         fs::create_dir_all(&cache_dir)?;
 
         if let Ok(entries) = fs::read_dir(&cache_dir) {
