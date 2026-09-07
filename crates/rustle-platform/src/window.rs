@@ -4,7 +4,7 @@
 //! Handles platform-specific differences in show/hide/minimize behavior.
 
 #[cfg(target_os = "linux")]
-use crate::platform::APP_ID;
+use crate::APP_ID;
 use iced::Task;
 
 #[cfg(target_os = "linux")]

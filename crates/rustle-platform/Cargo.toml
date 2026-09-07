@@ -1,0 +1,50 @@
+[package]
+name = "rustle-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Native desktop integration adapters for Rustle"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cosmic-text = "0.19.0"
+discord-rich-presence = "1.1.0"
+global-hotkey = "0.8"
+iced = { version = "=0.15.0-dev", features = ["tokio", "advanced"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+interprocess = { version = "2", features = ["tokio"] }
+rustle-application.workspace = true
+rustle-domain.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
+mpris-server = "0.10.0"
+x11rb = "0.14.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["objc2-core-services"] }
+tray-icon = "0.24.2"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+souvlaki = "0.8.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

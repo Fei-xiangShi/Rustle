@@ -105,17 +105,19 @@ impl MediaHandle {
 
 /// Start media controls service (Linux - MPRIS)
 #[cfg(target_os = "linux")]
-pub fn start_media_controls(
+pub fn start_media_controls_with(
     _window_handle: Option<usize>,
+    spawn_worker: crate::runtime::WorkerSpawner,
 ) -> (MediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
-    let (inner, rx) = linux::start();
+    let (inner, rx) = linux::start(spawn_worker);
     (MediaHandle { inner }, rx)
 }
 
 /// Start media controls service (Windows/macOS - souvlaki)
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-pub fn start_media_controls(
+pub fn start_media_controls_with(
     window_handle: Option<usize>,
+    _spawn_worker: crate::runtime::WorkerSpawner,
 ) -> (MediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
     let (inner, rx) = souvlaki_impl::start(window_handle);
     (MediaHandle { inner }, rx)
@@ -123,8 +125,9 @@ pub fn start_media_controls(
 
 /// Start media controls service (no-op on unsupported platforms)
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-pub fn start_media_controls(
+pub fn start_media_controls_with(
     _window_handle: Option<usize>,
+    _spawn_worker: crate::runtime::WorkerSpawner,
 ) -> (MediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
     let (_tx, rx) = mpsc::unbounded_channel();
     (MediaHandle { _phantom: () }, rx)

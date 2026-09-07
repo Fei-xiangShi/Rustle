@@ -2,7 +2,7 @@
 //!
 //! Windows requires special handling: minimize before hide, restore before show
 
-use crate::platform::APP_ID;
+use crate::APP_ID;
 use iced::Task;
 
 pub fn initialize_process() {

@@ -1,8 +1,8 @@
 //! Linux system tray implementation using ksni (freedesktop StatusNotifierItem)
 
-use super::{TrayCommand, TrayHandle, TrayPresentation, TrayWindowCommand};
-use crate::domain::playback::PlayMode;
+use super::{TrayCommand, TrayError, TrayHandle, TrayPresentation, TrayWindowCommand};
 use ksni::{Icon, MenuItem, Status, ToolTip, Tray as KsniTray, TrayMethods, menu::*};
+use rustle_domain::playback::PlayMode;
 use tokio::sync::mpsc;
 
 /// Linux system tray implementation using ksni
@@ -76,14 +76,14 @@ impl KsniTray for LinuxTray {
 pub async fn start_linux_tray(
     presentation: TrayPresentation,
     command_capacity: usize,
-) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
+) -> Result<(TrayHandle, mpsc::Receiver<TrayCommand>), TrayError> {
     let (tx, rx) = mpsc::channel(command_capacity);
     let tray = LinuxTray::new(tx, presentation);
 
     let handle = tray
         .spawn()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to start Linux tray: {}", e))?;
+        .map_err(|error| TrayError::backend("start Linux system tray", error))?;
 
     Ok((TrayHandle { handle }, rx))
 }

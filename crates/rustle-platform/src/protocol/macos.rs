@@ -5,7 +5,7 @@
 /// On macOS, `rustle://` links arrive as Apple Events rather than CLI args.
 /// This handler intercepts them and forwards URLs through the IPC channel.
 #[cfg(target_os = "macos")]
-pub fn setup_macos_url_handler(tx: crate::protocol::ipc::IpcSender) {
+pub fn setup_macos_url_handler(tx: super::ipc::IpcSender) {
     use objc2::rc::Retained;
     use objc2::runtime::{NSObject, NSObjectProtocol};
     use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -22,7 +22,7 @@ pub fn setup_macos_url_handler(tx: crate::protocol::ipc::IpcSender) {
     // Apple Events are delivered on AppKit's main thread. Keeping both values
     // in TLS makes that ownership part of the Rust type/lifetime boundary.
     thread_local! {
-        static SENDER: RefCell<Option<crate::protocol::ipc::IpcSender>> = const {
+        static SENDER: RefCell<Option<super::ipc::IpcSender>> = const {
             RefCell::new(None)
         };
     }
@@ -66,7 +66,7 @@ pub fn setup_macos_url_handler(tx: crate::protocol::ipc::IpcSender) {
                             };
                             if let Some(sender) = sender.as_ref() {
                                 let _ = sender
-                                    .send(crate::protocol::ipc::IpcMessage::Uri(url));
+                                    .send(super::ipc::IpcMessage::Uri(url));
                             }
                         });
                     }
@@ -118,4 +118,4 @@ pub fn setup_macos_url_handler(tx: crate::protocol::ipc::IpcSender) {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn setup_macos_url_handler(_tx: crate::protocol::ipc::IpcSender) {}
+pub fn setup_macos_url_handler(_tx: super::ipc::IpcSender) {}

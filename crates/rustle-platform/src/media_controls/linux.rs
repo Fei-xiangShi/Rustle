@@ -1,6 +1,6 @@
 //! Linux MPRIS D-Bus integration using LocalPlayerInterface trait
 
-use crate::platform::{APP_BINARY_NAME, APP_DISPLAY_NAME, APP_ID};
+use crate::{APP_BINARY_NAME, APP_DISPLAY_NAME, APP_ID};
 use mpris_server::{
     LocalPlayerInterface, LocalRootInterface, LocalServer, LoopStatus, Metadata, PlaybackRate,
     PlaybackStatus, Property, Time, TrackId, Volume,
@@ -313,7 +313,9 @@ impl LinuxMediaHandle {
 }
 
 /// Start MPRIS service
-pub fn start() -> (LinuxMediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
+pub fn start(
+    spawn_worker: crate::runtime::WorkerSpawner,
+) -> (LinuxMediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<MediaState>();
     let state = MprisSharedState::default();
@@ -323,49 +325,53 @@ pub fn start() -> (LinuxMediaHandle, mpsc::UnboundedReceiver<MediaCommand>) {
     };
 
     // Spawn MPRIS on a dedicated panic-contained thread with its own runtime.
-    let spawn_result = crate::runtime::spawn_guarded("linux-mpris", "mpris_service", move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                tracing::error!(%error, "Failed to create the MPRIS runtime");
-                return;
-            }
-        };
-
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
-            // Start the MPRIS server
-            let server = match LocalServer::new(APP_ID, player).await {
-                Ok(server) => server,
+    let spawn_result = spawn_worker(
+        "linux-mpris",
+        "mpris_service",
+        Box::new(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
                 Err(error) => {
-                    tracing::error!(%error, "Failed to create the MPRIS server");
+                    tracing::error!(%error, "Failed to create the MPRIS runtime");
                     return;
                 }
             };
 
-            // Run server and handle state updates concurrently
-            tokio::select! {
-                _ = server.run() => {}
-                _ = async {
-                    while let Some(state) = state_rx.recv().await {
-                        // Send PropertiesChanged signal to notify clients like Waybar
-                        let _ = server.properties_changed([
-                            Property::PlaybackStatus(state.status.into()),
-                            Property::Metadata(to_mpris_metadata(&state.metadata)),
-                            Property::CanGoNext(state.can_go_next),
-                            Property::CanGoPrevious(state.can_go_previous),
-                            Property::CanPlay(state.can_play),
-                            Property::CanPause(state.can_pause),
-                            Property::CanSeek(state.can_seek),
-                        ]).await;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                // Start the MPRIS server
+                let server = match LocalServer::new(APP_ID, player).await {
+                    Ok(server) => server,
+                    Err(error) => {
+                        tracing::error!(%error, "Failed to create the MPRIS server");
+                        return;
                     }
-                } => {}
-            }
-        });
-    });
+                };
+
+                // Run server and handle state updates concurrently
+                tokio::select! {
+                    _ = server.run() => {}
+                    _ = async {
+                        while let Some(state) = state_rx.recv().await {
+                            // Send PropertiesChanged signal to notify clients like Waybar
+                            let _ = server.properties_changed([
+                                Property::PlaybackStatus(state.status.into()),
+                                Property::Metadata(to_mpris_metadata(&state.metadata)),
+                                Property::CanGoNext(state.can_go_next),
+                                Property::CanGoPrevious(state.can_go_previous),
+                                Property::CanPlay(state.can_play),
+                                Property::CanPause(state.can_pause),
+                                Property::CanSeek(state.can_seek),
+                            ]).await;
+                        }
+                    } => {}
+                }
+            });
+        }),
+    );
     if let Err(error) = spawn_result {
         tracing::error!(
             error_kind = ?error.kind(),

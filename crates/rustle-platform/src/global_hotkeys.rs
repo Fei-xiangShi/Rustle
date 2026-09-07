@@ -8,7 +8,7 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tokio::sync::mpsc;
 
-use crate::features::keybindings::{Action, KeyBinding, KeyBindings, KeyCode};
+use rustle_domain::keybindings::{Action, KeyBinding, KeyBindings, KeyCode};
 
 /// Owns the native manager and the subset of configured shortcuts that are
 /// currently registered successfully with the operating system.
@@ -42,7 +42,7 @@ impl GlobalHotkeyService {
                 Err(error) => {
                     tracing::warn!(
                         ?action,
-                        binding = %crate::platform::keybindings::display_binding(Some(binding)),
+                        binding = %crate::keybindings::display_binding(Some(binding)),
                         %error,
                         "Failed to register configured global hotkey"
                     );
@@ -303,7 +303,7 @@ pub struct GlobalHotkeyError {
 }
 
 impl GlobalHotkeyError {
-    pub(crate) fn unsupported_session() -> Self {
+    pub fn unsupported_session() -> Self {
         Self {
             kind: GlobalHotkeyErrorKind::UnsupportedSession,
             source: None,
@@ -355,16 +355,20 @@ impl GlobalHotkeyError {
         self.kind
     }
 
-    pub const fn code(&self) -> crate::error::ErrorCode {
+    pub const fn code(&self) -> rustle_domain::error::ErrorCode {
         match self.kind {
             GlobalHotkeyErrorKind::UnsupportedSession
             | GlobalHotkeyErrorKind::UnsupportedBinding => {
-                crate::error::ErrorCode::PlatformUnsupported
+                rustle_domain::error::ErrorCode::PlatformUnsupported
             }
-            GlobalHotkeyErrorKind::NativeConflict => crate::error::ErrorCode::PlatformConflict,
+            GlobalHotkeyErrorKind::NativeConflict => {
+                rustle_domain::error::ErrorCode::PlatformConflict
+            }
             GlobalHotkeyErrorKind::BackendUnavailable
             | GlobalHotkeyErrorKind::Lifecycle
-            | GlobalHotkeyErrorKind::Rollback => crate::error::ErrorCode::PlatformUnavailable,
+            | GlobalHotkeyErrorKind::Rollback => {
+                rustle_domain::error::ErrorCode::PlatformUnavailable
+            }
         }
     }
 }
@@ -399,11 +403,11 @@ impl Error for GlobalHotkeyError {
     }
 }
 
-impl From<GlobalHotkeyError> for crate::error::AppError {
+impl From<GlobalHotkeyError> for rustle_application::error::AppError {
     fn from(error: GlobalHotkeyError) -> Self {
         let code = error.code();
         let summary = error.to_string();
-        crate::error::AppError::with_source(code, summary, error)
+        rustle_application::error::AppError::with_source(code, summary, error)
     }
 }
 
@@ -441,7 +445,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::features::keybindings::ModifierSet;
+    use rustle_domain::keybindings::ModifierSet;
 
     #[test]
     fn converts_keys_and_arbitrary_modifier_combinations() {
@@ -506,7 +510,10 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), GlobalHotkeyErrorKind::NativeConflict);
-        assert_eq!(error.code(), crate::error::ErrorCode::PlatformConflict);
+        assert_eq!(
+            error.code(),
+            rustle_domain::error::ErrorCode::PlatformConflict
+        );
         assert_eq!(
             error
                 .source()
@@ -578,20 +585,20 @@ mod tests {
     fn platform_error_kinds_map_to_stable_application_codes() {
         assert_eq!(
             GlobalHotkeyError::unsupported_session().code(),
-            crate::error::ErrorCode::PlatformUnsupported
+            rustle_domain::error::ErrorCode::PlatformUnsupported
         );
         assert_eq!(
             GlobalHotkeyError::native_conflict(HotkeyRegistrationError::simulated("conflict"))
                 .code(),
-            crate::error::ErrorCode::PlatformConflict
+            rustle_domain::error::ErrorCode::PlatformConflict
         );
         assert_eq!(
             GlobalHotkeyError::backend_unavailable(std::io::Error::other("backend")).code(),
-            crate::error::ErrorCode::PlatformUnavailable
+            rustle_domain::error::ErrorCode::PlatformUnavailable
         );
         assert_eq!(
             GlobalHotkeyError::lifecycle(HotkeyRegistrationError::simulated("lifecycle")).code(),
-            crate::error::ErrorCode::PlatformUnavailable
+            rustle_domain::error::ErrorCode::PlatformUnavailable
         );
         assert_eq!(
             GlobalHotkeyError::rollback(
@@ -599,7 +606,7 @@ mod tests {
                 HotkeyRegistrationError::simulated("rollback"),
             )
             .code(),
-            crate::error::ErrorCode::PlatformUnavailable
+            rustle_domain::error::ErrorCode::PlatformUnavailable
         );
     }
 }

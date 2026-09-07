@@ -1,8 +1,10 @@
 //! Native Windows notification-area implementation.
 
-use super::{TrayAvailability, TrayCommand, TrayHandle, TrayPresentation, TrayWindowCommand};
-use crate::domain::playback::PlayMode;
-use anyhow::{Context, anyhow};
+use super::{
+    TrayAvailability, TrayCommand, TrayError, TrayHandle, TrayPresentation, TrayResultExt,
+    TrayWindowCommand,
+};
+use rustle_domain::playback::PlayMode;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -92,7 +94,7 @@ thread_local! {
 pub fn start_windows_tray(
     presentation: TrayPresentation,
     command_capacity: usize,
-) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
+) -> Result<(TrayHandle, mpsc::Receiver<TrayCommand>), TrayError> {
     start_windows_tray_with_identity(presentation, command_capacity, default_tray_identity())
 }
 
@@ -100,14 +102,14 @@ fn start_windows_tray_with_identity(
     presentation: TrayPresentation,
     command_capacity: usize,
     identity: TrayIdentity,
-) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
+) -> Result<(TrayHandle, mpsc::Receiver<TrayCommand>), TrayError> {
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
     let tray = WindowsTray::new(command_tx, presentation, identity)?;
 
     WINDOWS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err(anyhow!("Windows system tray is already initialized"));
+            return Err(TrayError::already_initialized());
         }
         *slot = Some(tray);
         Ok(())
@@ -116,12 +118,10 @@ fn start_windows_tray_with_identity(
     Ok((TrayHandle { _private: () }, command_rx))
 }
 
-pub fn update_state(presentation: TrayPresentation) -> anyhow::Result<()> {
+pub fn update_state(presentation: TrayPresentation) -> Result<(), TrayError> {
     WINDOWS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let tray = slot
-            .as_mut()
-            .ok_or_else(|| anyhow!("Windows system tray is not initialized"))?;
+        let tray = slot.as_mut().ok_or_else(TrayError::not_initialized)?;
         tray.update_state(presentation)
     })
 }
@@ -154,7 +154,7 @@ impl WindowsTray {
         command_tx: mpsc::Sender<TrayCommand>,
         presentation: TrayPresentation,
         identity: TrayIdentity,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, TrayError> {
         // SAFETY: Passing null requests the module containing the current
         // process image; the call has no borrowed output or cleanup contract.
         let instance = unsafe { GetModuleHandleW(null()) };
@@ -279,7 +279,7 @@ impl WindowsTray {
         Ok(tray)
     }
 
-    fn update_state(&mut self, presentation: TrayPresentation) -> anyhow::Result<()> {
+    fn update_state(&mut self, presentation: TrayPresentation) -> Result<(), TrayError> {
         let new_menu = build_menu(&presentation)?;
         self.state.install_menu(new_menu);
         self.state.presentation = presentation;
@@ -345,7 +345,7 @@ struct WindowState {
 }
 
 impl WindowState {
-    fn register_icon(&mut self) -> anyhow::Result<()> {
+    fn register_icon(&mut self) -> Result<(), TrayError> {
         let mut data = self.notify_data(
             NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             &self.presentation.tooltip,
@@ -379,7 +379,7 @@ impl WindowState {
         self.shell_available = false;
     }
 
-    fn sync_icon(&mut self) -> anyhow::Result<()> {
+    fn sync_icon(&mut self) -> Result<(), TrayError> {
         if !self.icon_registered {
             let result = self.register_icon();
             return match result {
@@ -454,7 +454,7 @@ impl WindowState {
         }
     }
 
-    fn report_unavailable(&mut self, error: &anyhow::Error) {
+    fn report_unavailable(&mut self, error: &TrayError) {
         if self.shell_available {
             self.shell_available = false;
             self.send_command(TrayCommand::AvailabilityChanged(
@@ -521,18 +521,18 @@ unsafe extern "system" fn tray_window_proc(
 ) -> LRESULT {
     crate::runtime::catch_ffi_unwind(
         "windows_tray_wndproc",
-        || {
+        Box::new(move || {
             // SAFETY: The outer WNDPROC contract supplies the same validated
             // native arguments to the implementation, and this closure cannot
             // unwind beyond the ABI wrapper.
             unsafe { tray_window_proc_inner(hwnd, message, wparam, lparam) }
-        },
-        || {
+        }),
+        Box::new(move || {
             // SAFETY: On a captured panic, forwarding the untouched native
             // arguments is the only operation performed before returning to
             // Windows.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        },
+        }),
     )
 }
 
@@ -736,7 +736,7 @@ fn context_menu_point(hwnd: HWND, identity: TrayIdentity, packed_position: WPARA
     }
 }
 
-fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> anyhow::Result<bool> {
+fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> Result<bool, TrayError> {
     let class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(tray_window_proc),
@@ -750,9 +750,7 @@ fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> anyhow::Res
         // after the failed registration call on this same thread.
         let error = unsafe { GetLastError() };
         if error != ERROR_CLASS_ALREADY_EXISTS {
-            return Err(anyhow!(
-                "RegisterClassExW(tray window) failed with Win32 error {error}"
-            ));
+            return Err(TrayError::native("RegisterClassExW(tray window)", error));
         }
         return Ok(false);
     }
@@ -764,8 +762,8 @@ struct LoadedIcon {
     owned: bool,
 }
 
-fn load_small_icon() -> anyhow::Result<LoadedIcon> {
-    static ICON_DATA: &[u8] = include_bytes!("../../../assets/icons/icon_256.png");
+fn load_small_icon() -> Result<LoadedIcon, TrayError> {
+    static ICON_DATA: &[u8] = include_bytes!("../../../../assets/icons/icon_256.png");
 
     // SAFETY: GetDpiForSystem reads process DPI state and has no pointer or
     // ownership preconditions.
@@ -790,7 +788,7 @@ fn load_small_icon() -> anyhow::Result<LoadedIcon> {
     let height = metric(SM_CYSMICON).max(16) as u32;
 
     let rgba = image::load_from_memory(ICON_DATA)
-        .context("Failed to decode embedded Windows tray icon")?
+        .tray_context("decode embedded Windows tray icon")?
         .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
 
@@ -903,7 +901,7 @@ fn premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
 struct OwnedMenu(HMENU);
 
 impl OwnedMenu {
-    fn popup(operation: &'static str) -> anyhow::Result<Self> {
+    fn popup(operation: &'static str) -> Result<Self, TrayError> {
         // SAFETY: CreatePopupMenu has no preconditions.
         let handle = unsafe { CreatePopupMenu() };
         if handle.is_null() {
@@ -931,7 +929,7 @@ impl Drop for OwnedMenu {
     }
 }
 
-fn build_menu(presentation: &TrayPresentation) -> anyhow::Result<HMENU> {
+fn build_menu(presentation: &TrayPresentation) -> Result<HMENU, TrayError> {
     let root = OwnedMenu::popup("CreatePopupMenu(root)")?;
     append_text(
         root.0,
@@ -1016,12 +1014,12 @@ fn build_menu(presentation: &TrayPresentation) -> anyhow::Result<HMENU> {
     Ok(root.into_raw())
 }
 
-fn append_check_item(menu: HMENU, id: u16, label: &str, checked: bool) -> anyhow::Result<()> {
+fn append_check_item(menu: HMENU, id: u16, label: &str, checked: bool) -> Result<(), TrayError> {
     let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
     append_text(menu, flags, id as usize, label)
 }
 
-fn append_separator(menu: HMENU) -> anyhow::Result<()> {
+fn append_separator(menu: HMENU) -> Result<(), TrayError> {
     // SAFETY: menu is live and MF_SEPARATOR ignores the text pointer.
     if unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) } == 0 {
         Err(last_error("AppendMenuW(separator)"))
@@ -1030,7 +1028,7 @@ fn append_separator(menu: HMENU) -> anyhow::Result<()> {
     }
 }
 
-fn append_text(menu: HMENU, flags: u32, id: usize, label: &str) -> anyhow::Result<()> {
+fn append_text(menu: HMENU, flags: u32, id: usize, label: &str) -> Result<(), TrayError> {
     let label = wide(label);
     // SAFETY: AppendMenuW copies the NUL-terminated string during the call.
     if unsafe { AppendMenuW(menu, flags, id, label.as_ptr()) } == 0 {
@@ -1114,10 +1112,10 @@ fn utf16_array<const N: usize>(value: &str) -> [u16; N] {
     output
 }
 
-fn last_error(operation: &'static str) -> anyhow::Error {
+fn last_error(operation: &'static str) -> TrayError {
     // SAFETY: GetLastError is thread-local and has no preconditions.
     let code = unsafe { GetLastError() };
-    anyhow!("{operation} failed with Win32 error {code}")
+    TrayError::native(operation, code)
 }
 
 #[cfg(test)]

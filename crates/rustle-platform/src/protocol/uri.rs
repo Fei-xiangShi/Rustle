@@ -76,6 +76,8 @@ impl fmt::Display for UriError {
     }
 }
 
+impl std::error::Error for UriError {}
+
 /// Maximum URI length in bytes
 pub const MAX_URI_LENGTH: usize = 2048;
 

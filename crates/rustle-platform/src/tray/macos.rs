@@ -5,9 +5,10 @@
 //! work (opt-in status item and dedicated template artwork) is intentionally a
 //! separate task.
 
-use super::{TrayCommand, TrayHandle, TrayPresentation, TrayWindowCommand};
-use crate::domain::playback::PlayMode;
-use anyhow::{Context, anyhow};
+use super::{
+    TrayCommand, TrayError, TrayHandle, TrayPresentation, TrayResultExt, TrayWindowCommand,
+};
+use rustle_domain::playback::PlayMode;
 use std::cell::RefCell;
 use tokio::sync::mpsc;
 use tray_icon::{
@@ -33,7 +34,7 @@ thread_local! {
 pub fn start_macos_tray(
     presentation: TrayPresentation,
     command_capacity: usize,
-) -> anyhow::Result<(TrayHandle, mpsc::Receiver<TrayCommand>)> {
+) -> Result<(TrayHandle, mpsc::Receiver<TrayCommand>), TrayError> {
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
     install_menu_handler(command_tx.clone());
 
@@ -47,7 +48,7 @@ pub fn start_macos_tray(
         .with_icon(icon)
         .with_icon_as_template(true)
         .build()
-        .map_err(|error| anyhow!("Failed to create macOS status item: {error}"))?;
+        .tray_context("create macOS status item")?;
 
     let owner = MacosTray {
         tray,
@@ -57,7 +58,7 @@ pub fn start_macos_tray(
     MACOS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err(anyhow!("macOS status item is already initialized"));
+            return Err(TrayError::already_initialized());
         }
         *slot = Some(owner);
         Ok(())
@@ -66,12 +67,10 @@ pub fn start_macos_tray(
     Ok((TrayHandle { _private: () }, command_rx))
 }
 
-pub fn update_state(presentation: TrayPresentation) -> anyhow::Result<()> {
+pub fn update_state(presentation: TrayPresentation) -> Result<(), TrayError> {
     MACOS_TRAY.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let owner = slot
-            .as_mut()
-            .ok_or_else(|| anyhow!("macOS status item is not initialized"))?;
+        let owner = slot.as_mut().ok_or_else(TrayError::not_initialized)?;
         owner.apply_state(presentation)
     })
 }
@@ -93,7 +92,7 @@ struct MacosTray {
 }
 
 impl MacosTray {
-    fn apply_state(&mut self, presentation: TrayPresentation) -> anyhow::Result<()> {
+    fn apply_state(&mut self, presentation: TrayPresentation) -> Result<(), TrayError> {
         self.items.now_playing.set_text(&presentation.now_playing);
         self.items.play_pause.set_text(presentation.play_pause);
         self.items.previous.set_text(presentation.previous);
@@ -127,7 +126,7 @@ impl MacosTray {
             .set_checked(presentation.play_mode == PlayMode::Shuffle);
         self.tray
             .set_tooltip(Some(&presentation.tooltip))
-            .context("Failed to update macOS status item tooltip")?;
+            .tray_context("update macOS status item tooltip")?;
         self.presentation = presentation;
         Ok(())
     }
@@ -177,7 +176,7 @@ fn install_menu_handler(command_tx: mpsc::Sender<TrayCommand>) {
     }));
 }
 
-fn build_menu(presentation: &TrayPresentation) -> anyhow::Result<(Menu, MenuItems)> {
+fn build_menu(presentation: &TrayPresentation) -> Result<(Menu, MenuItems), TrayError> {
     let menu = Menu::new();
     let now_playing = MenuItem::with_id(
         MenuId::new("now_playing"),
@@ -241,22 +240,40 @@ fn build_menu(presentation: &TrayPresentation) -> anyhow::Result<(Menu, MenuItem
     );
     let quit = MenuItem::with_id(MenuId::new(QUIT_ID), presentation.quit, true, None);
 
-    menu.append(&now_playing)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&play_pause)?;
-    menu.append(&previous)?;
-    menu.append(&next)?;
-    menu.append(&favorite)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    play_mode_menu.append(&sequential)?;
-    play_mode_menu.append(&loop_all)?;
-    play_mode_menu.append(&loop_one)?;
-    play_mode_menu.append(&shuffle)?;
-    menu.append(&play_mode_menu)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&toggle_window)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&quit)?;
+    menu.append(&now_playing)
+        .tray_context("build macOS tray menu")?;
+    menu.append(&PredefinedMenuItem::separator())
+        .tray_context("build macOS tray menu")?;
+    menu.append(&play_pause)
+        .tray_context("build macOS tray menu")?;
+    menu.append(&previous)
+        .tray_context("build macOS tray menu")?;
+    menu.append(&next).tray_context("build macOS tray menu")?;
+    menu.append(&favorite)
+        .tray_context("build macOS tray menu")?;
+    menu.append(&PredefinedMenuItem::separator())
+        .tray_context("build macOS tray menu")?;
+    play_mode_menu
+        .append(&sequential)
+        .tray_context("build macOS tray play-mode menu")?;
+    play_mode_menu
+        .append(&loop_all)
+        .tray_context("build macOS tray play-mode menu")?;
+    play_mode_menu
+        .append(&loop_one)
+        .tray_context("build macOS tray play-mode menu")?;
+    play_mode_menu
+        .append(&shuffle)
+        .tray_context("build macOS tray play-mode menu")?;
+    menu.append(&play_mode_menu)
+        .tray_context("build macOS tray menu")?;
+    menu.append(&PredefinedMenuItem::separator())
+        .tray_context("build macOS tray menu")?;
+    menu.append(&toggle_window)
+        .tray_context("build macOS tray menu")?;
+    menu.append(&PredefinedMenuItem::separator())
+        .tray_context("build macOS tray menu")?;
+    menu.append(&quit).tray_context("build macOS tray menu")?;
 
     Ok((
         menu,
@@ -277,13 +294,13 @@ fn build_menu(presentation: &TrayPresentation) -> anyhow::Result<(Menu, MenuItem
     ))
 }
 
-fn load_icon() -> anyhow::Result<tray_icon::Icon> {
-    static ICON_DATA: &[u8] = include_bytes!("../../../assets/icons/icon_256.png");
-    let image = image::load_from_memory(ICON_DATA).context("Failed to load status item icon")?;
+fn load_icon() -> Result<tray_icon::Icon, TrayError> {
+    static ICON_DATA: &[u8] = include_bytes!("../../../../assets/icons/icon_256.png");
+    let image = image::load_from_memory(ICON_DATA).tray_context("decode macOS status item icon")?;
     let rgba = image
         .resize(36, 36, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     let (width, height) = rgba.dimensions();
     tray_icon::Icon::from_rgba(rgba.into_raw(), width, height)
-        .map_err(|error| anyhow!("Failed to create status item icon: {error}"))
+        .tray_context("create macOS status item icon")
 }

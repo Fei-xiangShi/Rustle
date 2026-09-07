@@ -4,7 +4,7 @@
 
 use iced::keyboard::{Key, Modifiers};
 
-use crate::domain::keybindings::{Action, KeyBinding, KeyBindings, KeyCode, ModifierSet};
+use rustle_domain::keybindings::{Action, KeyBinding, KeyBindings, KeyCode, ModifierSet};
 
 /// Modifier key symbols for display
 pub struct ModifierSymbols {

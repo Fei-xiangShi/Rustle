@@ -41,12 +41,12 @@ const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
         rationale: "song resolution must preserve stable codes and source chains",
     },
     SourceContractRule {
-        path: "src/platform/global_hotkeys.rs",
+        path: "crates/rustle-platform/src/global_hotkeys.rs",
         forbidden: "Result<(), String>",
         rationale: "native registration and rollback failures require typed semantics",
     },
     SourceContractRule {
-        path: "src/platform/global_hotkeys.rs",
+        path: "crates/rustle-platform/src/global_hotkeys.rs",
         forbidden: "GlobalHotkeyError::new",
         rationale: "platform errors must select an explicit typed kind",
     },
@@ -94,6 +94,11 @@ const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
         path: "crates/rustle-audio/src/streaming.rs",
         forbidden: "Fatal(String)",
         rationale: "range failures must be classified at production",
+    },
+    SourceContractRule {
+        path: "crates/rustle-platform/src/protocol/ipc.rs",
+        forbidden: "Result<(), String>",
+        rationale: "single-instance forwarding failures require typed semantics",
     },
 ];
 
@@ -308,9 +313,12 @@ fn observability_source_contract_violations(path: &str, contents: &str) -> Vec<S
 }
 
 fn verify_panic_boundary_contracts(root: &Path) -> XtaskResult<()> {
-    let source_root = root.join("src");
     let mut source_paths = Vec::new();
-    collect_rust_source_paths(&source_root, &mut source_paths)?;
+    for source_root in [root.join("src"), root.join("crates")] {
+        if source_root.is_dir() {
+            collect_rust_source_paths(&source_root, &mut source_paths)?;
+        }
+    }
     source_paths.sort();
 
     let mut violations = Vec::new();
@@ -467,6 +475,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         "rustle-application",
         "rustle-audio",
         "rustle-media",
+        "rustle-platform",
         "rustle-storage",
         "rustle-ncm",
     ] {
@@ -519,6 +528,27 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 "tracing",
                 "walkdir",
                 "xxhash-rust",
+            ],
+            "rustle-platform" => &[
+                "cosmic-text",
+                "discord-rich-presence",
+                "global-hotkey",
+                "iced",
+                "image",
+                "interprocess",
+                "ksni",
+                "mpris-server",
+                "objc2",
+                "objc2-foundation",
+                "rustle-application",
+                "rustle-domain",
+                "souvlaki",
+                "thiserror",
+                "tokio",
+                "tracing",
+                "tray-icon",
+                "windows-sys",
+                "x11rb",
             ],
             "rustle-storage" => &[
                 "anyhow",
@@ -573,7 +603,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         }
         if matches!(
             package_name,
-            "rustle-audio" | "rustle-media" | "rustle-storage"
+            "rustle-audio" | "rustle-media" | "rustle-platform" | "rustle-storage"
         ) {
             for required_dependency in ["rustle-domain", "rustle-application"] {
                 if !metadata_array(package, "dependencies")?
@@ -583,7 +613,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                     })
                 {
                     violations.push(format!(
-                        "package `rustle-storage` must depend on `{required_dependency}`"
+                        "package `{package_name}` must depend on `{required_dependency}`"
                     ));
                 }
             }
@@ -617,6 +647,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         "rustle-application",
         "rustle-audio",
         "rustle-media",
+        "rustle-platform",
         "rustle-storage",
         "rustle-ncm",
     ] {
@@ -647,17 +678,6 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
         forbidden.push((
             "crate::cache",
             "audio must consume the application cache port",
-        ));
-    }
-    if path.starts_with("src/platform/tray/") || path == "src/platform/tray.rs" {
-        forbidden.push(("crate::app::", "native tray code must emit pure commands"));
-        forbidden.push((
-            "crate::i18n",
-            "native tray code must consume localized presentation",
-        ));
-        forbidden.push((
-            "crate::features",
-            "native tray code must use domain/application contracts",
         ));
     }
     if path.starts_with("src/domain/")
@@ -911,6 +931,75 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "audio must not depend on sibling adapters",
             ),
             ("rustle_ui", "audio must not depend on sibling adapters"),
+        ]);
+    }
+    if path.starts_with("crates/rustle-platform/src/") {
+        forbidden.extend([
+            (
+                "anyhow",
+                "platform public and internal boundaries must use typed errors",
+            ),
+            (
+                "Result<(), String>",
+                "platform boundaries must not return bare strings",
+            ),
+            ("crate::app", "platform adapters must emit pure commands"),
+            (
+                "crate::i18n",
+                "platform adapters must consume localized presentation",
+            ),
+            (
+                "crate::features",
+                "platform adapters must use domain/application contracts directly",
+            ),
+            (
+                "crate::domain",
+                "platform must use domain contracts directly",
+            ),
+            (
+                "crate::application",
+                "platform must use application contracts directly",
+            ),
+            (
+                "crate::error",
+                "platform must use application errors directly",
+            ),
+            (
+                "crate::platform",
+                "platform must not depend on a root facade",
+            ),
+            ("crate::audio", "platform must not depend on audio adapters"),
+            ("crate::api", "platform must not depend on NCM adapters"),
+            (
+                "crate::cache",
+                "platform must not depend on storage facades",
+            ),
+            (
+                "crate::database",
+                "platform must not depend on storage facades",
+            ),
+            (
+                "rustle_audio",
+                "platform must not depend on sibling adapters",
+            ),
+            (
+                "rustle_media",
+                "platform must not depend on sibling adapters",
+            ),
+            ("rustle_ncm", "platform must not depend on sibling adapters"),
+            (
+                "rustle_storage",
+                "platform must not depend on sibling adapters",
+            ),
+            (
+                "rustle_observability",
+                "platform panic containment must be injected",
+            ),
+            ("rustle_ui", "platform must not depend on UI adapters"),
+            (
+                "tracing_subscriber",
+                "platform must not initialize observability",
+            ),
         ]);
     }
 
@@ -1494,7 +1583,7 @@ mod tests {
         );
         assert!(
             architecture_source_contract_violations(
-                "src/platform/tray/windows.rs",
+                "crates/rustle-platform/src/tray/windows.rs",
                 "crate::i18n::t(); crate::app::Message::Noop;",
             )
             .len()
@@ -1554,12 +1643,20 @@ mod tests {
             .len(),
             2
         );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-platform/src/protocol/ipc.rs",
+                "fn send() -> Result<(), String> { anyhow::bail!(\"failed\") }",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "audio-id", "media-id", "storage-id", "ncm-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "audio-id", "media-id", "platform-id", "storage-id", "ncm-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1612,6 +1709,31 @@ mod tests {
                     ]
                 },
                 {
+                    "name": "rustle-platform",
+                    "id": "platform-id",
+                    "dependencies": [
+                        {"name": "cosmic-text"},
+                        {"name": "discord-rich-presence"},
+                        {"name": "global-hotkey"},
+                        {"name": "iced"},
+                        {"name": "image"},
+                        {"name": "interprocess"},
+                        {"name": "ksni"},
+                        {"name": "mpris-server"},
+                        {"name": "objc2"},
+                        {"name": "objc2-foundation"},
+                        {"name": "rustle-application"},
+                        {"name": "rustle-domain"},
+                        {"name": "souvlaki"},
+                        {"name": "thiserror"},
+                        {"name": "tokio"},
+                        {"name": "tracing"},
+                        {"name": "tray-icon"},
+                        {"name": "windows-sys"},
+                        {"name": "x11rb"}
+                    ]
+                },
+                {
                     "name": "rustle-storage",
                     "id": "storage-id",
                     "dependencies": [
@@ -1657,6 +1779,7 @@ mod tests {
                         {"name": "rustle-application"},
                         {"name": "rustle-audio"},
                         {"name": "rustle-media"},
+                        {"name": "rustle-platform"},
                         {"name": "rustle-storage"},
                         {"name": "rustle-ncm"}
                     ]

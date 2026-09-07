@@ -1,55 +1,56 @@
-//! Platform abstraction layer
-//!
-//! This module provides unified interfaces for platform-specific functionality,
-//! organized by feature with platform implementations inside each feature module.
-//!
-//! # Structure
-//! - `tray/` - System tray functionality
-//! - `media_controls/` - Media control integration (MPRIS on Linux)
-//! - `window/` - Window behavior differences
-//! - `theme.rs` - Platform-specific theme constants
-//! - `keybindings.rs` - Keybinding display format
+//! Compatibility facade and runtime-hook composition for `rustle-platform`.
 
-#[cfg(target_os = "linux")]
-pub const APP_BINARY_NAME: &str = "rustle";
-#[cfg(target_os = "linux")]
-pub const APP_DISPLAY_NAME: &str = "Rustle";
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub const APP_ID: &str = "life.fxs.rustle";
+pub use rustle_platform::{discord, global_hotkeys, keybindings, protocol, theme, tray, window};
 
-pub mod discord;
-pub mod global_hotkeys;
-pub mod keybindings;
-pub mod media_controls;
-pub mod protocol;
-pub mod theme;
-pub mod tray;
-pub mod window;
+pub mod media_controls {
+    pub use rustle_platform::media_controls::{
+        MediaCommand, MediaHandle, MediaMetadata, MediaPlaybackStatus, MediaState, is_available,
+    };
 
-pub fn init() {
-    theme::configure_iced_font_system();
-    window::initialize_process();
+    /// Start native media controls through the process-wide guarded worker
+    /// boundary owned by the desktop composition root.
+    pub fn start_media_controls(
+        window_handle: Option<usize>,
+    ) -> (
+        MediaHandle,
+        tokio::sync::mpsc::UnboundedReceiver<MediaCommand>,
+    ) {
+        rustle_platform::media_controls::start_media_controls_with(
+            window_handle,
+            super::guarded_platform_worker,
+        )
+    }
 }
 
-/// Open the parent directory of the given file path in the system file manager.
-pub fn open_in_file_manager(path: &std::path::Path) {
-    #[cfg(target_os = "linux")]
-    {
-        let dir = path.parent().unwrap_or(path);
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
-    }
+/// Initialize process-wide platform policy and inject native panic containment.
+pub fn init() {
     #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer")
-            .arg("/select,")
-            .arg(path)
-            .spawn();
+    rustle_platform::runtime::install_ffi_guard(guarded_platform_ffi);
+
+    rustle_platform::init();
+}
+
+/// Open a path in the system file manager while keeping legacy callers
+/// fire-and-forget at the desktop compatibility edge.
+pub fn open_in_file_manager(path: &std::path::Path) {
+    if let Err(error) = rustle_platform::open_in_file_manager(path) {
+        tracing::warn!(%error, "Failed to open path in the system file manager");
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg("-R")
-            .arg(path)
-            .spawn();
-    }
+}
+
+fn guarded_platform_worker(
+    thread_name: &'static str,
+    operation: &'static str,
+    worker: rustle_platform::runtime::WorkerTask,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    crate::runtime::spawn_guarded(thread_name, operation, worker)
+}
+
+#[cfg(target_os = "windows")]
+fn guarded_platform_ffi(
+    boundary: &'static str,
+    callback: rustle_platform::runtime::FfiCallback,
+    fallback: rustle_platform::runtime::FfiCallback,
+) -> isize {
+    crate::runtime::catch_ffi_unwind(boundary, callback, fallback)
 }

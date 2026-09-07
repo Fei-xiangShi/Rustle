@@ -6,6 +6,7 @@ members = [
     "crates/rustle-domain",
     "crates/rustle-media",
     "crates/rustle-ncm",
+    "crates/rustle-platform",
     "crates/rustle-storage",
     "xtask",
 ]
@@ -38,6 +39,7 @@ rustle-audio = { path = "crates/rustle-audio" }
 rustle-domain = { path = "crates/rustle-domain" }
 rustle-media = { path = "crates/rustle-media" }
 rustle-ncm = { path = "crates/rustle-ncm" }
+rustle-platform = { path = "crates/rustle-platform" }
 rustle-storage = { path = "crates/rustle-storage" }
 
 [workspace.lints.rust]
@@ -98,6 +100,7 @@ rustle-audio.workspace = true
 rustle-domain.workspace = true
 rustle-media.workspace = true
 rustle-ncm.workspace = true
+rustle-platform.workspace = true
 rustle-storage.workspace = true
 
 # Local playlist import
@@ -106,53 +109,27 @@ encoding_rs = "0.8.35"
 notify = { version = "8.2", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-interprocess = { version = "2", features = ["tokio"] }
 rfd = "0.17.2"
 async-stream = "0.3.6"
 rand = "0.10.2"
 cosmic-text = "0.19.0"
 parking_lot = "0.12"
-global-hotkey = "0.8"
 
 # SDF text rendering
 sdf_glyph_renderer = "1.1.0"
 ab_glyph = "0.2"
 quick-xml = "0.42.0"
 futures-util = "0.3.34"
-discord-rich-presence = "1.1.0"
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "gzip", "stream"] }
 
 regex.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-mpris-server = "0.10.0"
-ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
-x11rb = "0.14.0"
-
 [patch.crates-io]
 iced = { git = "https://github.com/Fei-xiangShi/iced.git", rev = "573ebbf00ed3f544e784488cd3e71ab0ea10ec1b" }
 iced_runtime = { git = "https://github.com/Fei-xiangShi/iced.git", rev = "573ebbf00ed3f544e784488cd3e71ab0ea10ec1b" }
 smithay-client-toolkit = { git = "https://github.com/Fei-xiangShi/client-toolkit.git", rev = "f69a98395ead55777832525623ff82d40c16a25b" }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["objc2-core-services"] }
-tray-icon = "0.24.2"
-
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-souvlaki = "0.8.3"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"
