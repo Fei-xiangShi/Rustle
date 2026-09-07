@@ -1,0 +1,41 @@
+name: Setup pinned Rust
+description: Install Rustle's pinned toolchain and native Linux build dependencies.
+
+outputs:
+  toolchain:
+    description: Rust channel resolved from rust-toolchain.toml.
+    value: ${{ steps.toolchain.outputs.channel }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          libasound2-dev \
+          libudev-dev \
+          libwayland-dev \
+          libx11-xcb-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev \
+          pkg-config
+
+    - name: Resolve pinned toolchain
+      id: toolchain
+      shell: pwsh
+      run: |
+        $manifest = Get-Content rust-toolchain.toml -Raw
+        $match = [regex]::Match($manifest, '(?m)^channel\s*=\s*"([^"]+)"\s*$')
+        if (-not $match.Success) {
+          throw 'rust-toolchain.toml does not declare a quoted channel'
+        }
+        "channel=$($match.Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
+    - name: Install pinned Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ steps.toolchain.outputs.channel }}
+        components: rustfmt, clippy

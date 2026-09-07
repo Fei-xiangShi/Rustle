@@ -1,0 +1,165 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust-quality:
+    name: rust-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Rust
+        id: rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}
+          cache-on-failure: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Run authoritative quality gate
+        shell: bash
+        run: |
+          mkdir -p target/ci-logs
+          set -o pipefail
+          cargo xtask check 2>&1 | tee target/ci-logs/rust-quality.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-quality-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rust-windows:
+    name: rust-windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Rust
+        id: rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}
+          cache-on-failure: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Run Windows native gate
+        shell: bash
+        run: |
+          mkdir -p target/ci-logs
+          set -o pipefail
+          cargo xtask check-native 2>&1 | tee target/ci-logs/rust-windows.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-windows-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rust-linux:
+    name: rust-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Rust
+        id: rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}
+          cache-on-failure: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Run Linux native gate
+        shell: bash
+        run: |
+          mkdir -p target/ci-logs
+          set -o pipefail
+          cargo xtask check-native 2>&1 | tee target/ci-logs/rust-linux.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-linux-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rust-macos:
+    name: rust-macos
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Rust
+        id: rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-ci-${{ runner.os }}-${{ steps.rust.outputs.toolchain }}-${{ github.job }}
+          cache-on-failure: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Run macOS native gate
+        shell: bash
+        run: |
+          mkdir -p target/ci-logs
+          set -o pipefail
+          cargo xtask check-native 2>&1 | tee target/ci-logs/rust-macos.log
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-macos-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-logs
+          if-no-files-found: ignore
+          retention-days: 7

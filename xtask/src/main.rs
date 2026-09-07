@@ -26,6 +26,10 @@ fn run() -> XtaskResult<()> {
             reject_extra_args(args)?;
             check(&root)
         }
+        Some("check-native") => {
+            reject_extra_args(args)?;
+            check_native(&root)
+        }
         Some("metadata") => {
             reject_extra_args(args)?;
             print_metadata(&root)
@@ -49,6 +53,20 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     run_cargo(root, &["fmt", "--all", "--check"])?;
+    check_workspace(root)?;
+    clippy_workspace(root)?;
+    test_workspace(root)?;
+    doc_workspace(root)
+}
+
+fn check_native(root: &Path) -> XtaskResult<()> {
+    verify_toolchain(root)?;
+    check_workspace(root)?;
+    clippy_workspace(root)?;
+    test_workspace(root)
+}
+
+fn check_workspace(root: &Path) -> XtaskResult<()> {
     run_cargo(
         root,
         &[
@@ -58,7 +76,10 @@ fn check(root: &Path) -> XtaskResult<()> {
             "--all-targets",
             "--all-features",
         ],
-    )?;
+    )
+}
+
+fn clippy_workspace(root: &Path) -> XtaskResult<()> {
     run_cargo(
         root,
         &[
@@ -71,7 +92,10 @@ fn check(root: &Path) -> XtaskResult<()> {
             "-D",
             "warnings",
         ],
-    )?;
+    )
+}
+
+fn test_workspace(root: &Path) -> XtaskResult<()> {
     run_cargo(
         root,
         &[
@@ -82,6 +106,29 @@ fn check(root: &Path) -> XtaskResult<()> {
             "--all-features",
         ],
     )
+}
+
+fn doc_workspace(root: &Path) -> XtaskResult<()> {
+    let args = [
+        "doc",
+        "--locked",
+        "--workspace",
+        "--all-features",
+        "--no-deps",
+    ];
+    eprintln!("+ RUSTDOCFLAGS=-D warnings cargo {}", args.join(" "));
+    let status = cargo(root)
+        .env("RUSTDOCFLAGS", "-D warnings")
+        .args(args)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "`RUSTDOCFLAGS=-D warnings cargo {}` failed with {status}",
+            args.join(" ")
+        )))
+    }
 }
 
 fn print_metadata(root: &Path) -> XtaskResult<()> {
@@ -319,6 +366,7 @@ fn print_usage() {
 fn usage() -> &'static str {
     "Rustle engineering tasks:\n\
      \n  cargo xtask check\
+     \n  cargo xtask check-native\
      \n  cargo xtask metadata\
      \n  cargo xtask release-preflight [--tag vX.Y.Z]"
 }
