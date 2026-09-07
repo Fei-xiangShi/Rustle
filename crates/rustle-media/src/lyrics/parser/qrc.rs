@@ -1,9 +1,10 @@
-//! NetEase Cloud Music YRC format parser
+//! QQ Music QRC format parser
 //!
-//! YRC is a word-level lyrics format used by NetEase Cloud Music.
-//! Format: [start_time,duration](word_start,word_duration,0)word(word_start,word_duration,0)word...
+//! QRC 逐字歌词格式 (QQ音乐)
+//! 格式: [start_time,duration]word(word_start,word_duration)word(word_start,word_duration)...
+//! 与 YRC 不同，QRC 的单词在时间戳之前
 
-use crate::domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
+use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
 
 /// Parse line timestamp: [start_time,duration]
 fn parse_line_time(src: &str) -> Option<(usize, u64, u64)> {
@@ -25,7 +26,7 @@ fn parse_line_time(src: &str) -> Option<(usize, u64, u64)> {
     Some((end_bracket + 1, start_time, duration))
 }
 
-/// Parse word timestamp: (start_time,duration,0)
+/// Parse word timestamp: (start_time,duration)
 fn parse_word_time(src: &str) -> Option<(usize, u64, u64)> {
     if !src.starts_with('(') {
         return None;
@@ -35,49 +36,56 @@ fn parse_word_time(src: &str) -> Option<(usize, u64, u64)> {
     let time_str = &src[1..end_paren];
     let parts: Vec<&str> = time_str.split(',').collect();
 
-    if parts.len() != 3 {
+    if parts.len() != 2 {
         return None;
     }
 
     let start_time: u64 = parts[0].parse().ok()?;
     let duration: u64 = parts[1].parse().ok()?;
-    // parts[2] is always 0 in YRC format
 
     Some((end_paren + 1, start_time, duration))
 }
 
-/// Parse words from YRC line content
+/// Parse a single word with its following timestamp
+fn parse_word(src: &str) -> Option<(usize, LyricWordOwned)> {
+    // Find the timestamp position
+    let paren_pos = src.find('(')?;
+
+    // Word text is before the timestamp
+    let word_text = &src[..paren_pos];
+
+    // Parse the timestamp
+    let (time_consumed, start_time, duration) = parse_word_time(&src[paren_pos..])?;
+
+    Some((
+        paren_pos + time_consumed,
+        LyricWordOwned {
+            start_time,
+            end_time: start_time + duration,
+            word: word_text.to_string(),
+            roman_word: String::new(),
+        },
+    ))
+}
+
+/// Parse words from QRC line content
 fn parse_words(src: &str) -> Vec<LyricWordOwned> {
     let mut words = Vec::new();
     let mut pos = 0;
 
     while pos < src.len() {
-        // Try to parse word timestamp
-        if let Some((consumed, start_time, duration)) = parse_word_time(&src[pos..]) {
+        if let Some((consumed, word)) = parse_word(&src[pos..]) {
+            words.push(word);
             pos += consumed;
-
-            // Find the word text (until next '(' or end of string)
-            let word_end = src[pos..].find('(').map(|i| pos + i).unwrap_or(src.len());
-            let word_text = &src[pos..word_end];
-
-            words.push(LyricWordOwned {
-                start_time,
-                end_time: start_time + duration,
-                word: word_text.to_string(),
-                roman_word: String::new(),
-            });
-
-            pos = word_end;
         } else {
-            // Skip unknown character
-            pos += 1;
+            break;
         }
     }
 
     words
 }
 
-/// Parse a single YRC line
+/// Parse a single QRC line
 fn parse_line(line: &str) -> Option<LyricLineOwned> {
     let line = line.trim();
     if line.is_empty() {
@@ -100,8 +108,8 @@ fn parse_line(line: &str) -> Option<LyricLineOwned> {
     })
 }
 
-/// Parse YRC content into lyric lines
-pub fn parse_yrc(src: &str) -> Vec<LyricLineOwned> {
+/// Parse QRC content into lyric lines
+pub fn parse_qrc(src: &str) -> Vec<LyricLineOwned> {
     let lines = src.lines();
     let mut result = Vec::with_capacity(lines.size_hint().1.unwrap_or(128).min(1024));
 
@@ -116,9 +124,9 @@ pub fn parse_yrc(src: &str) -> Vec<LyricLineOwned> {
     result
 }
 
-/// Convert lyrics to YRC format string
+/// Convert lyrics to QRC format string
 #[cfg(test)]
-pub fn stringify_yrc(lines: &[LyricLineOwned]) -> String {
+pub fn stringify_qrc(lines: &[LyricLineOwned]) -> String {
     use std::fmt::Write;
 
     let capacity: usize = lines
@@ -136,16 +144,8 @@ pub fn stringify_yrc(lines: &[LyricLineOwned]) -> String {
             for word in line.words.iter() {
                 let word_start = word.start_time;
                 let word_duration = word.end_time - word.start_time;
-                write!(result, "({word_start},{word_duration},0)").unwrap();
-
-                // Replace parentheses with Chinese equivalents (YRC requirement)
-                for c in word.word.chars() {
-                    match c {
-                        '(' => result.push('（'),
-                        ')' => result.push('）'),
-                        _ => result.push(c),
-                    }
-                }
+                result.push_str(&word.word);
+                write!(result, "({word_start},{word_duration})").unwrap();
             }
             result.push('\n');
         }
@@ -159,34 +159,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_line_time() {
-        assert_eq!(parse_line_time("[0,1000]"), Some((8, 0, 1000)));
-        assert_eq!(parse_line_time("[12345,6789]"), Some((12, 12345, 6789)));
+    fn test_parse_word() {
+        let (consumed, word) = parse_word("Hello(0,500)").unwrap();
+        assert_eq!(consumed, 12);
+        assert_eq!(word.word, "Hello");
+        assert_eq!(word.start_time, 0);
+        assert_eq!(word.end_time, 500);
     }
 
     #[test]
-    fn test_parse_word_time() {
-        assert_eq!(parse_word_time("(0,500,0)"), Some((9, 0, 500)));
-        assert_eq!(parse_word_time("(1234,567,0)"), Some((12, 1234, 567)));
-    }
-
-    #[test]
-    fn test_parse_yrc() {
-        let content = "[0,2000](0,500,0)Hello(500,500,0) (1000,500,0)World(1500,500,0)!";
-        let lines = parse_yrc(content);
+    fn test_parse_qrc() {
+        let content = "[0,2000]Hello(0,500) (500,100)World(600,500)!(1100,400)";
+        let lines = parse_qrc(content);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].words.len(), 4);
         assert_eq!(lines[0].words[0].word, "Hello");
-        assert_eq!(lines[0].words[0].start_time, 0);
-        assert_eq!(lines[0].words[0].end_time, 500);
+        assert_eq!(lines[0].words[1].word, " ");
     }
 
     #[test]
-    fn test_stringify_yrc() {
-        let content = "[0,1000](0,500,0)Hello(500,500,0)World";
-        let lines = parse_yrc(content);
-        let output = stringify_yrc(&lines);
+    fn test_stringify_qrc() {
+        let content = "[0,1000]Hello(0,500)World(500,500)";
+        let lines = parse_qrc(content);
+        let output = stringify_qrc(&lines);
         assert!(output.contains("[0,1000]"));
-        assert!(output.contains("(0,500,0)Hello"));
+        assert!(output.contains("Hello(0,500)"));
     }
 }

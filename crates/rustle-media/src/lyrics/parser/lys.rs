@@ -8,7 +8,7 @@
 //! - 6, 7: Background line
 //! - 8: Background + Duet line
 
-use crate::domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
+use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
 
 /// Parse property marker: [digit]
 fn parse_property(src: &str) -> Option<(usize, bool, bool)> {

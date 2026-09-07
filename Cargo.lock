@@ -5316,6 +5316,7 @@ dependencies = [
  "rodio",
  "rustle-application",
  "rustle-domain",
+ "rustle-media",
  "rustle-ncm",
  "rustle-storage",
  "sdf_glyph_renderer",
@@ -5351,6 +5352,26 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustle-media"
+version = "0.5.2"
+dependencies = [
+ "encoding_rs",
+ "image",
+ "lofty",
+ "notify",
+ "quick-xml 0.42.0",
+ "rayon",
+ "rodio",
+ "rustle-application",
+ "rustle-domain",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "walkdir",
+ "xxhash-rust",
 ]
 
 [[package]]

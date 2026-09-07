@@ -465,6 +465,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
     for package_name in [
         "rustle-domain",
         "rustle-application",
+        "rustle-media",
         "rustle-storage",
         "rustle-ncm",
     ] {
@@ -490,6 +491,22 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
         let allowed: &[&str] = match package_name {
             "rustle-domain" => &["regex", "serde", "serde_json"],
             "rustle-application" => &["rustle-domain"],
+            "rustle-media" => &[
+                "encoding_rs",
+                "image",
+                "lofty",
+                "notify",
+                "quick-xml",
+                "rayon",
+                "rodio",
+                "rustle-application",
+                "rustle-domain",
+                "thiserror",
+                "tokio",
+                "tracing",
+                "walkdir",
+                "xxhash-rust",
+            ],
             "rustle-storage" => &[
                 "anyhow",
                 "directories",
@@ -541,7 +558,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
             violations
                 .push("package `rustle-application` must depend on `rustle-domain`".to_string());
         }
-        if package_name == "rustle-storage" {
+        if matches!(package_name, "rustle-media" | "rustle-storage") {
             for required_dependency in ["rustle-domain", "rustle-application"] {
                 if !metadata_array(package, "dependencies")?
                     .iter()
@@ -582,6 +599,7 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
     for dependency in [
         "rustle-domain",
         "rustle-application",
+        "rustle-media",
         "rustle-storage",
         "rustle-ncm",
     ] {
@@ -791,6 +809,46 @@ fn architecture_source_contract_violations(path: &str, contents: &str) -> Vec<St
                 "NCM must not depend on sibling adapters",
             ),
             ("rustle_ui", "NCM must not depend on sibling adapters"),
+        ]);
+    }
+    if path.starts_with("crates/rustle-media/src/") {
+        forbidden.extend([
+            ("iced::", "media must be UI-framework free"),
+            ("sqlx::", "media must not own database adapters"),
+            ("reqwest::", "media must not own network transport"),
+            ("ncm_api_rs", "media must not own NCM protocol types"),
+            ("crate::features", "media must not depend on root features"),
+            (
+                "crate::database",
+                "media must not depend on root storage facades",
+            ),
+            ("crate::api", "media must not depend on the root NCM facade"),
+            ("crate::audio", "media must not depend on audio playback"),
+            (
+                "crate::platform",
+                "media must not depend on platform adapters",
+            ),
+            ("crate::ui", "media must not depend on UI adapters"),
+            (
+                "crate::app::",
+                "media must not depend on the composition root",
+            ),
+            ("crate::domain", "media must use domain contracts directly"),
+            (
+                "rustle_storage",
+                "media must not depend on sibling adapters",
+            ),
+            ("rustle_ncm", "media must not depend on sibling adapters"),
+            ("rustle_audio", "media must not depend on sibling adapters"),
+            (
+                "rustle_platform",
+                "media must not depend on sibling adapters",
+            ),
+            (
+                "rustle_observability",
+                "media must not depend on sibling adapters",
+            ),
+            ("rustle_ui", "media must not depend on sibling adapters"),
         ]);
     }
 
@@ -1418,12 +1476,20 @@ mod tests {
             .len(),
             2
         );
+        assert_eq!(
+            architecture_source_contract_violations(
+                "crates/rustle-media/src/scan.rs",
+                "use crate::database::Database; use rustle_ncm::NcmClient;",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn architecture_graph_requires_physical_members_and_directed_dependencies() {
         let metadata = json!({
-            "workspace_members": ["domain-id", "application-id", "storage-id", "ncm-id", "root-id"],
+            "workspace_members": ["domain-id", "application-id", "media-id", "storage-id", "ncm-id", "root-id"],
             "packages": [
                 {
                     "name": "rustle-domain",
@@ -1438,6 +1504,26 @@ mod tests {
                     "name": "rustle-application",
                     "id": "application-id",
                     "dependencies": [{"name": "rustle-domain"}]
+                },
+                {
+                    "name": "rustle-media",
+                    "id": "media-id",
+                    "dependencies": [
+                        {"name": "encoding_rs"},
+                        {"name": "image"},
+                        {"name": "lofty"},
+                        {"name": "notify"},
+                        {"name": "quick-xml"},
+                        {"name": "rayon"},
+                        {"name": "rodio"},
+                        {"name": "rustle-application"},
+                        {"name": "rustle-domain"},
+                        {"name": "thiserror"},
+                        {"name": "tokio"},
+                        {"name": "tracing"},
+                        {"name": "walkdir"},
+                        {"name": "xxhash-rust"}
+                    ]
                 },
                 {
                     "name": "rustle-storage",
@@ -1483,6 +1569,7 @@ mod tests {
                     "dependencies": [
                         {"name": "rustle-domain"},
                         {"name": "rustle-application"},
+                        {"name": "rustle-media"},
                         {"name": "rustle-storage"},
                         {"name": "rustle-ncm"}
                     ]

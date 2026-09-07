@@ -1,0 +1,29 @@
+[package]
+name = "rustle-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+encoding_rs = "0.8.35"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+lofty = "0.25.1"
+notify = { version = "8.2", features = ["serde"] }
+quick-xml = "0.42.0"
+rayon = "1.12.0"
+rodio = { version = "0.22.2", features = ["symphonia-all"] }
+rustle-application.workspace = true
+rustle-domain.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tracing.workspace = true
+walkdir = "2.5.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

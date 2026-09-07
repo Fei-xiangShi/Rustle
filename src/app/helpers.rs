@@ -176,7 +176,7 @@ pub async fn validate_songs(db: Arc<Database>) -> u32 {
 /// Initialize cover cache
 pub async fn init_cover_cache() -> anyhow::Result<CoverCache> {
     let cache_dir = default_cache_dir();
-    CoverCache::new(cache_dir)
+    Ok(CoverCache::new(cache_dir)?)
 }
 
 /// Initialize font system for lyrics text shaping

@@ -512,13 +512,9 @@ impl App {
                     },
                 ) {
                     Ok(()) => Message::SongEditsSaved(song_id),
-                    Err(e) => Message::SongEditsFailed {
+                    Err(error) => Message::SongEditsFailed {
                         song_id,
-                        error: crate::error::AppError::with_message_source(
-                            crate::error::ErrorCode::MediaMetadataFailed,
-                            "Rustle could not update the song metadata",
-                            e,
-                        ),
+                        error: crate::error::AppError::from(error),
                     },
                 }
             },

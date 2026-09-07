@@ -2,7 +2,7 @@
 
 use std::io::BufRead;
 
-use crate::domain::lyrics::{LyricLineOwned, LyricWordOwned};
+use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned};
 
 /// TTML lyrics with metadata
 #[derive(Debug, Default, Clone)]

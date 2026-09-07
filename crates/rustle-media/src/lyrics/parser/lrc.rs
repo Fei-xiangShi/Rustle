@@ -2,7 +2,7 @@
 //!
 //! Supports the common [mm:ss.xx]text format with line-level synchronization.
 
-use crate::domain::lyrics::{LyricLineOwned, LyricWordOwned, MAX_LRC_TIMESTAMP, process_lyrics};
+use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned, MAX_LRC_TIMESTAMP, process_lyrics};
 
 fn parse_time_text(time_str: &str) -> Option<u64> {
     fn parse_component(part: &str) -> Option<f64> {
