@@ -708,6 +708,7 @@ impl LineAnimationManager {
     /// - enable_scale: Whether to apply scale effect
     /// - inactive_scale: Scale factor for inactive lines (default: 0.97)
     /// - bg_line_scale: Scale factor for background lines (default: 0.75)
+    ///
     /// 完整布局计算
     ///
     /// 移植自 `lyric-player/base.ts` 的 `calcLayout`
@@ -716,7 +717,10 @@ impl LineAnimationManager {
     /// - is_non_dynamic: True if all lines have only 1 word (affects opacity)
     /// - viewport_width: Retained for renderer API compatibility; responsive
     ///   visual scaling is supplied by the application at the draw boundary.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "layout function preserves the upstream lyric-engine parameter contract; remove when a versioned LyricsLayoutInput replaces it"
+    )]
     pub fn calc_layout_full(
         &mut self,
         line_heights: &[f32],
@@ -902,9 +906,7 @@ impl LineAnimationManager {
                     // default: 为了避免浏览器优化，使用极小但不为零的值
                     0.0001
                 } else if anim.is_bg {
-                    if is_active {
-                        0.4
-                    } else if !is_playing {
+                    if is_active || !is_playing {
                         0.4
                     } else {
                         0.0001
@@ -919,9 +921,7 @@ impl LineAnimationManager {
             } else {
                 // No hidePassedLines
                 if anim.is_bg {
-                    if is_active {
-                        0.4
-                    } else if !is_playing {
+                    if is_active || !is_playing {
                         0.4
                     } else {
                         0.0001

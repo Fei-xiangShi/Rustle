@@ -594,7 +594,10 @@ pub fn spawn_audio_thread(
 /// The control actor waits on ordered lifecycle commands, immutable streaming
 /// preparation results, or a coalesced maintenance deadline. Periodic work is
 /// never represented as a critical command.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "audio actor entry owns the complete runtime channel set; remove when AudioThreadContext owns those channels"
+)]
 async fn audio_thread_main(
     mut player: AudioPlayer,
     mut command_rx: AudioCommandReceiver,
@@ -1399,7 +1402,10 @@ async fn audio_thread_main(
     tracing::info!("Audio thread exiting (command channel closed)");
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "maintenance operates on actor-owned clocks and mailboxes; remove when ControlMaintenanceContext is introduced"
+)]
 fn run_control_maintenance(
     player: &mut AudioPlayer,
     buffer_mailbox: &BufferDataMailbox,
@@ -1815,7 +1821,10 @@ fn handle_shutdown(
 
 // ============ Command Handlers ============
 
-#[allow(clippy::too_many_arguments)] // Command handler mirrors the protocol payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handler mirrors the AudioCommand::Play protocol payload; remove when that variant carries a named request"
+)]
 fn handle_play(
     player: &mut AudioPlayer,
     event_tx: &AudioEventSender,
@@ -1851,7 +1860,10 @@ fn handle_play(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Command handler mirrors the protocol payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handler mirrors the AudioCommand::LoadPaused payload; remove when that variant carries a named request"
+)]
 fn handle_load_paused(
     player: &mut AudioPlayer,
     event_tx: &AudioEventSender,
@@ -1887,7 +1899,10 @@ fn handle_load_paused(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Command handler mirrors the protocol payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handler mirrors the AudioCommand::PlayAt payload; remove when that variant carries a named request"
+)]
 fn handle_play_at(
     player: &mut AudioPlayer,
     event_tx: &AudioEventSender,
@@ -1933,7 +1948,10 @@ fn handle_play_at(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream preparation completion joins actor state with an immutable result; remove when a preparation commit context owns the actor references"
+)]
 fn handle_streaming_preparation_result(
     prepared: StreamingPreparationResult,
     player: &mut AudioPlayer,
@@ -2138,7 +2156,10 @@ fn take_pending_preparation_pause(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Command handler mirrors the protocol payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handler mirrors the streaming play protocol payload; remove when the command carries a named streaming request"
+)]
 fn handle_play_streaming(
     player: &mut AudioPlayer,
     buffer_mailbox: &BufferDataMailbox,
@@ -2212,7 +2233,10 @@ fn handle_play_streaming(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Command handler mirrors the protocol payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handler mirrors the paused-stream protocol payload; remove when the command carries a named streaming request"
+)]
 fn handle_load_paused_streaming(
     player: &mut AudioPlayer,
     buffer_mailbox: &BufferDataMailbox,
@@ -2331,7 +2355,10 @@ fn handle_seek(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "seek submission captures one immutable worker request plus routing handles; remove when StreamingSeekRequest owns the remaining routing data"
+)]
 fn submit_streaming_seek(
     worker: &StreamingSeekWorker,
     player: &mut AudioPlayer,
@@ -2366,7 +2393,10 @@ fn submit_streaming_seek(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "seek completion atomically validates actor generation and installs the result; remove when a seek commit context owns the actor references"
+)]
 fn handle_streaming_seek_result(
     result: StreamingSeekResult,
     player: &mut AudioPlayer,
@@ -2570,7 +2600,10 @@ fn handle_create_preload_sink(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preload sink creation mirrors the audio command contract; remove when the command carries a named preload request"
+)]
 fn handle_create_preload_sink_streaming(
     player: &AudioPlayer,
     event_tx: &AudioEventSender,
@@ -2614,7 +2647,10 @@ fn handle_create_preload_sink_streaming(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Command handler mirrors the protocol payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handler mirrors the preloaded-play command payload; remove when the command carries a named handoff request"
+)]
 fn handle_play_preloaded(
     player: &mut AudioPlayer,
     buffer_mailbox: &BufferDataMailbox,

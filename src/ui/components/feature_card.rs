@@ -13,7 +13,10 @@ const PLAY_BUTTON_START_OFFSET: f32 = 12.0;
 const PLAY_BUTTON_END_OFFSET: f32 = 6.0;
 const HOVER_IMAGE_SCALE: f32 = 1.06;
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generic card leaf keeps caller-owned content and action types independent; remove when FeatureCardView is introduced"
+)]
 pub fn view<'a, Message: Clone + 'a>(
     title: String,
     subtitle: String,

@@ -114,13 +114,13 @@ pub(crate) async fn resolve_audio_source(
     let requested_level = client.current_quality_level();
     let requested_stem = format!("{}_{}", ncm_id, requested_level.api_level());
     let requested_candidate = crate::utils::find_cached_audio(&song_cache_dir, &requested_stem);
-    if let Some(cached_path) = requested_candidate.as_ref() {
-        if crate::cache::is_audio_cache_complete(&cached_path, ncm_id, requested_level, None) {
-            return Ok(ResolvedAudioSource::Cached {
-                quality: cached_quality(requested_level, requested_level, &cached_path),
-                path: cached_path.clone(),
-            });
-        }
+    if let Some(cached_path) = requested_candidate.as_ref()
+        && crate::cache::is_audio_cache_complete(cached_path, ncm_id, requested_level, None)
+    {
+        return Ok(ResolvedAudioSource::Cached {
+            quality: cached_quality(requested_level, requested_level, cached_path),
+            path: cached_path.clone(),
+        });
     }
 
     let url = client
@@ -311,10 +311,10 @@ async fn resolve_cover(client: &NcmClient, song: &DbSong, ncm_id: u64) -> Option
         return Some(path.to_string_lossy().to_string());
     }
 
-    if let Some(source) = song.cover_path.as_deref() {
-        if crate::image::is_remote_url(source) || crate::image::is_valid_local_path(source) {
-            return Some(source.to_string());
-        }
+    if let Some(source) = song.cover_path.as_deref()
+        && (crate::image::is_remote_url(source) || crate::image::is_valid_local_path(source))
+    {
+        return Some(source.to_string());
     }
 
     match client.track_detail(&[ncm_id]).await {

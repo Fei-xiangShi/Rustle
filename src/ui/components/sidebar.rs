@@ -126,90 +126,51 @@ impl LibraryItem {
     }
 }
 
+pub struct SidebarView<'a> {
+    pub current_route: &'a Route,
+    pub locale: Locale,
+    pub is_logged_in: bool,
+    pub importing_playlist: Option<&'a ImportingPlaylist>,
+    pub playlists: &'a [crate::database::DbPlaylist],
+    pub user_playlists: &'a [crate::api::PlaylistSummary],
+    pub image_state: &'a ImageState,
+    pub sidebar_animations: &'a HoverAnimations<SidebarId>,
+    pub sidebar_width: f32,
+    pub my_playlists_expanded: bool,
+    pub collected_playlists_expanded: bool,
+    pub context: ResponsiveContext,
+}
+
 /// Build the profile-specific sidebar presentation.
-pub fn view(
-    current_route: &Route,
-    locale: Locale,
-    is_logged_in: bool,
-    importing_playlist: Option<&ImportingPlaylist>,
-    playlists: &[crate::database::DbPlaylist],
-    user_playlists: &[crate::api::PlaylistSummary],
-    image_state: &ImageState,
-    sidebar_animations: &HoverAnimations<SidebarId>,
-    sidebar_width: f32,
-    my_playlists_expanded: bool,
-    collected_playlists_expanded: bool,
-    context: ResponsiveContext,
-    drawer_open: bool,
-) -> Element<'static, Message> {
-    match sidebar_presentation(context.profile, drawer_open) {
-        SidebarPresentation::Full => full_view(
-            current_route,
-            locale,
-            is_logged_in,
-            importing_playlist,
-            playlists,
-            user_playlists,
-            image_state,
-            sidebar_animations,
-            my_playlists_expanded,
-            collected_playlists_expanded,
-            context,
-            context.tokens.size(sidebar_width.clamp(240.0, 440.0)),
-        ),
-        SidebarPresentation::Rail | SidebarPresentation::Drawer => rail_view(
-            current_route,
-            locale,
-            is_logged_in,
-            playlists,
-            user_playlists,
-            image_state,
-            sidebar_animations,
-            context,
-        ),
+pub fn view(props: SidebarView<'_>, drawer_open: bool) -> Element<'static, Message> {
+    match sidebar_presentation(props.context.profile, drawer_open) {
+        SidebarPresentation::Full => {
+            let rendered_width = props
+                .context
+                .tokens
+                .size(props.sidebar_width.clamp(240.0, 440.0));
+            full_view(&props, rendered_width)
+        }
+        SidebarPresentation::Rail | SidebarPresentation::Drawer => rail_view(&props),
         SidebarPresentation::Hidden => Space::new().width(0).height(Fill).into(),
     }
 }
 
 /// Render the complete playlist/navigation drawer as an overlay surface.
-pub fn drawer_view(
-    current_route: &Route,
-    locale: Locale,
-    is_logged_in: bool,
-    importing_playlist: Option<&ImportingPlaylist>,
-    playlists: &[crate::database::DbPlaylist],
-    user_playlists: &[crate::api::PlaylistSummary],
-    image_state: &ImageState,
-    sidebar_animations: &HoverAnimations<SidebarId>,
-    sidebar_width: f32,
-    my_playlists_expanded: bool,
-    collected_playlists_expanded: bool,
-    context: ResponsiveContext,
-    transition_progress: f32,
-) -> Element<'static, Message> {
-    if !context.profile.uses_navigation_drawer() {
+pub fn drawer_view(props: SidebarView<'_>, transition_progress: f32) -> Element<'static, Message> {
+    if !props.context.profile.uses_navigation_drawer() {
         return Space::new().width(0).height(0).into();
     }
 
     let drawer_width = bounded_width(
-        context.tokens.size(sidebar_width.max(320.0)),
-        context.width(),
-        context.tokens.space(16.0),
+        props.context.tokens.size(props.sidebar_width.max(320.0)),
+        props.context.width(),
+        props.context.tokens.space(16.0),
     )
-    .max(context.tokens.size(240.0).min(context.width()));
+    .max(props.context.tokens.size(240.0).min(props.context.width()));
     let transition_progress = transition_progress.clamp(0.0, 1.0);
     let drawer = full_view(
-        current_route,
-        locale,
-        is_logged_in,
-        importing_playlist,
-        playlists,
-        user_playlists,
-        image_state,
-        sidebar_animations,
-        my_playlists_expanded,
-        collected_playlists_expanded,
-        context,
+        &props,
         // `full_view` receives rendered logical pixels (the same contract as
         // the desktop call above), so do not convert the token-scaled drawer
         // width back to reference units here.
@@ -241,20 +202,18 @@ pub fn drawer_view(
     )
 }
 
-fn full_view(
-    current_route: &Route,
-    locale: Locale,
-    is_logged_in: bool,
-    importing_playlist: Option<&ImportingPlaylist>,
-    playlists: &[crate::database::DbPlaylist],
-    user_playlists: &[crate::api::PlaylistSummary],
-    image_state: &ImageState,
-    sidebar_animations: &HoverAnimations<SidebarId>,
-    my_playlists_expanded: bool,
-    collected_playlists_expanded: bool,
-    context: ResponsiveContext,
-    rendered_width: f32,
-) -> Element<'static, Message> {
+fn full_view(props: &SidebarView<'_>, rendered_width: f32) -> Element<'static, Message> {
+    let current_route = props.current_route;
+    let locale = props.locale;
+    let is_logged_in = props.is_logged_in;
+    let importing_playlist = props.importing_playlist;
+    let playlists = props.playlists;
+    let user_playlists = props.user_playlists;
+    let image_state = props.image_state;
+    let sidebar_animations = props.sidebar_animations;
+    let my_playlists_expanded = props.my_playlists_expanded;
+    let collected_playlists_expanded = props.collected_playlists_expanded;
+    let context = props.context;
     let sidebar_width = rendered_width.max(context.tokens.chrome(ChromeRole::Sidebar));
     let metrics = SidebarMetrics::from_context(&context);
     // Logo section
@@ -376,16 +335,16 @@ fn full_view(
             metrics.cover_radius,
             context.tokens,
         ));
-        library_items.push(sidebar_button_animated_opt_cover(
-            crate::ui::icons::MUSIC,
-            cover_el,
-            name,
+        library_items.push(sidebar_button_animated_opt_cover(SidebarButtonView {
+            fallback_svg: crate::ui::icons::MUSIC,
+            cover_icon: cover_el,
+            label: name,
             is_active,
             hover_progress,
-            SidebarId::Playlist(id),
-            Message::OpenPlaylist(id),
+            sidebar_id: SidebarId::Playlist(id),
+            on_press: Message::OpenPlaylist(id),
             metrics,
-        ));
+        }));
     }
 
     library_items.push(import_playlist_btn);
@@ -429,16 +388,16 @@ fn full_view(
                     metrics.cover_radius,
                     context.tokens,
                 );
-                sidebar_button_animated_opt_cover(
-                    crate::ui::icons::MUSIC,
-                    Some(cover_el),
-                    name,
+                sidebar_button_animated_opt_cover(SidebarButtonView {
+                    fallback_svg: crate::ui::icons::MUSIC,
+                    cover_icon: Some(cover_el),
+                    label: name,
                     is_active,
                     hover_progress,
-                    SidebarId::UserPlaylist(id),
-                    Message::OpenNcmPlaylist(id),
+                    sidebar_id: SidebarId::UserPlaylist(id),
+                    on_press: Message::OpenNcmPlaylist(id),
                     metrics,
-                )
+                })
             };
 
         scrollable_items.push(Space::new().height(context.tokens.space(10.0)).into());
@@ -537,16 +496,15 @@ fn sidebar_divider(metrics: SidebarMetrics) -> Element<'static, Message> {
 /// Render the compact icon rail with the same playlist destinations as the
 /// full sidebar. The rail only maps existing data and messages; responsive
 /// policy remains unaware of playlist or image state.
-fn rail_view(
-    current_route: &Route,
-    locale: Locale,
-    is_logged_in: bool,
-    playlists: &[crate::database::DbPlaylist],
-    user_playlists: &[crate::api::PlaylistSummary],
-    image_state: &ImageState,
-    sidebar_animations: &HoverAnimations<SidebarId>,
-    context: ResponsiveContext,
-) -> Element<'static, Message> {
+fn rail_view(props: &SidebarView<'_>) -> Element<'static, Message> {
+    let current_route = props.current_route;
+    let locale = props.locale;
+    let is_logged_in = props.is_logged_in;
+    let playlists = props.playlists;
+    let user_playlists = props.user_playlists;
+    let image_state = props.image_state;
+    let sidebar_animations = props.sidebar_animations;
+    let context = props.context;
     let metrics = SidebarMetrics::from_context(&context);
     let rail_width = context.tokens.chrome(ChromeRole::SidebarRail);
 
@@ -595,32 +553,32 @@ fn rail_view(
             let cover_handle = u64::try_from(id)
                 .ok()
                 .and_then(|id| image_state.get(ImageKind::LocalPlaylistCover, id));
-            rail_cover_button(
+            rail_cover_button(RailCoverButtonView {
                 cover_handle,
-                ImageKind::LocalPlaylistCover,
-                playlist.name.clone(),
-                matches!(current_route, Route::Playlist(current_id) if *current_id == id),
-                sidebar_animations.get_progress(&SidebarId::Playlist(id)),
+                image_kind: ImageKind::LocalPlaylistCover,
+                label: playlist.name.clone(),
+                is_active: matches!(current_route, Route::Playlist(current_id) if *current_id == id),
+                hover_progress: sidebar_animations.get_progress(&SidebarId::Playlist(id)),
                 metrics,
-                SidebarId::Playlist(id),
-                Message::OpenPlaylist(id),
-            )
+                sidebar_id: SidebarId::Playlist(id),
+                on_press: Message::OpenPlaylist(id),
+            })
         })
         .collect::<Vec<_>>();
 
     if is_logged_in {
         playlist_buttons.extend(user_playlists.iter().map(|playlist| {
             let id = playlist.id;
-            rail_cover_button(
-                image_state.get(ImageKind::PlaylistCover, id),
-                ImageKind::PlaylistCover,
-                playlist.name.clone(),
-                matches!(current_route, Route::NcmPlaylist(current_id) if *current_id == id),
-                sidebar_animations.get_progress(&SidebarId::UserPlaylist(id)),
+            rail_cover_button(RailCoverButtonView {
+                cover_handle: image_state.get(ImageKind::PlaylistCover, id),
+                image_kind: ImageKind::PlaylistCover,
+                label: playlist.name.clone(),
+                is_active: matches!(current_route, Route::NcmPlaylist(current_id) if *current_id == id),
+                hover_progress: sidebar_animations.get_progress(&SidebarId::UserPlaylist(id)),
                 metrics,
-                SidebarId::UserPlaylist(id),
-                Message::OpenNcmPlaylist(id),
-            )
+                sidebar_id: SidebarId::UserPlaylist(id),
+                on_press: Message::OpenNcmPlaylist(id),
+            })
         }));
     }
 
@@ -666,8 +624,8 @@ fn rail_view(
     .into()
 }
 
-fn rail_cover_button(
-    cover_handle: Option<&iced::widget::image::Handle>,
+struct RailCoverButtonView<'a> {
+    cover_handle: Option<&'a iced::widget::image::Handle>,
     image_kind: ImageKind,
     label: String,
     is_active: bool,
@@ -675,7 +633,19 @@ fn rail_cover_button(
     metrics: SidebarMetrics,
     sidebar_id: SidebarId,
     on_press: Message,
-) -> Element<'static, Message> {
+}
+
+fn rail_cover_button(view: RailCoverButtonView<'_>) -> Element<'static, Message> {
+    let RailCoverButtonView {
+        cover_handle,
+        image_kind,
+        label,
+        is_active,
+        hover_progress,
+        metrics,
+        sidebar_id,
+        on_press,
+    } = view;
     let button_size = (metrics.cover_size + metrics.item_spacing).max(metrics.target_size);
     let cover = crate::ui::components::cover_image::custom(
         cover_handle,
@@ -901,19 +871,19 @@ fn sidebar_button_animated(
     on_press: Message,
     metrics: SidebarMetrics,
 ) -> Element<'static, Message> {
-    sidebar_button_animated_opt_cover(
-        icon_svg,
-        None,
+    sidebar_button_animated_opt_cover(SidebarButtonView {
+        fallback_svg: icon_svg,
+        cover_icon: None,
         label,
         is_active,
         hover_progress,
         sidebar_id,
         on_press,
         metrics,
-    )
+    })
 }
 
-fn sidebar_button_animated_opt_cover(
+struct SidebarButtonView {
     fallback_svg: &'static str,
     cover_icon: Option<Element<'static, Message>>,
     label: String,
@@ -922,7 +892,19 @@ fn sidebar_button_animated_opt_cover(
     sidebar_id: SidebarId,
     on_press: Message,
     metrics: SidebarMetrics,
-) -> Element<'static, Message> {
+}
+
+fn sidebar_button_animated_opt_cover(view: SidebarButtonView) -> Element<'static, Message> {
+    let SidebarButtonView {
+        fallback_svg,
+        cover_icon,
+        label,
+        is_active,
+        hover_progress,
+        sidebar_id,
+        on_press,
+        metrics,
+    } = view;
     let icon: Element<'static, Message> = match cover_icon {
         Some(el) => el,
         None => svg(svg::Handle::from_memory(fallback_svg.as_bytes()))

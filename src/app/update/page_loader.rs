@@ -65,16 +65,18 @@ pub fn convert_ncm_tracks_to_views_with_offset(
             );
 
             crate::ui::components::playlist_view::SongItem::new(
-                -(track.id as i64),
-                Some((crate::image::ImageKind::SongCover, track.id)),
-                Some(track.cover_url().to_string()),
-                start_index + i + 1,
-                meta.title.clone(),
-                meta.artist.clone(),
-                meta.album.clone(),
-                meta.duration_display(),
-                String::new(),
-                source,
+                crate::ui::components::playlist_view::SongItemData {
+                    id: -(track.id as i64),
+                    cover_key: Some((crate::image::ImageKind::SongCover, track.id)),
+                    cover_url: Some(track.cover_url().to_string()),
+                    index: start_index + i + 1,
+                    title: meta.title.clone(),
+                    artist: meta.artist.clone(),
+                    album: meta.album.clone(),
+                    duration: meta.duration_display(),
+                    added_date: String::new(),
+                    source,
+                },
             )
         })
         .collect()

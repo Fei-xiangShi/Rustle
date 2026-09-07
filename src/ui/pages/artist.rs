@@ -1,9 +1,5 @@
 //! Artist detail page.
 
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::rc::Rc;
-
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Color, Element, Fill, Length, Padding};
 
@@ -15,7 +11,7 @@ use crate::ui::components::{
     cover_image, detail_card, detail_description,
     playlist_view::{self, PlaylistColumns},
 };
-use crate::ui::pages::playlist::{self, ArtistPageTab, DetailGradientSnapshot, PlaylistView};
+use crate::ui::pages::playlist::{self, ArtistPageTab, PlaylistView};
 use crate::ui::responsive::{
     CardRole, ResponsiveContext, TextRole, UiTokens, detail_header_metrics,
 };
@@ -23,26 +19,13 @@ use crate::ui::theme::BOLD_WEIGHT;
 use crate::ui::widgets::detail_header;
 use crate::ui::{theme, widgets};
 
-pub fn view<'a>(
-    artist: &'a PlaylistView,
-    image_state: &'a ImageState,
-    song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
-    icon_animations: &'a crate::ui::animation::HoverAnimations<crate::app::IconId>,
-    search_animation: &'a crate::ui::animation::SingleHoverAnimation,
-    search_expanded: bool,
-    search_query: &'a str,
-    liked_songs: Option<&'a HashSet<u64>>,
-    locale: Locale,
-    scroll_state: Rc<RefCell<widgets::VirtualListState>>,
-    current_user_id: Option<u64>,
-    current_playing_id: Option<i64>,
-    description_expanded: bool,
-    gradient_source: Option<DetailGradientSnapshot>,
-    gradient_progress: f32,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
-    view_for_context(
-        artist,
+pub fn view<'a>(view: playlist::DetailPageView<'a>) -> Element<'a, Message> {
+    view_for_context(view)
+}
+
+fn view_for_context<'a>(view: playlist::DetailPageView<'a>) -> Element<'a, Message> {
+    let playlist::DetailPageView {
+        detail: artist,
         image_state,
         song_animations,
         icon_animations,
@@ -58,29 +41,9 @@ pub fn view<'a>(
         gradient_source,
         gradient_progress,
         context,
-    )
-}
-
-fn view_for_context<'a>(
-    artist: &'a PlaylistView,
-    image_state: &'a ImageState,
-    song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
-    icon_animations: &'a crate::ui::animation::HoverAnimations<crate::app::IconId>,
-    search_animation: &'a crate::ui::animation::SingleHoverAnimation,
-    search_expanded: bool,
-    search_query: &'a str,
-    liked_songs: Option<&'a HashSet<u64>>,
-    locale: Locale,
-    scroll_state: Rc<RefCell<widgets::VirtualListState>>,
-    current_user_id: Option<u64>,
-    current_playing_id: Option<i64>,
-    description_expanded: bool,
-    gradient_source: Option<DetailGradientSnapshot>,
-    gradient_progress: f32,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
-    let controls = playlist::build_controls(
-        artist,
+    } = view;
+    let controls = playlist::build_controls(playlist::DetailControls {
+        playlist: artist,
         icon_animations,
         search_animation,
         search_expanded,
@@ -88,7 +51,7 @@ fn view_for_context<'a>(
         locale,
         current_user_id,
         context,
-    );
+    });
     let header = build_header(
         artist,
         image_state,
@@ -118,8 +81,8 @@ fn view_for_context<'a>(
             let filtered_indices = playlist_view::filter_song_indices(&artist.songs, search_query);
             let columns = PlaylistColumns::online().for_context(context);
             let song_list_header = playlist_view::build_header(locale, columns, context);
-            let song_list = playlist_view::build_list(
-                &artist.songs,
+            let song_list = playlist_view::build_list(playlist_view::SongListView {
+                songs: &artist.songs,
                 filtered_indices,
                 image_state,
                 song_animations,
@@ -128,7 +91,7 @@ fn view_for_context<'a>(
                 scroll_state,
                 current_playing_id,
                 context,
-            );
+            });
 
             column![song_list_header, song_list]
                 .spacing(0)

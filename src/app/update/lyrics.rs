@@ -1247,11 +1247,19 @@ impl App {
 
     /// Install cached background colors + texture from coordinator into shader.
     fn install_background_from_coordinator(&mut self, song_id: i64) {
-        let Some((cover_path, primary, secondary, tertiary, image_data, width, height)) =
-            self.playback.preload_coordinator.background_data(song_id)
-        else {
+        let Some(prepared) = self.playback.preload_coordinator.background_data(song_id) else {
             return;
         };
+
+        let super::preload_coordinator::PreparedBackground {
+            cover_path,
+            primary,
+            secondary,
+            tertiary,
+            image_data,
+            image_width: width,
+            image_height: height,
+        } = prepared;
 
         self.ui
             .lyrics

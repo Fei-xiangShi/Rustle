@@ -29,11 +29,7 @@ impl ButtonSize {
     }
 
     fn icon_size(self, tokens: UiTokens) -> f32 {
-        let reference = if matches!(self, Self::Small) {
-            22.0
-        } else {
-            22.0
-        };
+        let reference = 22.0;
         tokens.size(reference * self.emphasis())
     }
 

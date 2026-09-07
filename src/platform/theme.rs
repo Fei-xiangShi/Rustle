@@ -85,7 +85,7 @@ pub fn list_installed_font_families(db: &Database) -> Vec<String> {
         .faces()
         .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
         .collect();
-    families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    families.sort_by_key(|a| a.to_lowercase());
     families.dedup();
     families
 }

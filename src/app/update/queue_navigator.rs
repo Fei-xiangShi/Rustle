@@ -12,7 +12,7 @@ use crate::features::PlayMode;
 /// `remaining` is the current shuffled deck. A candidate is only removed when
 /// the app confirms that song as current, so speculative preload reads never
 /// advance navigation. `history` and `cursor` provide real Previous semantics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShuffleCache {
     next: Option<usize>,
     prev: Option<usize>,
@@ -21,20 +21,6 @@ pub struct ShuffleCache {
     remaining: Vec<usize>,
     queue_len: usize,
     current: Option<usize>,
-}
-
-impl Default for ShuffleCache {
-    fn default() -> Self {
-        Self {
-            next: None,
-            prev: None,
-            history: Vec::new(),
-            cursor: None,
-            remaining: Vec::new(),
-            queue_len: 0,
-            current: None,
-        }
-    }
 }
 
 impl ShuffleCache {

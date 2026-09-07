@@ -20,19 +20,33 @@ use crate::ui::{theme, widgets};
 const ACCOUNT_AVATAR_NAME_GAP: f32 = 5.0;
 const ACCOUNT_NAME_BADGE_GAP: f32 = 6.0;
 
+pub struct TopBarView<'a> {
+    pub context: ResponsiveContext,
+    pub locale: Locale,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+    pub search_query: &'a str,
+    pub is_logged_in: bool,
+    pub user_info: Option<&'a UserInfo>,
+    pub image_state: &'a ImageState,
+    pub show_background: bool,
+    pub is_maximized: bool,
+}
+
 /// Build the complete top bar with navigation buttons on left, search bar in center, user info and window controls on right
-pub fn view<'a>(
-    context: ResponsiveContext,
-    locale: Locale,
-    can_go_back: bool,
-    can_go_forward: bool,
-    search_query: &'a str,
-    is_logged_in: bool,
-    user_info: Option<&UserInfo>,
-    image_state: &ImageState,
-    show_background: bool,
-    is_maximized: bool,
-) -> Element<'a, Message> {
+pub fn view<'a>(view: TopBarView<'a>) -> Element<'a, Message> {
+    let TopBarView {
+        context,
+        locale,
+        can_go_back,
+        can_go_forward,
+        search_query,
+        is_logged_in,
+        user_info,
+        image_state,
+        show_background,
+        is_maximized,
+    } = view;
     let tokens = context.tokens;
     let button_size = tokens.target(TargetRole::WindowControl);
     let control_radius = button_size / 2.0;
@@ -428,16 +442,6 @@ pub fn view<'a>(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ACCOUNT_AVATAR_NAME_GAP, ACCOUNT_NAME_BADGE_GAP};
-
-    #[test]
-    fn avatar_name_gap_is_tighter_than_name_badge_gap() {
-        assert!(ACCOUNT_AVATAR_NAME_GAP < ACCOUNT_NAME_BADGE_GAP);
-    }
-}
-
 /// Navigation button style (back/forward)
 fn nav_button_style(
     theme: &iced::Theme,
@@ -589,3 +593,13 @@ const CLOSE_ICON: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="current
     <line x1="6" y1="6" x2="18" y2="18"/>
     <line x1="6" y1="18" x2="18" y2="6"/>
 </svg>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::{ACCOUNT_AVATAR_NAME_GAP, ACCOUNT_NAME_BADGE_GAP};
+
+    #[test]
+    fn avatar_name_gap_is_tighter_than_name_badge_gap() {
+        const { assert!(ACCOUNT_AVATAR_NAME_GAP < ACCOUNT_NAME_BADGE_GAP) };
+    }
+}

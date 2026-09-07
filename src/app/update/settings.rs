@@ -310,19 +310,6 @@ fn key_to_keycode(key: &Key) -> Option<KeyCode> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_character_space_to_space_keycode() {
-        assert_eq!(
-            key_to_keycode(&Key::Character(" ".into())),
-            Some(KeyCode::Space)
-        );
-    }
-}
-
 impl App {
     pub(super) fn refresh_cache_stats(&mut self) {
         let stats = cache::calculate_cache_stats();
@@ -422,11 +409,11 @@ impl App {
                     self.core.settings.lyrics.lyrics_font_family = family.clone();
 
                     // Update engine's text shaper so synchronous shaping uses the new font
-                    if let Some(engine_cell) = &self.ui.lyrics.engine {
-                        if let Some(font_system) = &self.ui.lyrics.shared_font_system {
-                            let mut engine = engine_cell.borrow_mut();
-                            engine.set_font_family(family.clone(), font_system.clone());
-                        }
+                    if let Some(engine_cell) = &self.ui.lyrics.engine
+                        && let Some(font_system) = &self.ui.lyrics.shared_font_system
+                    {
+                        let mut engine = engine_cell.borrow_mut();
+                        engine.set_font_family(family.clone(), font_system.clone());
                     }
 
                     // Invalidate all caches and trigger re-shape
@@ -696,9 +683,7 @@ impl App {
                 Some(Task::none())
             }
             Message::GlobalHotkeyPressed(id) => {
-                let Some((action, scope)) = self.ui.editing_keybinding else {
-                    return None;
-                };
+                let (action, scope) = self.ui.editing_keybinding?;
 
                 let binding = self
                     .core
@@ -736,5 +721,18 @@ impl App {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_character_space_to_space_keycode() {
+        assert_eq!(
+            key_to_keycode(&Key::Character(" ".into())),
+            Some(KeyCode::Space)
+        );
     }
 }

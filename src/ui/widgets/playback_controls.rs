@@ -304,19 +304,34 @@ pub fn favorite_button<M: Clone + 'static>(
 }
 
 /// Build the player bar controls, including play mode and favorite actions.
-pub fn view_player_bar<M: Clone + 'static>(
-    is_playing: bool,
-    is_buffering: bool,
-    size: ControlSize,
-    tokens: UiTokens,
-    prev_disabled: bool,
-    play_mode_button: Element<'static, M>,
-    prev_action: Option<M>,
-    play_action: M,
-    next_action: M,
-    favorite: Option<bool>,
-    favorite_action: Option<M>,
-) -> Element<'static, M> {
+pub struct PlayerBarControls<M> {
+    pub is_playing: bool,
+    pub is_buffering: bool,
+    pub size: ControlSize,
+    pub tokens: UiTokens,
+    pub prev_disabled: bool,
+    pub play_mode_button: Element<'static, M>,
+    pub prev_action: Option<M>,
+    pub play_action: M,
+    pub next_action: M,
+    pub favorite: Option<bool>,
+    pub favorite_action: Option<M>,
+}
+
+pub fn view_player_bar<M: Clone + 'static>(controls: PlayerBarControls<M>) -> Element<'static, M> {
+    let PlayerBarControls {
+        is_playing,
+        is_buffering,
+        size,
+        tokens,
+        prev_disabled,
+        play_mode_button,
+        prev_action,
+        play_action,
+        next_action,
+        favorite,
+        favorite_action,
+    } = controls;
     let spacing = size.spacing(tokens);
 
     row![
@@ -335,16 +350,28 @@ pub fn view_player_bar<M: Clone + 'static>(
 }
 
 /// Build the complete playback controls row with buffering state
-pub fn view<M: Clone + 'static>(
-    is_playing: bool,
-    is_buffering: bool,
-    size: ControlSize,
-    tokens: UiTokens,
-    prev_disabled: bool,
-    prev_action: Option<M>,
-    play_action: M,
-    next_action: M,
-) -> Element<'static, M> {
+pub struct PlaybackControls<M> {
+    pub is_playing: bool,
+    pub is_buffering: bool,
+    pub size: ControlSize,
+    pub tokens: UiTokens,
+    pub prev_disabled: bool,
+    pub prev_action: Option<M>,
+    pub play_action: M,
+    pub next_action: M,
+}
+
+pub fn view<M: Clone + 'static>(controls: PlaybackControls<M>) -> Element<'static, M> {
+    let PlaybackControls {
+        is_playing,
+        is_buffering,
+        size,
+        tokens,
+        prev_disabled,
+        prev_action,
+        play_action,
+        next_action,
+    } = controls;
     let spacing = size.spacing(tokens);
 
     row![
@@ -367,14 +394,14 @@ pub fn view_simple<M: Clone + 'static>(
     play_action: M,
     next_action: M,
 ) -> Element<'static, M> {
-    view(
+    view(PlaybackControls {
         is_playing,
-        false,
+        is_buffering: false,
         size,
         tokens,
-        prev_action.is_none(),
+        prev_disabled: prev_action.is_none(),
         prev_action,
         play_action,
         next_action,
-    )
+    })
 }

@@ -457,27 +457,6 @@ impl LyricsEnginePrimitive {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{background_slide_progress, background_slide_scale, logical_blur_to_physical};
-
-    #[test]
-    fn blur_cap_is_applied_before_physical_scale() {
-        assert_eq!(logical_blur_to_physical(4.0, 2.0, 1.0), 8.0);
-        assert_eq!(logical_blur_to_physical(8.0, 2.0, 1.0), 10.0);
-        assert_eq!(logical_blur_to_physical(-1.0, 2.0, 1.0), 0.0);
-        assert!((logical_blur_to_physical(5.0, 1.0, 4.0 / 3.0) - 20.0 / 3.0).abs() < 0.0001);
-    }
-
-    #[test]
-    fn background_slide_uses_amll_progress_and_scale() {
-        assert_eq!(background_slide_progress(-80.0), 0.0);
-        assert_eq!(background_slide_progress(0.0), 1.0);
-        assert_eq!(background_slide_scale(-80.0), 0.8);
-        assert_eq!(background_slide_scale(0.0), 1.0);
-    }
-}
-
 impl Primitive for LyricsEnginePrimitive {
     type Pipeline = LyricsEnginePipeline;
 
@@ -557,15 +536,15 @@ impl Primitive for LyricsEnginePrimitive {
             dots_state.dot_opacities = dots.dot_opacities;
 
             gpu_pipeline.prepare_interlude_dots(
-                device,
-                queue,
-                &dots_state,
-                full_viewport_width,
-                full_viewport_height,
-                bounds_x,
-                bounds_y,
-                scale,
-                font_size / scale,
+                crate::features::lyrics::engine::gpu_pipeline::InterludeDotsPreparation {
+                    device,
+                    queue,
+                    dots: &dots_state,
+                    viewport_size: [full_viewport_width, full_viewport_height],
+                    bounds_origin: [bounds_x, bounds_y],
+                    scale_factor: scale,
+                    logical_font_size: font_size / scale,
+                },
             );
         }
 
@@ -659,5 +638,26 @@ impl Primitive for LyricsEnginePrimitive {
 
         // Render lyrics text
         gpu_pipeline.render(&mut render_pass);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{background_slide_progress, background_slide_scale, logical_blur_to_physical};
+
+    #[test]
+    fn blur_cap_is_applied_before_physical_scale() {
+        assert_eq!(logical_blur_to_physical(4.0, 2.0, 1.0), 8.0);
+        assert_eq!(logical_blur_to_physical(8.0, 2.0, 1.0), 10.0);
+        assert_eq!(logical_blur_to_physical(-1.0, 2.0, 1.0), 0.0);
+        assert!((logical_blur_to_physical(5.0, 1.0, 4.0 / 3.0) - 20.0 / 3.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn background_slide_uses_amll_progress_and_scale() {
+        assert_eq!(background_slide_progress(-80.0), 0.0);
+        assert_eq!(background_slide_progress(0.0), 1.0);
+        assert_eq!(background_slide_scale(-80.0), 0.8);
+        assert_eq!(background_slide_scale(0.0), 1.0);
     }
 }

@@ -4,6 +4,18 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+/// Borrowed input for recording a completed download.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDownload<'a> {
+    pub song_id: i64,
+    pub ncm_id: u64,
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub file_path: &'a str,
+    pub file_size: u64,
+    pub quality: &'a str,
+}
+
 /// Song metadata stored in database
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct DbSong {

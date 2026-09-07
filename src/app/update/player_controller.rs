@@ -547,7 +547,7 @@ impl App {
             request_id,
             queue_index,
             song.clone(),
-            PendingPlaybackKind::LoadPausedTrack,
+            PendingPlaybackKind::LoadPaused,
         );
         self.replace_active_streaming_buffer(None);
         Ok(())
@@ -568,7 +568,7 @@ impl App {
             request_id,
             queue_index,
             song.clone(),
-            PendingPlaybackKind::LoadPausedTrack,
+            PendingPlaybackKind::LoadPaused,
         );
         self.replace_active_streaming_buffer(None);
         Ok(())
@@ -600,7 +600,7 @@ impl App {
             request_id,
             queue_index,
             song.clone(),
-            PendingPlaybackKind::LoadPausedTrack,
+            PendingPlaybackKind::LoadPaused,
         );
         self.replace_active_streaming_buffer(Some(buffer));
         Ok(())
@@ -618,7 +618,7 @@ impl App {
             request_id,
             queue_index,
             song.clone(),
-            PendingPlaybackKind::RestartCurrentTrack,
+            PendingPlaybackKind::RestartCurrent,
         );
         Ok(())
     }
@@ -634,7 +634,7 @@ impl App {
             request_id,
             Some(idx),
             song,
-            PendingPlaybackKind::StartPlayingTrack,
+            PendingPlaybackKind::StartPlaying,
         );
         Ok(Task::none())
     }
@@ -651,7 +651,7 @@ impl App {
             request_id,
             Some(idx),
             song,
-            PendingPlaybackKind::StartPlayingTrack,
+            PendingPlaybackKind::StartPlaying,
         );
         Ok(Task::none())
     }
@@ -793,17 +793,17 @@ impl App {
         };
 
         match pending.kind {
-            PendingPlaybackKind::StartPlayingTrack => {
+            PendingPlaybackKind::StartPlaying => {
                 if let Some(idx) = pending.queue_index {
                     self.on_song_started(idx, pending.song)
                 } else {
                     self.commit_current_song_playback_state(None, pending.song, true)
                 }
             }
-            PendingPlaybackKind::RestartCurrentTrack => {
+            PendingPlaybackKind::RestartCurrent => {
                 self.commit_current_song_playback_state(pending.queue_index, pending.song, true)
             }
-            PendingPlaybackKind::LoadPausedTrack => {
+            PendingPlaybackKind::LoadPaused => {
                 tracing::debug!("Ignoring Started for paused-load request_id={}", request_id);
                 Task::none()
             }
@@ -832,16 +832,19 @@ impl App {
             self.playback.pause_requested = false;
 
             return match pending.kind {
-                PendingPlaybackKind::LoadPausedTrack => {
+                PendingPlaybackKind::LoadPaused => {
                     if let Some(idx) = pending.queue_index {
                         self.on_song_loaded_paused(idx, pending.song)
                     } else {
                         self.commit_current_song_playback_state(None, pending.song, false)
                     }
                 }
-                PendingPlaybackKind::RestartCurrentTrack => self
-                    .commit_current_song_playback_state(pending.queue_index, pending.song, false),
-                PendingPlaybackKind::StartPlayingTrack => {
+                PendingPlaybackKind::RestartCurrent => self.commit_current_song_playback_state(
+                    pending.queue_index,
+                    pending.song,
+                    false,
+                ),
+                PendingPlaybackKind::StartPlaying => {
                     tracing::debug!(
                         "Ignoring Paused for playing-track request_id={}",
                         request_id
@@ -926,7 +929,7 @@ impl App {
             self.playback.pause_requested = false;
 
             return match pending.kind {
-                PendingPlaybackKind::StartPlayingTrack => {
+                PendingPlaybackKind::StartPlaying => {
                     if let Some(idx) = pending.queue_index {
                         if unhealthy_preload {
                             tracing::warn!(
@@ -944,7 +947,7 @@ impl App {
                         Self::toast_error(toast_message)
                     }
                 }
-                PendingPlaybackKind::LoadPausedTrack | PendingPlaybackKind::RestartCurrentTrack => {
+                PendingPlaybackKind::LoadPaused | PendingPlaybackKind::RestartCurrent => {
                     Self::toast_error(toast_message)
                 }
             };
@@ -1078,7 +1081,7 @@ impl App {
                             request_id,
                             queue_index,
                             song,
-                            PendingPlaybackKind::RestartCurrentTrack,
+                            PendingPlaybackKind::RestartCurrent,
                         );
                         if has_saved_position && let Some(state) = &mut self.playback.saved_state {
                             state.position_secs = 0.0;
@@ -1468,11 +1471,7 @@ impl App {
     pub fn handle_song_resolved_streaming(
         &mut self,
         idx: usize,
-        finalized_cache_path: Option<String>,
-        cover_path: Option<String>,
-        shared_buffer: Option<crate::audio::SharedBuffer>,
-        duration_secs: Option<u64>,
-        quality: Option<super::song_resolver::ResolvedAudioQuality>,
+        resolved: ResolvedSong,
         context: crate::audio::identity::PlaybackContext,
     ) -> Task<Message> {
         if !self.accepts_audio_context(&context) {
@@ -1482,17 +1481,9 @@ impl App {
         tracing::info!(
             "Song at index {} resolved to {:?} (buffer: {})",
             idx,
-            finalized_cache_path,
-            shared_buffer.is_some()
+            resolved.finalized_cache_path,
+            resolved.shared_buffer.is_some()
         );
-
-        let resolved = ResolvedSong {
-            finalized_cache_path,
-            cover_path,
-            shared_buffer,
-            duration_secs,
-            quality,
-        };
         if self.playback.current_index == Some(idx) {
             self.playback.current_quality = resolved.quality.clone();
         }

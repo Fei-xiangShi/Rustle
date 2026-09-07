@@ -583,7 +583,10 @@ impl AudioPlayer {
                 .unwrap_or(false))
     }
 
-    #[allow(clippy::too_many_arguments)] // Mirrors the immutable preload + transition contract.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "method mirrors the immutable preload and transition handoff contract; remove when PreloadedHandoff owns the payload"
+    )]
     pub fn play_preloaded_sink(
         &mut self,
         sink: Sink,
@@ -1126,7 +1129,10 @@ impl AudioPlayer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preseek installation validates and commits one streaming source; remove when PreseekedSource owns all installation metadata"
+    )]
     pub(crate) fn install_preseeked_streaming_source(
         &mut self,
         source: PreparedStreamingSource,

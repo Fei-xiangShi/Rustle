@@ -105,11 +105,13 @@ impl App {
                 context,
             ) => Some(self.handle_song_resolved_streaming(
                 *idx,
-                finalized_cache_path.clone(),
-                cover_path.clone(),
-                shared_buffer.clone(),
-                *duration_secs,
-                quality.clone(),
+                super::song_resolver::ResolvedSong {
+                    finalized_cache_path: finalized_cache_path.clone(),
+                    cover_path: cover_path.clone(),
+                    shared_buffer: shared_buffer.clone(),
+                    duration_secs: *duration_secs,
+                    quality: quality.clone(),
+                },
                 context.clone(),
             )),
 

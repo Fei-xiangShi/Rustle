@@ -1466,9 +1466,9 @@ pub struct StartupRestoreState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingPlaybackKind {
-    StartPlayingTrack,
-    LoadPausedTrack,
-    RestartCurrentTrack,
+    StartPlaying,
+    LoadPaused,
+    RestartCurrent,
 }
 
 #[derive(Debug, Clone)]
@@ -2415,7 +2415,7 @@ pub enum SearchTab {
 
 impl SearchTab {
     /// Get the NCM API search type code
-    pub fn to_search_type(&self) -> crate::api::SearchType {
+    pub fn to_search_type(self) -> crate::api::SearchType {
         match self {
             SearchTab::Songs => crate::api::SearchType::Songs,
             SearchTab::Artists => crate::api::SearchType::Artists,

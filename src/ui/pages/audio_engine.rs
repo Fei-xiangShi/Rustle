@@ -102,16 +102,15 @@ pub fn view<'a>(
         equalizer_section(settings, locale, context),
         Space::new().height(tokens.space(40.0)),
         // Audio visualization section
-        audio_visualization_section(
-            left_level,
-            right_level,
+        audio_visualization_section(AudioVisualization {
+            channel_levels: [left_level, right_level],
             spectrum_db,
             sample_rate,
             decay,
             bars_mode,
             locale,
             context,
-        ),
+        }),
     ]
     .spacing(0)
     .width(Fill);
@@ -215,16 +214,26 @@ fn equalizer_section(
 }
 
 /// Audio visualization section with spectrum analyzer
-fn audio_visualization_section(
-    left_level: f32,
-    right_level: f32,
+struct AudioVisualization {
+    channel_levels: [f32; 2],
     spectrum_db: [f32; SPECTRUM_BARS],
     sample_rate: u32,
     decay: f32,
     bars_mode: bool,
     locale: Locale,
     context: ResponsiveContext,
-) -> Element<'static, Message> {
+}
+
+fn audio_visualization_section(view: AudioVisualization) -> Element<'static, Message> {
+    let AudioVisualization {
+        channel_levels: [left_level, right_level],
+        spectrum_db,
+        sample_rate,
+        decay,
+        bars_mode,
+        locale,
+        context,
+    } = view;
     let tokens = context.tokens;
 
     // Separator line

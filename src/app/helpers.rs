@@ -392,18 +392,26 @@ pub async fn load_playlist_view(
         .map(|(i, song)| {
             let meta = crate::metadata::SongMetadata::from(&song.song);
             let added_date = format_relative_time(song.added_at);
-            pages::PlaylistSongView::new(
-                song.song.id,
-                crate::image::song_cover_key_for_source(song.song.id, &song.song.file_path),
-                None,
-                i + 1,
-                meta.title.clone(),
-                meta.artist.clone(),
-                meta.album.clone(),
-                meta.duration_display(),
+            pages::PlaylistSongView::new(crate::ui::components::playlist_view::SongItemData {
+                id: song.song.id,
+                cover_key: crate::image::song_cover_key_for_source(
+                    song.song.id,
+                    &song.song.file_path,
+                ),
+                cover_url: None,
+                index: i + 1,
+                title: meta.title.clone(),
+                artist: meta.artist.clone(),
+                album: meta.album.clone(),
+                duration: meta.duration_display(),
                 added_date,
-                crate::utils::compute_source(&song.song.file_path, song.song.id, None, None),
-            )
+                source: crate::utils::compute_source(
+                    &song.song.file_path,
+                    song.song.id,
+                    None,
+                    None,
+                ),
+            })
         })
         .collect();
 

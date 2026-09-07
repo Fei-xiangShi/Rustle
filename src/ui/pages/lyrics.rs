@@ -36,35 +36,56 @@ use crate::ui::widgets::{self, ControlSize, SliderSize};
 /// `download_progress`: Download progress for streaming songs (0.0 to 1.0)
 /// `is_fm_mode`: Whether in Personal FM mode
 /// `is_maximized`: Whether the application window is currently maximized
-pub fn view<'a>(
-    song: &'a DbSong,
-    image_state: &'a ImageState,
-    artist_id: Option<u64>,
-    is_playing: bool,
-    position: f32, // 0.0 to 1.0
-    duration_secs: f32,
-    cached_engine_lines: Option<&'a Arc<Vec<LyricLineData>>>,
-    _current_line_index: Option<usize>,
-    play_mode: PlayMode,
-    animation_progress: f32,
-    bg_colors: &crate::utils::DominantColors,
-    _bg_shader: &'a crate::ui::effects::background::LyricsBackgroundProgram,
-    textured_bg_shader: &'a TexturedBackgroundProgram,
-    lyrics_engine: Option<&'a std::cell::RefCell<LyricsEngine>>,
-    power_saving_mode: bool,
-    is_liked: bool,
-    download_progress: Option<f32>,
-    is_fm_mode: bool,
-    is_maximized: bool,
-    display_mode: LyricsDisplayMode,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
+pub struct LyricsPageView<'a> {
+    pub song: &'a DbSong,
+    pub image_state: &'a ImageState,
+    pub artist_id: Option<u64>,
+    pub is_playing: bool,
+    pub position: f32,
+    pub duration_secs: f32,
+    pub cached_engine_lines: Option<&'a Arc<Vec<LyricLineData>>>,
+    pub play_mode: PlayMode,
+    pub animation_progress: f32,
+    pub bg_colors: &'a crate::utils::DominantColors,
+    pub textured_bg_shader: &'a TexturedBackgroundProgram,
+    pub lyrics_engine: Option<&'a std::cell::RefCell<LyricsEngine>>,
+    pub power_saving_mode: bool,
+    pub is_liked: bool,
+    pub download_progress: Option<f32>,
+    pub is_fm_mode: bool,
+    pub is_maximized: bool,
+    pub display_mode: LyricsDisplayMode,
+    pub context: ResponsiveContext,
+}
+
+pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
+    let LyricsPageView {
+        song,
+        image_state,
+        artist_id,
+        is_playing,
+        position,
+        duration_secs,
+        cached_engine_lines,
+        play_mode,
+        animation_progress,
+        bg_colors,
+        textured_bg_shader,
+        lyrics_engine,
+        power_saving_mode,
+        is_liked,
+        download_progress,
+        is_fm_mode,
+        is_maximized,
+        display_mode,
+        context,
+    } = view;
     let tokens = context.tokens;
     let title_bar_height = top_bar_height(&context);
 
     let content: Element<'a, Message> = match lyrics_page_layout(context) {
         LyricsPageLayout::Split => {
-            let artwork_panel = build_artwork_panel(
+            let artwork_panel = build_artwork_panel(ArtworkPanelView {
                 song,
                 image_state,
                 artist_id,
@@ -76,8 +97,8 @@ pub fn view<'a>(
                 download_progress,
                 is_fm_mode,
                 context,
-                ArtworkPanelPresentation::Wide,
-            );
+                presentation: ArtworkPanelPresentation::Wide,
+            });
             let lyrics_panel = if power_saving_mode {
                 build_simple_lyrics_panel(
                     cached_engine_lines,
@@ -129,7 +150,7 @@ pub fn view<'a>(
                     let visible_mode = lyrics_mode_at_progress(progress);
                     let body: Element<'a, Message> = match visible_mode {
                         LyricsDisplayMode::Artwork => {
-                            let artwork_panel = build_artwork_panel(
+                            let artwork_panel = build_artwork_panel(ArtworkPanelView {
                                 song,
                                 image_state,
                                 artist_id,
@@ -141,8 +162,8 @@ pub fn view<'a>(
                                 download_progress,
                                 is_fm_mode,
                                 context,
-                                ArtworkPanelPresentation::Focus,
-                            );
+                                presentation: ArtworkPanelPresentation::Focus,
+                            });
                             let horizontal_padding = tokens.space(24.0);
                             let minimum_vertical_padding = tokens.space(16.0);
 
@@ -530,7 +551,7 @@ fn artwork_requires_vertical_scroll(context: ResponsiveContext, title_bar_height
 }
 
 /// Build the player panel with cover, song info, and controls.
-fn build_artwork_panel<'a>(
+struct ArtworkPanelView<'a> {
     song: &'a DbSong,
     image_state: &'a ImageState,
     artist_id: Option<u64>,
@@ -543,7 +564,23 @@ fn build_artwork_panel<'a>(
     is_fm_mode: bool,
     context: ResponsiveContext,
     presentation: ArtworkPanelPresentation,
-) -> Element<'a, Message> {
+}
+
+fn build_artwork_panel<'a>(view: ArtworkPanelView<'a>) -> Element<'a, Message> {
+    let ArtworkPanelView {
+        song,
+        image_state,
+        artist_id,
+        is_playing,
+        position,
+        duration_secs,
+        play_mode,
+        is_liked,
+        download_progress,
+        is_fm_mode,
+        context,
+        presentation,
+    } = view;
     let tokens = context.tokens;
     let current_time = crate::utils::format_time(position * duration_secs);
     let total_time = crate::utils::format_time(duration_secs);

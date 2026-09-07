@@ -96,21 +96,35 @@ pub struct SongItem {
     pub source: Source,
 }
 
+pub struct SongItemData {
+    pub id: i64,
+    pub cover_key: Option<(crate::image::ImageKind, u64)>,
+    pub cover_url: Option<String>,
+    pub index: usize,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration: String,
+    pub added_date: String,
+    pub source: Source,
+}
+
 impl SongItem {
     /// Create a new SongItem with pre-computed display values.
     /// Cover resolution is deferred to `image::resolve`.
-    pub fn new(
-        id: i64,
-        cover_key: Option<(crate::image::ImageKind, u64)>,
-        cover_url: Option<String>,
-        index: usize,
-        title: String,
-        artist: String,
-        album: String,
-        duration: String,
-        added_date: String,
-        source: Source,
-    ) -> Self {
+    pub fn new(data: SongItemData) -> Self {
+        let SongItemData {
+            id,
+            cover_key,
+            cover_url,
+            index,
+            title,
+            artist,
+            album,
+            duration,
+            added_date,
+            source,
+        } = data;
         let display_title = truncate_string(&title, MAX_TITLE_LEN);
         let display_artist = truncate_string(&artist, MAX_ARTIST_LEN);
         let display_album = album.clone();
@@ -138,6 +152,18 @@ impl SongItem {
             source,
         }
     }
+}
+
+pub struct SongListView<'a> {
+    pub songs: &'a [SongItem],
+    pub filtered_indices: Option<Vec<usize>>,
+    pub image_state: &'a ImageState,
+    pub song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
+    pub liked_songs: Option<&'a HashSet<u64>>,
+    pub columns: PlaylistColumns,
+    pub scroll_state: Rc<RefCell<VirtualListState>>,
+    pub current_playing_id: Option<i64>,
+    pub context: ResponsiveContext,
 }
 
 /// Truncate string with ellipsis if too long
@@ -313,17 +339,18 @@ pub fn build_header(
 }
 
 /// Build the virtual song list
-pub fn build_list<'a>(
-    songs: &'a [SongItem],
-    filtered_indices: Option<Vec<usize>>,
-    image_state: &'a ImageState,
-    song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
-    liked_songs: Option<&'a HashSet<u64>>,
-    columns: PlaylistColumns,
-    scroll_state: Rc<RefCell<VirtualListState>>,
-    current_playing_id: Option<i64>,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
+pub fn build_list<'a>(view: SongListView<'a>) -> Element<'a, Message> {
+    let SongListView {
+        songs,
+        filtered_indices,
+        image_state,
+        song_animations,
+        liked_songs,
+        columns,
+        scroll_state,
+        current_playing_id,
+        context,
+    } = view;
     let tokens = context.tokens;
     let row_height = song_row_height(tokens);
     let filtered_indices = filtered_indices.map(Rc::new);

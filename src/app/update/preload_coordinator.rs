@@ -55,6 +55,18 @@ pub struct BackgroundSlot {
     pub image_height: u32,
 }
 
+/// Background resources prepared together for one song and installed as a unit.
+#[derive(Debug, Clone)]
+pub struct PreparedBackground {
+    pub cover_path: Option<String>,
+    pub primary: [f32; 4],
+    pub secondary: [f32; 4],
+    pub tertiary: [f32; 4],
+    pub image_data: Vec<u8>,
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
 /// Per-song lyrics preload readiness
 #[derive(Debug, Clone, Default)]
 pub struct LyricsSlot {
@@ -252,18 +264,7 @@ impl PreloadCoordinator {
     }
 
     /// Clone cached background data for installation into shader.
-    pub fn background_data(
-        &self,
-        song_id: i64,
-    ) -> Option<(
-        Option<String>,
-        [f32; 4],
-        [f32; 4],
-        [f32; 4],
-        Vec<u8>,
-        u32,
-        u32,
-    )> {
+    pub fn background_data(&self, song_id: i64) -> Option<PreparedBackground> {
         let slot = self.background_slots.get(&song_id)?;
         let cover_path = slot.cover_path.clone();
         let primary = slot.primary?;
@@ -271,7 +272,15 @@ impl PreloadCoordinator {
         let tertiary = slot.tertiary?;
         let image_data = slot.image_data.clone()?;
         let (w, h) = (slot.image_width, slot.image_height);
-        Some((cover_path, primary, secondary, tertiary, image_data, w, h))
+        Some(PreparedBackground {
+            cover_path,
+            primary,
+            secondary,
+            tertiary,
+            image_data,
+            image_width: w,
+            image_height: h,
+        })
     }
 
     // ── Lyrics slot ──
@@ -343,5 +352,29 @@ mod tests {
 
         coordinator.ensure_background_slot(1, Some("second.png".to_string()));
         assert_eq!(coordinator.background_colors(1), None);
+    }
+
+    #[test]
+    fn prepared_background_keeps_identity_colors_and_texture_together() {
+        let mut coordinator = PreloadCoordinator::default();
+        let cover_path = "cover.png".to_string();
+        let primary = [0.8, 0.2, 0.3, 1.0];
+        let secondary = [0.3, 0.6, 0.9, 1.0];
+        let tertiary = [0.5, 0.2, 0.8, 1.0];
+        let image_data = vec![1, 2, 3, 4, 5, 6];
+
+        coordinator.ensure_background_slot(7, Some(cover_path.clone()));
+        coordinator.store_background_colors(7, cover_path.clone(), primary, secondary, tertiary);
+        coordinator.store_background_texture(7, cover_path.clone(), image_data.clone(), 2, 1);
+
+        let prepared = coordinator
+            .background_data(7)
+            .expect("complete background should produce one installation payload");
+        assert_eq!(prepared.cover_path.as_deref(), Some(cover_path.as_str()));
+        assert_eq!(prepared.primary, primary);
+        assert_eq!(prepared.secondary, secondary);
+        assert_eq!(prepared.tertiary, tertiary);
+        assert_eq!(prepared.image_data, image_data);
+        assert_eq!((prepared.image_width, prepared.image_height), (2, 1));
     }
 }

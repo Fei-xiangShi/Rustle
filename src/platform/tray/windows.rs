@@ -769,7 +769,7 @@ unsafe fn load_small_icon() -> anyhow::Result<LoadedIcon> {
 fn premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
     debug_assert_eq!(rgba.len() % 4, 0);
     let mut output = Vec::with_capacity(rgba.len());
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         let alpha = u16::from(pixel[3]);
         output.push(((u16::from(pixel[2]) * alpha + 127) / 255) as u8);
         output.push(((u16::from(pixel[1]) * alpha + 127) / 255) as u8);

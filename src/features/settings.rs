@@ -149,7 +149,7 @@ impl MusicQuality {
     }
 
     /// Get the API rate value for this quality
-    pub fn to_api_rate(&self) -> u32 {
+    pub fn to_api_rate(self) -> u32 {
         match self {
             Self::Standard => 0, // 128000
             Self::Higher => 1,   // 192000
@@ -301,7 +301,7 @@ pub struct DisplaySettings {
 }
 
 // Lyrics panel settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LyricsSettings {
     pub lyrics_font_family: Option<String>,
 }
@@ -506,14 +506,6 @@ impl Default for PlaybackSettings {
             music_quality: MusicQuality::High, // 320k default
             automix_enabled: false,
             automix_analysis_max_seconds: default_automix_analysis_max_seconds(),
-        }
-    }
-}
-
-impl Default for LyricsSettings {
-    fn default() -> Self {
-        Self {
-            lyrics_font_family: None,
         }
     }
 }

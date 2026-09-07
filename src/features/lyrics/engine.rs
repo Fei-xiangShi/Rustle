@@ -666,10 +666,7 @@ impl LyricsEngine {
         if index_changed || self.last_interlude_state != is_interlude_active {
             self.last_interlude_state = is_interlude_active;
 
-            if is_seek {
-                self.line_animations
-                    .set_pos_y_spring_params(self.pos_y_spring_params());
-            } else if is_interlude_active {
+            if is_seek || is_interlude_active {
                 self.line_animations
                     .set_pos_y_spring_params(self.pos_y_spring_params());
             } else {

@@ -174,7 +174,9 @@ fn swash_to_alpha(image: &SwashImage) -> Option<Vec<u8>> {
             Some(
                 image
                     .data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|px| px[3])
                     .collect::<Vec<u8>>(),
             )
@@ -186,7 +188,9 @@ fn swash_to_alpha(image: &SwashImage) -> Option<Vec<u8>> {
             Some(
                 image
                     .data
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|px| px[0].max(px[1]).max(px[2]))
                     .collect::<Vec<u8>>(),
             )

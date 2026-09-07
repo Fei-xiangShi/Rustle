@@ -586,8 +586,10 @@ impl SharedBuffer {
         capacity: usize,
         demand_stall_timeout: Duration,
     ) -> Self {
-        let mut policy = StreamingBufferPolicy::default();
-        policy.capacity_bytes = capacity.max(1);
+        let policy = StreamingBufferPolicy {
+            capacity_bytes: capacity.max(1),
+            ..StreamingBufferPolicy::default()
+        };
         Self::with_policy_and_stall_timeout(total_size, policy, demand_stall_timeout)
     }
 
@@ -2139,15 +2141,15 @@ pub fn start_buffer_download(
                 ))
                 .await;
         }
-        if let Some(tx) = &event_tx {
-            if !playable_sent {
-                let _ = tx
-                    .send(StreamingEvent::new(
-                        identity.clone(),
-                        StreamingEventKind::Playable,
-                    ))
-                    .await;
-            }
+        if let Some(tx) = &event_tx
+            && !playable_sent
+        {
+            let _ = tx
+                .send(StreamingEvent::new(
+                    identity.clone(),
+                    StreamingEventKind::Playable,
+                ))
+                .await;
         }
         tracing::debug!("Strict Range download complete: {} bytes", downloaded);
     });

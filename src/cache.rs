@@ -87,9 +87,8 @@ fn replace_closed_file(temp_path: &Path, final_path: &Path) -> std::io::Result<(
 
 /// Atomically replace the destination with a closed temporary file.
 pub fn publish_replace(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
-    replace_closed_file(temp_path, final_path).map_err(|error| {
+    replace_closed_file(temp_path, final_path).inspect_err(|_error| {
         cleanup_temp_file(temp_path);
-        error
     })
 }
 

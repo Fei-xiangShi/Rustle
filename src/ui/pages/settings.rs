@@ -22,23 +22,25 @@ use crate::ui::responsive::{
 use crate::ui::{theme, widgets};
 
 /// Settings page view with fixed header and all sections on one scrollable page
-pub fn view<'a>(
-    settings: &'a Settings,
-    audio_devices: Vec<(String, String)>,
-    font_families: Vec<String>,
-    active_section: SettingsSection,
-    locale: Locale,
-    editing_keybinding: Option<(Action, ShortcutScope)>,
-    is_logged_in: bool,
-    user_info: Option<&'a crate::app::UserInfo>,
-    image_state: &'a ImageState,
-    cache_stats: Option<&'a crate::cache::CacheStats>,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
-    view_for_context(
+pub struct SettingsPageView<'a> {
+    pub settings: &'a Settings,
+    pub audio_devices: Vec<(String, String)>,
+    pub font_families: Vec<String>,
+    pub active_section: SettingsSection,
+    pub locale: Locale,
+    pub editing_keybinding: Option<(Action, ShortcutScope)>,
+    pub is_logged_in: bool,
+    pub user_info: Option<&'a crate::app::UserInfo>,
+    pub image_state: &'a ImageState,
+    pub cache_stats: Option<&'a crate::cache::CacheStats>,
+    pub context: ResponsiveContext,
+}
+
+pub fn view<'a>(view: SettingsPageView<'a>) -> Element<'a, Message> {
+    let SettingsPageView {
         settings,
-        &audio_devices,
-        &font_families,
+        audio_devices,
+        font_families,
         active_section,
         locale,
         editing_keybinding,
@@ -47,22 +49,7 @@ pub fn view<'a>(
         image_state,
         cache_stats,
         context,
-    )
-}
-
-fn view_for_context<'a>(
-    settings: &'a Settings,
-    audio_devices: &[(String, String)],
-    font_families: &[String],
-    active_section: SettingsSection,
-    locale: Locale,
-    editing_keybinding: Option<(Action, ShortcutScope)>,
-    is_logged_in: bool,
-    user_info: Option<&'a crate::app::UserInfo>,
-    image_state: &'a ImageState,
-    cache_stats: Option<&'a crate::cache::CacheStats>,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
+    } = view;
     let tokens = context.tokens;
     // Fixed header: title + tabs
     let header = column![
@@ -91,10 +78,10 @@ fn view_for_context<'a>(
         });
 
     // All sections on one page
-    let all_sections = all_sections_content(
+    let all_sections = all_sections_content(SettingsSections {
         settings,
-        audio_devices,
-        font_families,
+        audio_devices: &audio_devices,
+        font_families: &font_families,
         locale,
         editing_keybinding,
         is_logged_in,
@@ -102,7 +89,7 @@ fn view_for_context<'a>(
         image_state,
         cache_stats,
         context,
-    );
+    });
 
     let scrollable_content = crate::ui::widgets::smooth_scroll(
         scrollable(
@@ -242,18 +229,32 @@ fn tab_bar(
 }
 
 /// All settings sections on one page
-fn all_sections_content(
-    settings: &Settings,
-    audio_devices: &[(String, String)],
-    font_families: &[String],
+struct SettingsSections<'a> {
+    settings: &'a Settings,
+    audio_devices: &'a [(String, String)],
+    font_families: &'a [String],
     locale: Locale,
     editing_keybinding: Option<(Action, ShortcutScope)>,
     is_logged_in: bool,
-    user_info: Option<&crate::app::UserInfo>,
-    image_state: &ImageState,
-    cache_stats: Option<&crate::cache::CacheStats>,
+    user_info: Option<&'a crate::app::UserInfo>,
+    image_state: &'a ImageState,
+    cache_stats: Option<&'a crate::cache::CacheStats>,
     context: ResponsiveContext,
-) -> Element<'static, Message> {
+}
+
+fn all_sections_content(view: SettingsSections<'_>) -> Element<'static, Message> {
+    let SettingsSections {
+        settings,
+        audio_devices,
+        font_families,
+        locale,
+        editing_keybinding,
+        is_logged_in,
+        user_info,
+        image_state,
+        cache_stats,
+        context,
+    } = view;
     use crate::app::SettingsSection;
     column![
         // Account section

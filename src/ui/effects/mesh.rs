@@ -82,6 +82,11 @@ const H: [f32; 16] = [
     2.0, -2.0, 1.0, 1.0, -3.0, 3.0, -2.0, -1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0,
 ];
 
+struct SurfacePatch<'a> {
+    corners: [&'a ControlPoint; 4],
+    tangent_power: [f32; 2],
+}
+
 /// 计算 Hermite 曲面上的点
 ///
 /// 矩阵布局与 meshCoefficients 完全一致：
@@ -93,16 +98,9 @@ const H: [f32; 16] = [
 /// ]
 ///
 /// 其中 l = location, u = uTangent, v = vTangent
-fn surface_point(
-    u: f32,
-    v: f32,
-    p00: &ControlPoint,
-    p01: &ControlPoint,
-    p10: &ControlPoint,
-    p11: &ControlPoint,
-    u_power: f32,
-    v_power: f32,
-) -> (f32, f32) {
+fn surface_point(u: f32, v: f32, patch: SurfacePatch<'_>) -> (f32, f32) {
+    let [p00, p01, p10, p11] = patch.corners;
+    let [u_power, v_power] = patch.tangent_power;
     let u_vec = [u * u * u, u * u, u, 1.0];
     let v_vec = [v * v * v, v * v, v, 1.0];
 
@@ -387,8 +385,14 @@ impl BhpMesh {
                         // default: vy = baseVy + v
                         let vy = base_vy + v;
 
-                        let (px, py) =
-                            surface_point(u_norm, v_norm, p00, p01, p10, p11, u_power, v_power);
+                        let (px, py) = surface_point(
+                            u_norm,
+                            v_norm,
+                            SurfacePatch {
+                                corners: [p00, p01, p10, p11],
+                                tangent_power: [u_power, v_power],
+                            },
+                        );
                         let color = color_point(u_norm, v_norm, c00, c01, c10, c11);
 
                         // default: uvX = sX + v * invTH
@@ -571,9 +575,8 @@ fn smoothify_control_points(
                 let mut sum_up = 0.0;
                 let mut sum_vp = 0.0;
 
-                for dj in 0..3 {
-                    for di in 0..3 {
-                        let weight = kernel[dj][di];
+                for (dj, kernel_row) in kernel.iter().enumerate() {
+                    for (di, weight) in kernel_row.iter().copied().enumerate() {
                         let idx = (j + dj - 1) * w + (i + di - 1);
                         let nb = &old_points[idx];
                         sum_x += nb.x * weight;

@@ -282,7 +282,12 @@ fn build_active_card(
 
     // Responsive progress bar with FillPortion
     let pct = (progress * 100.0) as u32;
-    let fill_portion = ((progress.max(0.01).min(1.0)) * 1000.0) as u16;
+    let bounded_progress = if progress.is_nan() {
+        0.01
+    } else {
+        progress.clamp(0.01, 1.0)
+    };
+    let fill_portion = (bounded_progress * 1000.0) as u16;
     let empty_portion = 1000u16.saturating_sub(fill_portion);
     let bar = container(
         row![

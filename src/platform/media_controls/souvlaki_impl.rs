@@ -90,37 +90,37 @@ impl SouvlakiMediaHandle {
         }
 
         // Update controls
-        if let Ok(mut controls_guard) = self.state.controls.lock() {
-            if let Some(ref mut controls) = *controls_guard {
-                let mut published = self.state.published.lock().unwrap();
-                let metadata_changed = published.metadata.as_ref() != Some(&state.metadata);
+        if let Ok(mut controls_guard) = self.state.controls.lock()
+            && let Some(ref mut controls) = *controls_guard
+        {
+            let mut published = self.state.published.lock().unwrap();
+            let metadata_changed = published.metadata.as_ref() != Some(&state.metadata);
 
-                if metadata_changed {
-                    let cache = self.metadata_cache.lock().unwrap();
-                    let metadata = SouvlakiMetadata {
-                        title: Some(cache.title.as_deref().unwrap_or("")),
-                        artist: Some(cache.artist.as_deref().unwrap_or("")),
-                        album: Some(cache.album.as_deref().unwrap_or("")),
-                        cover_url: cache.cover_url.as_deref(),
-                        duration: cache.duration,
-                    };
+            if metadata_changed {
+                let cache = self.metadata_cache.lock().unwrap();
+                let metadata = SouvlakiMetadata {
+                    title: Some(cache.title.as_deref().unwrap_or("")),
+                    artist: Some(cache.artist.as_deref().unwrap_or("")),
+                    album: Some(cache.album.as_deref().unwrap_or("")),
+                    cover_url: cache.cover_url.as_deref(),
+                    duration: cache.duration,
+                };
 
-                    if let Err(err) = controls.set_metadata(metadata) {
-                        tracing::debug!("Failed to update media metadata: {:?}", err);
-                    } else {
-                        published.metadata = Some(state.metadata.clone());
-                    }
+                if let Err(err) = controls.set_metadata(metadata) {
+                    tracing::debug!("Failed to update media metadata: {:?}", err);
+                } else {
+                    published.metadata = Some(state.metadata.clone());
                 }
+            }
 
-                if should_sync_playback(&published, &state, metadata_changed) {
-                    let playback = to_souvlaki_playback(state.status, state.position_us);
-                    if let Err(err) = controls.set_playback(playback) {
-                        tracing::debug!("Failed to update media playback: {:?}", err);
-                    } else {
-                        published.playback_status = Some(state.status);
-                        published.position_us = state.position_us;
-                        published.last_playback_sync = Some(Instant::now());
-                    }
+            if should_sync_playback(&published, &state, metadata_changed) {
+                let playback = to_souvlaki_playback(state.status, state.position_us);
+                if let Err(err) = controls.set_playback(playback) {
+                    tracing::debug!("Failed to update media playback: {:?}", err);
+                } else {
+                    published.playback_status = Some(state.status);
+                    published.position_us = state.position_us;
+                    published.last_playback_sync = Some(Instant::now());
                 }
             }
         }

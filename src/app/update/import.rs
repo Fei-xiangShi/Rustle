@@ -607,75 +607,74 @@ impl App {
                     playlist.complete(*imported, *skipped, *errors);
                 }
 
-                if is_success {
-                    if let (Some(db), Some(playlist)) = (&self.core.db, &self.ui.importing_playlist)
-                    {
-                        let db_for_library = db.clone();
-                        let db_for_songs = db.clone();
-                        let name = playlist.name.clone();
-                        let cover_path = playlist.cover_path.clone();
-                        let root_path = playlist.root_path.clone();
+                if is_success
+                    && let (Some(db), Some(playlist)) = (&self.core.db, &self.ui.importing_playlist)
+                {
+                    let db_for_library = db.clone();
+                    let db_for_songs = db.clone();
+                    let name = playlist.name.clone();
+                    let cover_path = playlist.cover_path.clone();
+                    let root_path = playlist.root_path.clone();
 
-                        let mut tasks = vec![
-                            toast_task,
-                            Task::perform(
-                                async move {
-                                    let create_result = async {
-                                        let watched_path =
-                                            root_path.canonicalize().unwrap_or(root_path);
-                                        let watched_path_str =
-                                            watched_path.to_string_lossy().to_string();
-                                        let playlist_id = if let Some(existing) = db_for_library
-                                            .get_watched_folder_by_path(&watched_path_str)
-                                            .await?
-                                            .and_then(|folder| folder.playlist_id)
-                                        {
-                                            sync_playlist_from_import(
-                                                db_for_library.clone(),
-                                                existing,
-                                                name,
-                                                cover_path,
-                                                scanned_paths,
-                                            )
-                                            .await?
-                                        } else {
-                                            create_playlist_from_import(
-                                                db_for_library.clone(),
-                                                name,
-                                                cover_path,
-                                                scanned_paths,
-                                            )
-                                            .await?
-                                        };
-                                        db_for_library
-                                            .upsert_watched_folder(NewWatchedFolder {
-                                                path: watched_path_str,
-                                                playlist_id: Some(playlist_id),
-                                                enabled: true,
-                                            })
-                                            .await?;
-                                        Result::<i64>::Ok(playlist_id)
-                                    }
-                                    .await;
+                    let mut tasks = vec![
+                        toast_task,
+                        Task::perform(
+                            async move {
+                                let create_result = async {
+                                    let watched_path =
+                                        root_path.canonicalize().unwrap_or(root_path);
+                                    let watched_path_str =
+                                        watched_path.to_string_lossy().to_string();
+                                    let playlist_id = if let Some(existing) = db_for_library
+                                        .get_watched_folder_by_path(&watched_path_str)
+                                        .await?
+                                        .and_then(|folder| folder.playlist_id)
+                                    {
+                                        sync_playlist_from_import(
+                                            db_for_library.clone(),
+                                            existing,
+                                            name,
+                                            cover_path,
+                                            scanned_paths,
+                                        )
+                                        .await?
+                                    } else {
+                                        create_playlist_from_import(
+                                            db_for_library.clone(),
+                                            name,
+                                            cover_path,
+                                            scanned_paths,
+                                        )
+                                        .await?
+                                    };
+                                    db_for_library
+                                        .upsert_watched_folder(NewWatchedFolder {
+                                            path: watched_path_str,
+                                            playlist_id: Some(playlist_id),
+                                            enabled: true,
+                                        })
+                                        .await?;
+                                    Result::<i64>::Ok(playlist_id)
+                                }
+                                .await;
 
-                                    create_result.map_err(|err| err.to_string())
-                                },
-                                Message::ImportedPlaylistCreated,
-                            ),
-                            Task::perform(load_songs(db_for_songs), Message::SongsLoaded),
-                        ];
+                                create_result.map_err(|err| err.to_string())
+                            },
+                            Message::ImportedPlaylistCreated,
+                        ),
+                        Task::perform(load_songs(db_for_songs), Message::SongsLoaded),
+                    ];
 
-                        if let Some(secs) = clear_delay_secs {
-                            tasks.push(Task::perform(
-                                async move {
-                                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                                },
-                                |_| Message::ClearImportingPlaylist,
-                            ));
-                        }
-
-                        return Task::batch(tasks);
+                    if let Some(secs) = clear_delay_secs {
+                        tasks.push(Task::perform(
+                            async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                            },
+                            |_| Message::ClearImportingPlaylist,
+                        ));
                     }
+
+                    return Task::batch(tasks);
                 }
 
                 if let Some(secs) = clear_delay_secs {

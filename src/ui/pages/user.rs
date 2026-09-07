@@ -1,8 +1,5 @@
 //! User detail page.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Fill, Length, Padding};
 
@@ -22,16 +19,7 @@ use crate::ui::{theme, widgets};
 pub fn view<'a>(
     user: &'a PlaylistView,
     image_state: &'a ImageState,
-    _song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
-    _icon_animations: &crate::ui::animation::HoverAnimations<crate::app::IconId>,
-    _search_animation: &crate::ui::animation::SingleHoverAnimation,
-    _search_expanded: bool,
-    _search_query: &str,
-    _liked_songs: Option<&std::collections::HashSet<u64>>,
     locale: Locale,
-    _scroll_state: Rc<RefCell<widgets::VirtualListState>>,
-    _current_user_id: Option<u64>,
-    _current_playing_id: Option<i64>,
     description_expanded: bool,
     gradient_source: Option<DetailGradientSnapshot>,
     gradient_progress: f32,

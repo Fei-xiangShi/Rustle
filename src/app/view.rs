@@ -69,34 +69,23 @@ impl App {
                         };
 
                     // Use preview position while seeking, otherwise use actual position
-                    let display_position = if self.ui.seek_preview_position.is_some() {
-                        self.ui.seek_preview_position.unwrap()
-                    } else {
-                        position
-                    };
+                    let display_position = self.ui.seek_preview_position.unwrap_or(position);
 
-                    // Calculate current lyric line based on playback position
-                    let position_ms = (position * duration * 1000.0) as u64;
-                    let current_line = pages::find_current_line(&self.ui.lyrics.lines, position_ms);
-
-                    pages::lyrics::view(
+                    pages::lyrics::view(pages::lyrics::LyricsPageView {
                         song,
-                        &self.ui.image_state,
-                        self.current_song_artist_id(),
+                        image_state: &self.ui.image_state,
+                        artist_id: self.current_song_artist_id(),
                         is_playing,
-                        display_position,
-                        duration,
-                        self.ui.lyrics.cached_engine_lines.as_ref(), // Use cached engine lines (Rc)
-                        current_line,
-                        self.core.settings.play_mode,
-                        lyrics_progress,
-                        &self.ui.lyrics.bg_colors,
-                        &self.ui.lyrics.bg_shader,
-                        &self.ui.lyrics.textured_bg_shader,
-                        self.ui.lyrics.engine.as_ref(),
-                        self.core.settings.display.power_saving_mode,
-                        // Check if current song is liked
-                        if song.id < 0 {
+                        position: display_position,
+                        duration_secs: duration,
+                        cached_engine_lines: self.ui.lyrics.cached_engine_lines.as_ref(),
+                        play_mode: self.core.settings.play_mode,
+                        animation_progress: lyrics_progress,
+                        bg_colors: &self.ui.lyrics.bg_colors,
+                        textured_bg_shader: &self.ui.lyrics.textured_bg_shader,
+                        lyrics_engine: self.ui.lyrics.engine.as_ref(),
+                        power_saving_mode: self.core.settings.display.power_saving_mode,
+                        is_liked: if song.id < 0 {
                             let ncm_id = (-song.id) as u64;
                             self.core
                                 .user_info
@@ -106,12 +95,12 @@ impl App {
                         } else {
                             false
                         },
-                        self.playback_cache_progress(),
-                        self.is_fm_mode(),
-                        self.core.window_maximized,
-                        self.ui.lyrics.display_mode,
+                        download_progress: self.playback_cache_progress(),
+                        is_fm_mode: self.is_fm_mode(),
+                        is_maximized: self.core.window_maximized,
+                        display_mode: self.ui.lyrics.display_mode,
                         context,
-                    )
+                    })
                 } else {
                     Space::new().width(0).height(0).into()
                 }
@@ -121,18 +110,20 @@ impl App {
 
         // Left sidebar
         let sidebar = components::sidebar::view(
-            &self.ui.current_route,
-            self.core.locale,
-            self.core.is_logged_in,
-            self.ui.importing_playlist.as_ref(),
-            &self.library.playlists,
-            &self.ui.home.user_playlists,
-            &self.ui.image_state,
-            &self.ui.sidebar_animations,
-            self.ui.sidebar_width,
-            self.ui.my_playlists_expanded,
-            self.ui.collected_playlists_expanded,
-            context,
+            components::sidebar::SidebarView {
+                current_route: &self.ui.current_route,
+                locale: self.core.locale,
+                is_logged_in: self.core.is_logged_in,
+                importing_playlist: self.ui.importing_playlist.as_ref(),
+                playlists: &self.library.playlists,
+                user_playlists: &self.ui.home.user_playlists,
+                image_state: &self.ui.image_state,
+                sidebar_animations: &self.ui.sidebar_animations,
+                sidebar_width: self.ui.sidebar_width,
+                my_playlists_expanded: self.ui.my_playlists_expanded,
+                collected_playlists_expanded: self.ui.collected_playlists_expanded,
+                context,
+            },
             false,
         );
 
@@ -163,24 +154,24 @@ impl App {
             | Route::Album(_)
             | Route::RecentlyPlayed => {
                 if let Some(playlist) = &self.ui.playlist_page.current {
-                    pages::playlist::view(
-                        playlist,
-                        &self.ui.image_state,
-                        &self.ui.playlist_page.song_animations,
-                        &self.ui.playlist_page.icon_animations,
-                        &self.ui.playlist_page.search_animation,
-                        self.ui.playlist_page.search_expanded,
-                        &self.ui.playlist_page.search_query,
+                    pages::playlist::view(pages::playlist::DetailPageView {
+                        detail: playlist,
+                        image_state: &self.ui.image_state,
+                        song_animations: &self.ui.playlist_page.song_animations,
+                        icon_animations: &self.ui.playlist_page.icon_animations,
+                        search_animation: &self.ui.playlist_page.search_animation,
+                        search_expanded: self.ui.playlist_page.search_expanded,
+                        search_query: &self.ui.playlist_page.search_query,
                         liked_songs,
-                        self.core.locale,
-                        self.ui.playlist_page.scroll_state.clone(),
+                        locale: self.core.locale,
+                        scroll_state: self.ui.playlist_page.scroll_state.clone(),
                         current_user_id,
                         current_playing_id,
-                        self.ui.playlist_page.description_expanded,
-                        self.ui.playlist_page.gradient_source(),
-                        self.ui.playlist_page.gradient_animation.progress(),
+                        description_expanded: self.ui.playlist_page.description_expanded,
+                        gradient_source: self.ui.playlist_page.gradient_source(),
+                        gradient_progress: self.ui.playlist_page.gradient_animation.progress(),
                         context,
-                    )
+                    })
                 } else {
                     pages::playlist::gradient_placeholder(self.ui.playlist_page.gradient_source())
                 }
@@ -190,16 +181,7 @@ impl App {
                     pages::user::view(
                         playlist,
                         &self.ui.image_state,
-                        &self.ui.playlist_page.song_animations,
-                        &self.ui.playlist_page.icon_animations,
-                        &self.ui.playlist_page.search_animation,
-                        self.ui.playlist_page.search_expanded,
-                        &self.ui.playlist_page.search_query,
-                        liked_songs,
                         self.core.locale,
-                        self.ui.playlist_page.scroll_state.clone(),
-                        current_user_id,
-                        current_playing_id,
                         self.ui.playlist_page.description_expanded,
                         self.ui.playlist_page.gradient_source(),
                         self.ui.playlist_page.gradient_animation.progress(),
@@ -211,24 +193,24 @@ impl App {
             }
             Route::Artist(_) => {
                 if let Some(playlist) = &self.ui.playlist_page.current {
-                    pages::artist::view(
-                        playlist,
-                        &self.ui.image_state,
-                        &self.ui.playlist_page.song_animations,
-                        &self.ui.playlist_page.icon_animations,
-                        &self.ui.playlist_page.search_animation,
-                        self.ui.playlist_page.search_expanded,
-                        &self.ui.playlist_page.search_query,
+                    pages::artist::view(pages::playlist::DetailPageView {
+                        detail: playlist,
+                        image_state: &self.ui.image_state,
+                        song_animations: &self.ui.playlist_page.song_animations,
+                        icon_animations: &self.ui.playlist_page.icon_animations,
+                        search_animation: &self.ui.playlist_page.search_animation,
+                        search_expanded: self.ui.playlist_page.search_expanded,
+                        search_query: &self.ui.playlist_page.search_query,
                         liked_songs,
-                        self.core.locale,
-                        self.ui.playlist_page.scroll_state.clone(),
+                        locale: self.core.locale,
+                        scroll_state: self.ui.playlist_page.scroll_state.clone(),
                         current_user_id,
                         current_playing_id,
-                        self.ui.playlist_page.description_expanded,
-                        self.ui.playlist_page.gradient_source(),
-                        self.ui.playlist_page.gradient_animation.progress(),
+                        description_expanded: self.ui.playlist_page.description_expanded,
+                        gradient_source: self.ui.playlist_page.gradient_source(),
+                        gradient_progress: self.ui.playlist_page.gradient_animation.progress(),
                         context,
-                    )
+                    })
                 } else {
                     pages::playlist::gradient_placeholder(self.ui.playlist_page.gradient_source())
                 }
@@ -265,19 +247,19 @@ impl App {
             ),
             Route::Settings(section) => {
                 let _ = section;
-                pages::settings::view(
-                    &self.core.settings,
-                    self.audio_output_devices(),
-                    self.lyrics_font_families(),
-                    self.ui.active_settings_section,
-                    self.core.locale,
-                    self.ui.editing_keybinding,
-                    self.core.is_logged_in,
-                    self.core.user_info.as_ref(),
-                    &self.ui.image_state,
-                    self.ui.cache_stats.as_ref(),
+                pages::settings::view(pages::settings::SettingsPageView {
+                    settings: &self.core.settings,
+                    audio_devices: self.audio_output_devices(),
+                    font_families: self.lyrics_font_families(),
+                    active_section: self.ui.active_settings_section,
+                    locale: self.core.locale,
+                    editing_keybinding: self.ui.editing_keybinding,
+                    is_logged_in: self.core.is_logged_in,
+                    user_info: self.core.user_info.as_ref(),
+                    image_state: &self.ui.image_state,
+                    cache_stats: self.ui.cache_stats.as_ref(),
                     context,
-                )
+                })
             }
             Route::AudioEngine => pages::audio_engine::view(
                 &self.core.settings,
@@ -287,18 +269,18 @@ impl App {
             ),
         };
 
-        let top_bar = components::window_controls::view(
+        let top_bar = components::window_controls::view(components::window_controls::TopBarView {
             context,
-            self.core.locale,
-            self.ui.nav_history.can_go_back(),
-            self.ui.nav_history.can_go_forward(),
-            &self.ui.search_query,
-            self.core.is_logged_in,
-            self.core.user_info.as_ref(),
-            &self.ui.image_state,
-            !self.ui.current_route.has_gradient_background(),
-            self.core.window_maximized,
-        );
+            locale: self.core.locale,
+            can_go_back: self.ui.nav_history.can_go_back(),
+            can_go_forward: self.ui.nav_history.can_go_forward(),
+            search_query: &self.ui.search_query,
+            is_logged_in: self.core.is_logged_in,
+            user_info: self.core.user_info.as_ref(),
+            image_state: &self.ui.image_state,
+            show_background: !self.ui.current_route.has_gradient_background(),
+            is_maximized: self.core.window_maximized,
+        });
         let controls_overlay = container(top_bar).width(Fill).padding(0);
 
         // Right panel with content and window controls overlay
@@ -385,24 +367,24 @@ impl App {
                 })
         });
 
-        let player_bar = components::player_bar::view(
+        let player_bar = components::player_bar::view(components::player_bar::PlayerBarView {
             context,
-            self.playback.current_song.as_ref(),
-            &self.playback.current_artists,
+            current_song: self.playback.current_song.as_ref(),
+            current_artists: &self.playback.current_artists,
             is_playing,
-            display_position,
-            duration,
+            position: display_position,
+            duration_secs: duration,
             volume,
-            self.core.settings.play_mode,
+            play_mode: self.core.settings.play_mode,
             current_favorite,
             progress_colors,
             is_buffering,
-            self.playback_cache_progress(),
+            download_progress: self.playback_cache_progress(),
             is_fm_mode,
             is_first_song,
             current_song_cover,
-            self.playback.current_quality.as_ref(),
-        );
+            current_quality: self.playback.current_quality.as_ref(),
+        });
 
         // Queue overlay - full width, positioned above player bar
         let queue_overlay: Element<'_, Message> = if self.ui.queue_visible {
@@ -463,18 +445,20 @@ impl App {
         let sidebar_drawer_overlay: Element<'_, Message> =
             if context.profile.uses_navigation_drawer() && self.ui.sidebar_drawer_visible() {
                 components::sidebar::drawer_view(
-                    &self.ui.current_route,
-                    self.core.locale,
-                    self.core.is_logged_in,
-                    self.ui.importing_playlist.as_ref(),
-                    &self.library.playlists,
-                    &self.ui.home.user_playlists,
-                    &self.ui.image_state,
-                    &self.ui.sidebar_animations,
-                    self.ui.sidebar_width,
-                    self.ui.my_playlists_expanded,
-                    self.ui.collected_playlists_expanded,
-                    context,
+                    components::sidebar::SidebarView {
+                        current_route: &self.ui.current_route,
+                        locale: self.core.locale,
+                        is_logged_in: self.core.is_logged_in,
+                        importing_playlist: self.ui.importing_playlist.as_ref(),
+                        playlists: &self.library.playlists,
+                        user_playlists: &self.ui.home.user_playlists,
+                        image_state: &self.ui.image_state,
+                        sidebar_animations: &self.ui.sidebar_animations,
+                        sidebar_width: self.ui.sidebar_width,
+                        my_playlists_expanded: self.ui.my_playlists_expanded,
+                        collected_playlists_expanded: self.ui.collected_playlists_expanded,
+                        context,
+                    },
                     self.ui.sidebar_drawer_progress(),
                 )
             } else {
@@ -563,14 +547,16 @@ impl App {
                                 watch_path,
                             } => {
                                 let body = components::edit_dialog::view_body(
-                                    name,
-                                    description,
-                                    cover_path.as_deref(),
-                                    *watch_available,
-                                    *watch_enabled,
-                                    watch_path.as_deref(),
-                                    locale,
-                                    context,
+                                    components::edit_dialog::PlaylistEditorView {
+                                        name,
+                                        description,
+                                        cover_path: cover_path.as_deref(),
+                                        watch_available: *watch_available,
+                                        watch_enabled: *watch_enabled,
+                                        watch_path: watch_path.as_deref(),
+                                        locale,
+                                        context,
+                                    },
                                 );
                                 let title =
                                     locale.get(crate::i18n::Key::EditPlaylistTitle).to_string();

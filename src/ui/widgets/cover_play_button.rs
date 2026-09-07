@@ -85,6 +85,6 @@ mod tests {
         assert!(idle.a > 0.0 && idle.a < 1.0);
         assert!(hovered.a > idle.a && hovered.a < 1.0);
         assert!(midpoint.r > idle.r && midpoint.r < hovered.r);
-        assert!(PLAY_ICON_MAX_OPACITY > 0.0 && PLAY_ICON_MAX_OPACITY < 1.0);
+        const { assert!(PLAY_ICON_MAX_OPACITY > 0.0 && PLAY_ICON_MAX_OPACITY < 1.0) };
     }
 }

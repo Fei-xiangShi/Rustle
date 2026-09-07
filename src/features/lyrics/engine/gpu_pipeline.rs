@@ -31,13 +31,25 @@ use parking_lot::RwLock;
 
 use super::CachedShapedLine;
 use super::interlude_dots::{InterludeDots, dot_padding_x, dot_padding_y, dot_size, dot_spacing};
-use super::per_line_blur::{GLOW_TEXTURE_FORMAT, GlowBounds, LineRenderInfo, PerLineBlurRenderer};
+use super::per_line_blur::{
+    GLOW_TEXTURE_FORMAT, GlowBounds, LineRenderInfo, PerLineBlurRenderer, PreparedRenderInput,
+};
 use super::sdf_cache::SdfCache;
 use super::text_shaper::ShapedLine;
 use super::types::{
     ComputedLineStyle, FontConfig, LyricLineData, LyricsLineTraits, emphasis_easing,
 };
 use super::vertex::{GlobalUniform, LineUniform, LyricGlyphVertex};
+
+pub struct InterludeDotsPreparation<'a> {
+    pub device: &'a Device,
+    pub queue: &'a Queue,
+    pub dots: &'a InterludeDots,
+    pub viewport_size: [f32; 2],
+    pub bounds_origin: [f32; 2],
+    pub scale_factor: f32,
+    pub logical_font_size: f32,
+}
 
 fn lyrics_plus_lighter_blend() -> wgpu::BlendState {
     wgpu::BlendState {
@@ -517,7 +529,10 @@ impl LyricsGpuPipeline {
     ///
     /// The shaped_lines contain all glyph positions calculated by LyricsEngine,
     /// so we don't need to call shape_line again here.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GPU frame preparation borrows renderer-owned data without cloning; remove when LyricsFrameInput owns the complete frame snapshot"
+    )]
     pub fn prepare_with_shaped_lines(
         &mut self,
         device: &Device,
@@ -636,7 +651,10 @@ impl LyricsGpuPipeline {
     /// - No shape_line calls - uses pre-computed glyph positions
     /// - Glyph positions are in LOGICAL pixels, scaled to physical for rendering
     /// - Translation and romanized text also use pre-shaped data
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "geometry builder consumes a normalized shaped-frame contract; remove when ShapedGeometryInput groups these immutable values"
+    )]
     fn build_geometry_from_shaped(
         &mut self,
         queue: &Queue,
@@ -980,7 +998,10 @@ impl LyricsGpuPipeline {
     }
 
     /// Add glyphs from pre-shaped line data (for translation/romanized)
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "glyph emission is a private renderer leaf over one shaped run; remove when ShapedGlyphRun owns the run metadata"
+    )]
     fn add_shaped_glyphs_to_line(
         &mut self,
         queue: &Queue,
@@ -1124,18 +1145,16 @@ impl LyricsGpuPipeline {
     }
 
     /// Prepare interlude dots for rendering
-    pub fn prepare_interlude_dots(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        dots: &InterludeDots,
-        viewport_width: f32,
-        viewport_height: f32,
-        bounds_x: f32,
-        bounds_y: f32,
-        scale_factor: f32,
-        logical_font_size: f32,
-    ) {
+    pub fn prepare_interlude_dots(&mut self, preparation: InterludeDotsPreparation<'_>) {
+        let InterludeDotsPreparation {
+            device,
+            queue,
+            dots,
+            viewport_size,
+            bounds_origin,
+            scale_factor,
+            logical_font_size,
+        } = preparation;
         self.dots_enabled = dots.enabled && dots.scale > 0.01;
 
         if !self.dots_enabled {
@@ -1144,8 +1163,8 @@ impl LyricsGpuPipeline {
 
         let dots_uniform = DotsUniform::from_interlude_dots(
             dots,
-            [viewport_width, viewport_height],
-            [bounds_x, bounds_y],
+            viewport_size,
+            bounds_origin,
             scale_factor,
             logical_font_size,
         );
@@ -1278,14 +1297,16 @@ impl LyricsGpuPipeline {
         }
 
         // 使用逐行模糊渲染器
-        self.per_line_blur.read().render_prepared(
-            encoder,
-            target,
-            clip_bounds,
-            &self.offscreen_pipeline,
-            &self.glow_mask_pipeline,
-            &self.vertex_buffer,
-            &self.index_buffer,
-        );
+        self.per_line_blur
+            .read()
+            .render_prepared(PreparedRenderInput {
+                encoder,
+                target,
+                clip_bounds,
+                text_pipeline: &self.offscreen_pipeline,
+                glow_pipeline: &self.glow_mask_pipeline,
+                vertex_buffer: &self.vertex_buffer,
+                index_buffer: &self.index_buffer,
+            });
     }
 }

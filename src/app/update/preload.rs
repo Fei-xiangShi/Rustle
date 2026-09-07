@@ -21,6 +21,16 @@ use super::audio_preload_manager::{self, PreloadDirection, SlotState};
 use super::player_controller::PlaybackSource;
 use super::queue_navigator;
 
+struct PreloadBufferReady {
+    idx: usize,
+    finalized_cache_path: Option<String>,
+    direction: PreloadDirection,
+    buffer: crate::audio::SharedBuffer,
+    duration_secs: u64,
+    quality: Option<super::song_resolver::ResolvedAudioQuality>,
+    request_identity: PreloadIdentity,
+}
+
 impl App {
     fn release_preload_request_ids<I>(&self, request_ids: I)
     where
@@ -228,15 +238,15 @@ impl App {
                 duration_secs,
                 quality,
                 identity,
-            ) => self.handle_preload_buffer_ready(
-                *idx,
-                finalized_cache_path.clone(),
-                *direction,
-                buffer.clone(),
-                *duration_secs,
-                quality.clone(),
-                identity.clone(),
-            ),
+            ) => self.handle_preload_buffer_ready(PreloadBufferReady {
+                idx: *idx,
+                finalized_cache_path: finalized_cache_path.clone(),
+                direction: *direction,
+                buffer: buffer.clone(),
+                duration_secs: *duration_secs,
+                quality: quality.clone(),
+                request_identity: identity.clone(),
+            }),
 
             Message::PreloadAudioFailed(idx, direction, identity) => {
                 tracing::warn!("Preload failed ({}): idx={}", direction, idx);
@@ -387,16 +397,16 @@ impl App {
     }
 
     /// Handle preload ready with SharedBuffer (streaming playback)
-    fn handle_preload_buffer_ready(
-        &mut self,
-        idx: usize,
-        finalized_cache_path: Option<String>,
-        direction: PreloadDirection,
-        buffer: crate::audio::SharedBuffer,
-        duration_secs: u64,
-        quality: Option<super::song_resolver::ResolvedAudioQuality>,
-        request_identity: PreloadIdentity,
-    ) -> Option<Task<Message>> {
+    fn handle_preload_buffer_ready(&mut self, ready: PreloadBufferReady) -> Option<Task<Message>> {
+        let PreloadBufferReady {
+            idx,
+            finalized_cache_path,
+            direction,
+            buffer,
+            duration_secs,
+            quality,
+            request_identity,
+        } = ready;
         if !self.playback.audio_preload_manager.has_pending_request(
             idx,
             direction,

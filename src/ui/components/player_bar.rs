@@ -172,25 +172,45 @@ fn artist_target_message(target: ArtistTarget) -> Message {
     }
 }
 
+pub struct PlayerBarView<'a> {
+    pub context: ResponsiveContext,
+    pub current_song: Option<&'a DbSong>,
+    pub current_artists: &'a [ArtistSummary],
+    pub is_playing: bool,
+    pub position: f32,
+    pub duration_secs: f32,
+    pub volume: f32,
+    pub play_mode: PlayMode,
+    pub current_favorite: Option<(u64, bool)>,
+    pub progress_colors: Option<[Color; 3]>,
+    pub is_buffering: bool,
+    pub download_progress: Option<f32>,
+    pub is_fm_mode: bool,
+    pub is_first_song: bool,
+    pub current_song_cover: Option<&'a iced::widget::image::Handle>,
+    pub current_quality: Option<&'a crate::app::ResolvedAudioQuality>,
+}
+
 /// Build the player bar
-pub fn view(
-    context: ResponsiveContext,
-    current_song: Option<&DbSong>,
-    current_artists: &[ArtistSummary],
-    is_playing: bool,
-    position: f32, // 0.0 to 1.0
-    duration_secs: f32,
-    volume: f32, // 0.0 to 1.0
-    play_mode: PlayMode,
-    current_favorite: Option<(u64, bool)>,
-    progress_colors: Option<[Color; 3]>,
-    is_buffering: bool,             // Whether streaming is buffering
-    download_progress: Option<f32>, // Download progress 0.0 to 1.0 (None if not streaming)
-    is_fm_mode: bool,               // Whether in Personal FM mode
-    is_first_song: bool,            // Whether at first song in queue
-    current_song_cover: Option<&iced::widget::image::Handle>,
-    current_quality: Option<&crate::app::ResolvedAudioQuality>,
-) -> Element<'static, Message> {
+pub fn view(props: PlayerBarView<'_>) -> Element<'static, Message> {
+    let PlayerBarView {
+        context,
+        current_song,
+        current_artists,
+        is_playing,
+        position,
+        duration_secs,
+        volume,
+        play_mode,
+        current_favorite,
+        progress_colors,
+        is_buffering,
+        download_progress,
+        is_fm_mode,
+        is_first_song,
+        current_song_cover,
+        current_quality,
+    } = props;
     let current_time = utils::format_time(position * duration_secs);
     let total_time = utils::format_time(duration_secs);
 
@@ -262,7 +282,10 @@ pub fn view(
     opaque(bar)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private renderer receives the already-normalized player-bar snapshot; remove when PlayerBarBodyView owns this derived layout state"
+)]
 fn build_body(
     current_song: Option<&DbSong>,
     current_artists: &[ArtistSummary],
@@ -301,17 +324,19 @@ fn build_body(
     let favorite_state = current_favorite.map(|(_, liked)| liked);
     let favorite_action = current_favorite.map(|(song_id, _)| Message::ToggleFavorite(song_id));
     let controls = widgets::playback_controls::view_player_bar(
-        is_playing,
-        is_buffering,
-        ControlSize::Small,
-        tokens,
-        is_fm_mode && is_first_song,
-        mode_button,
-        prev_action,
-        Message::TogglePlayback,
-        Message::NextSong,
-        favorite_state,
-        favorite_action,
+        widgets::playback_controls::PlayerBarControls {
+            is_playing,
+            is_buffering,
+            size: ControlSize::Small,
+            tokens,
+            prev_disabled: is_fm_mode && is_first_song,
+            play_mode_button: mode_button,
+            prev_action,
+            play_action: Message::TogglePlayback,
+            next_action: Message::NextSong,
+            favorite: favorite_state,
+            favorite_action,
+        },
     );
 
     let right_section = build_right_section(

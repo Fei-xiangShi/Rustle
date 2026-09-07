@@ -103,12 +103,11 @@ fn convert_ncm_playlist_chunks(
                     .await
                     .unwrap_or_default();
                     let is_last = batch_index + 1 == batch_count;
-                    if is_last {
-                        if let Some(mut detail) = cache_detail.take() {
+                    if is_last
+                        && let Some(mut detail) = cache_detail.take() {
                             detail.tracks = all_tracks.clone();
                             crate::cache::save_ncm_playlist_cache(&detail).await;
                         }
-                    }
                     yield Message::NcmPlaylistSongsChunk(
                         generation,
                         playlist_id,
@@ -175,12 +174,11 @@ fn fetch_ncm_playlist_chunks(
                     .await
                     .unwrap_or_default();
                     let is_last = batch_index + 1 == batch_count;
-                    if is_last {
-                        if let Some(mut detail) = cache_detail.take() {
+                    if is_last
+                        && let Some(mut detail) = cache_detail.take() {
                             detail.tracks = all_tracks.clone();
                             crate::cache::save_ncm_playlist_cache(&detail).await;
                         }
-                    }
                     yield Message::NcmPlaylistSongsChunk(
                         generation,
                         playlist_id,
@@ -1064,11 +1062,11 @@ impl App {
             }
 
             Message::AddNcmPlaylist(songs, play_now) => {
-                return self.handle_ncm_playlist_queue(songs, *play_now, None);
+                self.handle_ncm_playlist_queue(songs, *play_now, None)
             }
 
             Message::AddNcmPlaylistWithSource(songs, play_now, source_id) => {
-                return self.handle_ncm_playlist_queue(songs, *play_now, *source_id);
+                self.handle_ncm_playlist_queue(songs, *play_now, *source_id)
             }
 
             Message::UserPlaylistsLoaded(playlists) => {
@@ -1622,7 +1620,6 @@ impl App {
 
                 let albums_task = if let Some(client) = &self.core.ncm_client {
                     let client = client.clone();
-                    let page_id = page_id;
                     let artist_id = detail.id;
                     Task::perform(
                         async move {
@@ -2020,9 +2017,7 @@ impl App {
                 {
                     let client = client.clone();
                     async move {
-                        let Some(client) = client else {
-                            return None;
-                        };
+                        let client = client?;
                         match client.recommend_tracks().await {
                             Ok(tracks) => tracks.into_iter().next(),
                             Err(e) => {
@@ -2058,9 +2053,7 @@ impl App {
                 {
                     let client = client.clone();
                     async move {
-                        let Some(client) = client else {
-                            return None;
-                        };
+                        let client = client?;
                         match client
                             .playlist_detail_preview(PRIVATE_RADAR_PLAYLIST_ID)
                             .await

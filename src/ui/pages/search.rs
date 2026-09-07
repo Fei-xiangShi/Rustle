@@ -171,7 +171,8 @@ fn view_for_context<'a>(
                                         })
                                         .into()
                                 };
-                            let song_row = search_song_row(
+
+                            search_song_row(
                                 song,
                                 index_num,
                                 duration_str,
@@ -179,8 +180,7 @@ fn view_for_context<'a>(
                                 availability_badge,
                                 hover_progress,
                                 context,
-                            );
-                            song_row
+                            )
                         })
                         .keyed_by(move |index| {
                             songs
@@ -609,17 +609,17 @@ fn grid_results<'a>(
                 let item_tab = tab;
 
                 let cover_handle = image_state.get(kind, item_id);
-                let card = grid_card(
-                    *item,
+                let card = grid_card(GridCardView {
+                    item: *item,
                     cover_handle,
                     kind,
                     hover_progress,
                     item_id,
-                    item_tab,
+                    tab: item_tab,
                     card_width,
-                    card_metrics.radius,
+                    card_radius: card_metrics.radius,
                     tokens,
-                );
+                });
                 row_items.push(card);
             }
 
@@ -639,7 +639,7 @@ fn grid_results<'a>(
 }
 
 /// Grid card for album/playlist
-fn grid_card<'a>(
+struct GridCardView<'a> {
     item: GridItemRef<'a>,
     cover_handle: Option<&'a iced::widget::image::Handle>,
     kind: ImageKind,
@@ -649,7 +649,20 @@ fn grid_card<'a>(
     card_width: f32,
     card_radius: f32,
     tokens: crate::ui::responsive::UiTokens,
-) -> Element<'a, Message> {
+}
+
+fn grid_card<'a>(view: GridCardView<'a>) -> Element<'a, Message> {
+    let GridCardView {
+        item,
+        cover_handle,
+        kind,
+        hover_progress,
+        item_id,
+        tab,
+        card_width,
+        card_radius,
+        tokens,
+    } = view;
     let has_cover = cover_handle.is_some();
 
     let cover: Element<'a, Message> = container(cover_image::custom(

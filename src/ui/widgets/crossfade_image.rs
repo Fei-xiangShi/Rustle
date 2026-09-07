@@ -292,7 +292,10 @@ pub fn crossfade_image(handle: Option<image::Handle>) -> CrossfadeImage {
     CrossfadeImage::new(handle)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "renderer leaf mirrors iced draw state and two image layers; remove when CrossfadeDrawContext owns the renderer inputs"
+)]
 fn draw_image<Renderer>(
     renderer: &mut Renderer,
     layout: Layout<'_>,

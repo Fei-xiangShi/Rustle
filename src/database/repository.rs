@@ -91,20 +91,8 @@ impl Database {
         ops::refresh_song_metadata(&self.pool, song).await
     }
 
-    pub async fn insert_download(
-        &self,
-        song_id: i64,
-        ncm_id: u64,
-        title: &str,
-        artist: &str,
-        file_path: &str,
-        file_size: u64,
-        quality: &str,
-    ) -> anyhow::Result<()> {
-        ops::insert_download(
-            &self.pool, song_id, ncm_id, title, artist, file_path, file_size, quality,
-        )
-        .await?;
+    pub async fn insert_download(&self, download: NewDownload<'_>) -> anyhow::Result<()> {
+        ops::insert_download(&self.pool, download).await?;
         Ok(())
     }
 

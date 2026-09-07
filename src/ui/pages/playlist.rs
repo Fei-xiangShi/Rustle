@@ -98,27 +98,33 @@ pub enum ArtistPageTab {
 /// Song item in playlist (alias for SongItem)
 pub type PlaylistSongView = SongItem;
 
+pub struct DetailPageView<'a> {
+    pub detail: &'a PlaylistView,
+    pub image_state: &'a ImageState,
+    pub song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
+    pub icon_animations: &'a crate::ui::animation::HoverAnimations<crate::app::IconId>,
+    pub search_animation: &'a crate::ui::animation::SingleHoverAnimation,
+    pub search_expanded: bool,
+    pub search_query: &'a str,
+    pub liked_songs: Option<&'a HashSet<u64>>,
+    pub locale: Locale,
+    pub scroll_state: Rc<RefCell<VirtualListState>>,
+    pub current_user_id: Option<u64>,
+    pub current_playing_id: Option<i64>,
+    pub description_expanded: bool,
+    pub gradient_source: Option<DetailGradientSnapshot>,
+    pub gradient_progress: f32,
+    pub context: ResponsiveContext,
+}
+
 /// Build the playlist detail page
-pub fn view<'a>(
-    playlist: &'a PlaylistView,
-    image_state: &'a ImageState,
-    song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
-    icon_animations: &'a crate::ui::animation::HoverAnimations<crate::app::IconId>,
-    search_animation: &'a crate::ui::animation::SingleHoverAnimation,
-    search_expanded: bool,
-    search_query: &'a str,
-    liked_songs: Option<&'a HashSet<u64>>,
-    locale: Locale,
-    scroll_state: Rc<RefCell<VirtualListState>>,
-    current_user_id: Option<u64>,
-    current_playing_id: Option<i64>,
-    description_expanded: bool,
-    gradient_source: Option<DetailGradientSnapshot>,
-    gradient_progress: f32,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
-    view_for_context(
-        playlist,
+pub fn view<'a>(view: DetailPageView<'a>) -> Element<'a, Message> {
+    view_for_context(view)
+}
+
+fn view_for_context<'a>(view: DetailPageView<'a>) -> Element<'a, Message> {
+    let DetailPageView {
+        detail: playlist,
         image_state,
         song_animations,
         icon_animations,
@@ -134,28 +140,8 @@ pub fn view<'a>(
         gradient_source,
         gradient_progress,
         context,
-    )
-}
-
-fn view_for_context<'a>(
-    playlist: &'a PlaylistView,
-    image_state: &'a ImageState,
-    song_animations: &'a crate::ui::animation::HoverAnimations<i64>,
-    icon_animations: &crate::ui::animation::HoverAnimations<crate::app::IconId>,
-    search_animation: &crate::ui::animation::SingleHoverAnimation,
-    search_expanded: bool,
-    search_query: &str,
-    liked_songs: Option<&'a HashSet<u64>>,
-    locale: Locale,
-    scroll_state: Rc<RefCell<VirtualListState>>,
-    current_user_id: Option<u64>,
-    current_playing_id: Option<i64>,
-    description_expanded: bool,
-    gradient_source: Option<DetailGradientSnapshot>,
-    gradient_progress: f32,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
-    let controls = build_controls(
+    } = view;
+    let controls = build_controls(DetailControls {
         playlist,
         icon_animations,
         search_animation,
@@ -164,7 +150,7 @@ fn view_for_context<'a>(
         locale,
         current_user_id,
         context,
-    );
+    });
     let header = build_header(
         playlist,
         image_state,
@@ -193,8 +179,8 @@ fn view_for_context<'a>(
     let song_list_header = playlist_view::build_header(locale, columns, context);
 
     // Use virtual list for song rows
-    let song_list = playlist_view::build_list(
-        &playlist.songs,
+    let song_list = playlist_view::build_list(playlist_view::SongListView {
+        songs: &playlist.songs,
         filtered_indices,
         image_state,
         song_animations,
@@ -203,7 +189,7 @@ fn view_for_context<'a>(
         scroll_state,
         current_playing_id,
         context,
-    );
+    });
 
     let content = column![gradient_section, song_list_header, song_list,]
         .spacing(0)
@@ -769,7 +755,7 @@ fn playlist_owner_avatar_handle<'a>(
         .and_then(|id| image_state.get(crate::image::ImageKind::ArtistCover, id))
 }
 
-fn capsule_action_button<'a>(
+struct CapsuleAction {
     label: String,
     icon_svg: &'static str,
     icon_id: crate::app::IconId,
@@ -778,7 +764,19 @@ fn capsule_action_button<'a>(
     selected: bool,
     hover_progress: f32,
     tokens: UiTokens,
-) -> Element<'a, Message> {
+}
+
+fn capsule_action_button(action: CapsuleAction) -> Element<'static, Message> {
+    let CapsuleAction {
+        label,
+        icon_svg,
+        icon_id,
+        on_press,
+        emphasized,
+        selected,
+        hover_progress,
+        tokens,
+    } = action;
     let height = tokens.target(TargetRole::Control);
     let icon_size = tokens.icon(IconRole::Medium);
     let horizontal_padding = tokens.space(14.0);
@@ -881,16 +879,28 @@ fn emphasized_capsule_background(hover_progress: f32, pressed: bool) -> Color {
 }
 
 /// Build the control buttons (play, like, download, etc.)
-pub(crate) fn build_controls<'a>(
-    playlist: &PlaylistView,
-    icon_animations: &crate::ui::animation::HoverAnimations<crate::app::IconId>,
-    search_animation: &crate::ui::animation::SingleHoverAnimation,
-    search_expanded: bool,
-    search_query: &str,
-    locale: Locale,
-    current_user_id: Option<u64>,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
+pub(crate) struct DetailControls<'a> {
+    pub playlist: &'a PlaylistView,
+    pub icon_animations: &'a crate::ui::animation::HoverAnimations<crate::app::IconId>,
+    pub search_animation: &'a crate::ui::animation::SingleHoverAnimation,
+    pub search_expanded: bool,
+    pub search_query: &'a str,
+    pub locale: Locale,
+    pub current_user_id: Option<u64>,
+    pub context: ResponsiveContext,
+}
+
+pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Message> {
+    let DetailControls {
+        playlist,
+        icon_animations,
+        search_animation,
+        search_expanded,
+        search_query,
+        locale,
+        current_user_id,
+        context,
+    } = view;
     use crate::app::IconId;
 
     let tokens = context.tokens;
@@ -912,16 +922,16 @@ pub(crate) fn build_controls<'a>(
     };
 
     let action_height = tokens.target(TargetRole::Control);
-    let play_btn = capsule_action_button(
-        locale.get(Key::PlaylistPlayAll).to_string(),
-        icons::PLAY,
-        IconId::PlayButton,
-        Message::PlayPlaylist(playlist_id),
-        true,
-        false,
-        icon_animations.get_progress(&IconId::PlayButton),
+    let play_btn = capsule_action_button(CapsuleAction {
+        label: locale.get(Key::PlaylistPlayAll).to_string(),
+        icon_svg: icons::PLAY,
+        icon_id: IconId::PlayButton,
+        on_press: Message::PlayPlaylist(playlist_id),
+        emphasized: true,
+        selected: false,
+        hover_progress: icon_animations.get_progress(&IconId::PlayButton),
         tokens,
-    );
+    });
 
     // Build controls row
     let mut action_items: Vec<Element<'a, Message>> = vec![play_btn];
@@ -987,34 +997,34 @@ pub(crate) fn build_controls<'a>(
             } else {
                 icons::HEART_OUTLINE
             };
-            let like_btn = capsule_action_button(
-                locale.get(like_label).to_string(),
-                heart_icon,
-                IconId::Like,
-                Message::TogglePlaylistSubscribe(playlist_id),
-                false,
-                is_subscribed,
-                icon_animations.get_progress(&IconId::Like),
+            let like_btn = capsule_action_button(CapsuleAction {
+                label: locale.get(like_label).to_string(),
+                icon_svg: heart_icon,
+                icon_id: IconId::Like,
+                on_press: Message::TogglePlaylistSubscribe(playlist_id),
+                emphasized: false,
+                selected: is_subscribed,
+                hover_progress: icon_animations.get_progress(&IconId::Like),
                 tokens,
-            );
+            });
 
             action_items.push(like_btn);
         }
 
-        let download_btn = capsule_action_button(
-            locale.get(Key::PlaylistDownload).to_string(),
-            icons::DOWNLOAD,
-            IconId::Download,
-            Message::RequestDownloadPlaylist(
+        let download_btn = capsule_action_button(CapsuleAction {
+            label: locale.get(Key::PlaylistDownload).to_string(),
+            icon_svg: icons::DOWNLOAD,
+            icon_id: IconId::Download,
+            on_press: Message::RequestDownloadPlaylist(
                 playlist_id,
                 playlist.name.clone(),
                 playlist.song_count,
             ),
-            false,
-            false,
-            icon_animations.get_progress(&IconId::Download),
+            emphasized: false,
+            selected: false,
+            hover_progress: icon_animations.get_progress(&IconId::Download),
             tokens,
-        );
+        });
 
         action_items.push(download_btn);
     }

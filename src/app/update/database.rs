@@ -437,19 +437,30 @@ impl App {
                         let meta = crate::metadata::SongMetadata::from(song);
 
                         pages::PlaylistSongView::new(
-                            song.id,
-                            crate::image::song_cover_key_for_source(song.id, &song.file_path),
-                            None,
-                            i + 1,
-                            meta.title.clone(),
-                            meta.artist.clone(),
-                            meta.album.clone(),
-                            meta.duration_display(),
-                            self.core
-                                .locale
-                                .get(crate::i18n::Key::RecentlyPlayedList)
-                                .to_string(),
-                            crate::utils::compute_source(&song.file_path, song.id, None, None),
+                            crate::ui::components::playlist_view::SongItemData {
+                                id: song.id,
+                                cover_key: crate::image::song_cover_key_for_source(
+                                    song.id,
+                                    &song.file_path,
+                                ),
+                                cover_url: None,
+                                index: i + 1,
+                                title: meta.title.clone(),
+                                artist: meta.artist.clone(),
+                                album: meta.album.clone(),
+                                duration: meta.duration_display(),
+                                added_date: self
+                                    .core
+                                    .locale
+                                    .get(crate::i18n::Key::RecentlyPlayedList)
+                                    .to_string(),
+                                source: crate::utils::compute_source(
+                                    &song.file_path,
+                                    song.id,
+                                    None,
+                                    None,
+                                ),
+                            },
                         )
                     })
                     .collect();

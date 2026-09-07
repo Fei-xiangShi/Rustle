@@ -22,6 +22,8 @@ use std::ops::RangeInclusive;
 
 use crate::ui::responsive::UiTokens;
 
+type SliderStyleFn<'a> = Box<dyn Fn(&Theme, Status) -> Style + 'a>;
+
 /// Multi-track slider widget
 pub struct MultiTrackSlider<'a, Message> {
     range: RangeInclusive<f32>,
@@ -33,7 +35,7 @@ pub struct MultiTrackSlider<'a, Message> {
     on_release: Option<Message>,
     width: Length,
     height: f32,
-    style: Box<dyn Fn(&Theme, Status) -> Style + 'a>,
+    style: SliderStyleFn<'a>,
     status: Option<Status>,
 }
 

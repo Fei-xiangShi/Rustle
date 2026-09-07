@@ -13,7 +13,10 @@ const PLAY_BUTTON_END_OFFSET: f32 = 4.0;
 const HOVER_MASK_MAX_ALPHA: f32 = 0.24;
 const HOVER_IMAGE_SCALE: f32 = 1.06;
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generic playlist card keeps data and message types decoupled; remove when PlaylistCardView is introduced"
+)]
 pub(crate) fn view_with_metrics<'a, Message: Clone + 'a>(
     name: &'a str,
     cover_handle: Option<&'a iced::widget::image::Handle>,

@@ -349,6 +349,21 @@ fn divider_padding(tokens: crate::ui::responsive::UiTokens) -> Padding {
         .right(0.0)
 }
 
+// ── Theme-aware helpers ────────────────────────────
+
+fn glass(t: &iced::Theme) -> Color {
+    let s = theme::surface(t);
+    Color::from_rgba(s.r, s.g, s.b, 0.92)
+}
+
+fn glass_border(t: &iced::Theme) -> Color {
+    if theme::is_dark_theme(t) {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.07)
+    } else {
+        Color::from_rgba(0.0, 0.0, 0.0, 0.08)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{divider_padding, item_content_padding};
@@ -366,20 +381,5 @@ mod tests {
         assert_eq!(divider.right, 0.0);
         assert!(divider.top > 0.0);
         assert_eq!(divider.top, divider.bottom);
-    }
-}
-
-// ── Theme-aware helpers ────────────────────────────
-
-fn glass(t: &iced::Theme) -> Color {
-    let s = theme::surface(t);
-    Color::from_rgba(s.r, s.g, s.b, 0.92)
-}
-
-fn glass_border(t: &iced::Theme) -> Color {
-    if theme::is_dark_theme(t) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.07)
-    } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.08)
     }
 }

@@ -10,17 +10,29 @@ use crate::ui::responsive::{
 };
 use crate::ui::{icons, theme, widgets};
 
+pub struct PlaylistEditorView<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub cover_path: Option<&'a str>,
+    pub watch_available: bool,
+    pub watch_enabled: bool,
+    pub watch_path: Option<&'a str>,
+    pub locale: Locale,
+    pub context: ResponsiveContext,
+}
+
 /// Render the playlist editor with token-scaled controls and a stacked tablet fallback.
-pub fn view_body<'a>(
-    name: &str,
-    description: &str,
-    cover_path: Option<&str>,
-    watch_available: bool,
-    watch_enabled: bool,
-    watch_path: Option<&'a str>,
-    locale: Locale,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
+pub fn view_body<'a>(props: PlaylistEditorView<'a>) -> Element<'a, Message> {
+    let PlaylistEditorView {
+        name,
+        description,
+        cover_path,
+        watch_available,
+        watch_enabled,
+        watch_path,
+        locale,
+        context,
+    } = props;
     let tokens = context.tokens;
     let cover_size = tokens.size(120.0);
     let cover_radius = tokens.cover_radius(CoverRadiusRole::Card);

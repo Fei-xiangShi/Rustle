@@ -25,7 +25,7 @@ tracing-subscriber = "0.3.23"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
+all = { level = "deny", priority = -1 }
 
 [package]
 name = "rustle"

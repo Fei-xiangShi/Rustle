@@ -37,6 +37,8 @@ const BUFFER_ITEMS: usize = 8;
 /// This keeps initial image demand bounded while the widget is bootstrapping.
 const INITIAL_VIEWPORT_ITEMS: usize = 10;
 
+type VisibleRangeCallback<'a, Message> = Box<dyn Fn((usize, usize)) -> Message + 'a>;
+
 /// Events that must reach every mounted row because child widgets may own
 /// lifecycle, focus, or clipboard state that is independent of pointer hit
 /// testing. In particular, stateful image widgets synchronize new handles on
@@ -140,328 +142,6 @@ impl VirtualListState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{VirtualList, VirtualListState};
-    use crate::ui::responsive::UiTokens;
-    use iced::advanced::Shell;
-    use iced::advanced::layout::{self, Layout};
-    use iced::advanced::renderer;
-    use iced::advanced::widget::{Tree, Widget};
-    use iced::mouse::{self, Cursor};
-    use iced::time::Instant;
-    use iced::{Background, Element, Event, Length, Point, Rectangle, Size, Transformation};
-    use iced_runtime::UserInterface;
-    use iced_runtime::user_interface::Cache;
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
-    struct EventProbe {
-        redraw_count: Rc<Cell<usize>>,
-        pointer_count: Rc<Cell<usize>>,
-    }
-
-    #[derive(Default)]
-    struct LayerRecordingRenderer {
-        layers: Vec<Rectangle>,
-    }
-
-    impl renderer::Renderer for LayerRecordingRenderer {
-        fn start_layer(&mut self, bounds: Rectangle) {
-            self.layers.push(bounds);
-        }
-
-        fn end_layer(&mut self) {}
-
-        fn start_transformation(&mut self, _transformation: Transformation) {}
-
-        fn end_transformation(&mut self) {}
-
-        fn fill_quad(&mut self, _quad: renderer::Quad, _background: impl Into<Background>) {}
-
-        fn allocate_image(
-            &self,
-            _handle: &iced::advanced::image::Handle,
-            _callback: impl FnOnce(
-                Result<iced::advanced::image::Allocation, iced::advanced::image::Error>,
-            ) + Send
-            + 'static,
-        ) {
-        }
-
-        fn hint(&mut self, _scale: renderer::Scale) {}
-
-        fn scale(&self) -> Option<renderer::Scale> {
-            None
-        }
-
-        fn reset(&mut self, _new_bounds: Rectangle) {}
-
-        fn settings(&self) -> renderer::Settings {
-            renderer::Settings::default()
-        }
-    }
-
-    struct DrawViewportProbe {
-        viewports: Rc<RefCell<Vec<Rectangle>>>,
-    }
-
-    impl Widget<(), (), LayerRecordingRenderer> for DrawViewportProbe {
-        fn size(&self) -> Size<Length> {
-            Size::new(Length::Fill, Length::Fixed(50.0))
-        }
-
-        fn layout(
-            &mut self,
-            _tree: &mut Tree,
-            _renderer: &LayerRecordingRenderer,
-            limits: &layout::Limits,
-        ) -> layout::Node {
-            layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(50.0), Size::ZERO))
-        }
-
-        fn draw(
-            &self,
-            _tree: &Tree,
-            _renderer: &mut LayerRecordingRenderer,
-            _theme: &(),
-            _style: &renderer::Style,
-            _layout: Layout<'_>,
-            _cursor: Cursor,
-            viewport: &Rectangle,
-        ) {
-            self.viewports.borrow_mut().push(*viewport);
-        }
-    }
-
-    impl<Message> Widget<Message, (), ()> for EventProbe {
-        fn size(&self) -> Size<Length> {
-            Size::new(Length::Fill, Length::Fixed(50.0))
-        }
-
-        fn layout(
-            &mut self,
-            _tree: &mut Tree,
-            _renderer: &(),
-            limits: &layout::Limits,
-        ) -> layout::Node {
-            layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(50.0), Size::ZERO))
-        }
-
-        fn update(
-            &mut self,
-            _tree: &mut Tree,
-            event: &Event,
-            _layout: Layout<'_>,
-            _cursor: Cursor,
-            _renderer: &(),
-            _shell: &mut Shell<'_, Message>,
-            _viewport: &Rectangle,
-        ) {
-            if matches!(
-                event,
-                Event::Window(iced::window::Event::RedrawRequested(_))
-            ) {
-                self.redraw_count.set(self.redraw_count.get() + 1);
-            }
-            if matches!(
-                event,
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-            ) {
-                self.pointer_count.set(self.pointer_count.get() + 1);
-            }
-        }
-
-        fn draw(
-            &self,
-            _tree: &Tree,
-            _renderer: &mut (),
-            _theme: &(),
-            _style: &renderer::Style,
-            _layout: Layout<'_>,
-            _cursor: Cursor,
-            _viewport: &Rectangle,
-        ) {
-        }
-    }
-
-    #[test]
-    fn visible_range_includes_overscan_and_stays_within_item_count() {
-        let mut state = VirtualListState::new(20, 50.0);
-        state.update(20, 50.0, 200.0);
-
-        assert_eq!(state.visible_range(), (0, 13));
-
-        state.scroll_offset = 500.0;
-        assert_eq!(state.visible_range(), (2, 20));
-    }
-
-    #[test]
-    fn visible_range_has_bounded_bootstrap_before_layout() {
-        let state = VirtualListState::new(100, 50.0);
-
-        assert_eq!(state.visible_range(), (0, 18));
-    }
-
-    #[test]
-    fn immediate_scrolling_and_jumps_are_clamped() {
-        let mut state = VirtualListState::new(20, 50.0);
-        state.update(20, 50.0, 200.0);
-
-        assert_eq!(state.scroll_by_immediate(120.0), 120.0);
-        assert_eq!(state.scroll_offset, 120.0);
-
-        assert_eq!(state.scroll_by_immediate(-500.0), -120.0);
-        assert_eq!(state.scroll_offset, 0.0);
-
-        state.jump_to(f32::MAX);
-        assert_eq!(state.scroll_offset, 800.0);
-    }
-
-    #[test]
-    fn redraw_events_reach_visible_children() {
-        let redraw_count = Rc::new(Cell::new(0));
-        let probe_count = Rc::clone(&redraw_count);
-        let list: VirtualList<'_, (), (), ()> =
-            VirtualList::new(1, 50.0, UiTokens::default(), move |_| {
-                Element::new(EventProbe {
-                    redraw_count: Rc::clone(&probe_count),
-                    pointer_count: Rc::new(Cell::new(0)),
-                })
-            })
-            .scrollbar(false);
-        let mut renderer = ();
-        let mut user_interface = UserInterface::build(
-            list,
-            Size::new(200.0, 100.0),
-            Cache::default(),
-            &mut renderer,
-        );
-        let redraw = Event::Window(iced::window::Event::RedrawRequested(Instant::now()));
-        let window = iced::window::Headless;
-        let waker = iced::advanced::shell::Waker::noop();
-        let mut messages = iced::advanced::shell::Bus::new();
-
-        user_interface.update(
-            &window,
-            &waker,
-            &[redraw],
-            Cursor::Unavailable,
-            &mut renderer,
-            &mut messages,
-        );
-
-        assert_eq!(redraw_count.get(), 1);
-    }
-
-    #[test]
-    fn initial_redraw_publishes_the_visible_range() {
-        let list: VirtualList<'_, (usize, usize), (), ()> =
-            VirtualList::new(100, 50.0, UiTokens::default(), move |_| {
-                Element::new(EventProbe {
-                    redraw_count: Rc::new(Cell::new(0)),
-                    pointer_count: Rc::new(Cell::new(0)),
-                })
-            })
-            .scrollbar(false)
-            .on_visible_range(|range| range);
-        let mut renderer = ();
-        let mut user_interface = UserInterface::build(
-            list,
-            Size::new(200.0, 100.0),
-            Cache::default(),
-            &mut renderer,
-        );
-        let redraw = Event::Window(iced::window::Event::RedrawRequested(Instant::now()));
-        let window = iced::window::Headless;
-        let waker = iced::advanced::shell::Waker::noop();
-        let mut messages = iced::advanced::shell::Bus::new();
-
-        user_interface.update(
-            &window,
-            &waker,
-            &[redraw],
-            Cursor::Unavailable,
-            &mut renderer,
-            &mut messages,
-        );
-
-        assert_eq!(messages.into_iter().collect::<Vec<_>>(), vec![(0, 11)]);
-    }
-
-    #[test]
-    fn pointer_events_only_reach_the_hit_row() {
-        let pointer_counts = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
-        let probe_counts = pointer_counts.clone();
-        let list: VirtualList<'_, (), (), ()> =
-            VirtualList::new(2, 50.0, UiTokens::default(), move |index| {
-                Element::new(EventProbe {
-                    redraw_count: Rc::new(Cell::new(0)),
-                    pointer_count: Rc::clone(&probe_counts[index]),
-                })
-            })
-            .scrollbar(false);
-        let mut renderer = ();
-        let mut user_interface = UserInterface::build(
-            list,
-            Size::new(200.0, 100.0),
-            Cache::default(),
-            &mut renderer,
-        );
-        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
-        let window = iced::window::Headless;
-        let waker = iced::advanced::shell::Waker::noop();
-        let mut messages = iced::advanced::shell::Bus::new();
-
-        user_interface.update(
-            &window,
-            &waker,
-            &[click],
-            Cursor::Available(Point::new(20.0, 75.0)),
-            &mut renderer,
-            &mut messages,
-        );
-
-        assert_eq!(pointer_counts[0].get(), 0);
-        assert_eq!(pointer_counts[1].get(), 1);
-    }
-
-    #[test]
-    fn drawing_layers_and_children_use_the_parent_viewport_intersection() {
-        let child_viewports = Rc::new(RefCell::new(Vec::new()));
-        let observed_viewports = Rc::clone(&child_viewports);
-        let mut list: VirtualList<'_, (), (), LayerRecordingRenderer> =
-            VirtualList::new(3, 50.0, UiTokens::default(), move |_| {
-                Element::new(DrawViewportProbe {
-                    viewports: Rc::clone(&observed_viewports),
-                })
-            });
-        let mut tree = Tree::new(&list as &dyn Widget<(), (), LayerRecordingRenderer>);
-        let mut renderer = LayerRecordingRenderer::default();
-        let limits = layout::Limits::new(Size::ZERO, Size::new(200.0, 100.0));
-        let node = list.layout(&mut tree, &renderer, &limits);
-        let viewport = Rectangle {
-            x: 0.0,
-            y: 20.0,
-            width: 200.0,
-            height: 60.0,
-        };
-
-        list.draw(
-            &tree,
-            &mut renderer,
-            &(),
-            &renderer::Style::default(),
-            Layout::new(&node),
-            Cursor::Unavailable,
-            &viewport,
-        );
-
-        assert_eq!(renderer.layers, vec![viewport, viewport]);
-        assert_eq!(child_viewports.borrow().as_slice(), &[viewport, viewport]);
-    }
-}
-
 /// A virtual list widget that only renders visible items
 pub struct VirtualList<'a, Message, Theme, Renderer, Key = usize>
 where
@@ -491,7 +171,7 @@ where
     /// Function to create hover message for an item index
     on_item_hover: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     /// Function to create a message when the visible range changes.
-    on_visible_range: Option<Box<dyn Fn((usize, usize)) -> Message + 'a>>,
+    on_visible_range: Option<VisibleRangeCallback<'a, Message>>,
     /// Optional callback used instead of directly applying line-wheel input.
     on_smooth_scroll: Option<Box<dyn Fn(f32) -> Message + 'a>>,
     /// Message emitted before immediate pixel or scrollbar movement.
@@ -1345,5 +1025,327 @@ where
 {
     fn from(list: VirtualList<'a, Message, Theme, Renderer, Key>) -> Self {
         Element::new(list)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VirtualList, VirtualListState};
+    use crate::ui::responsive::UiTokens;
+    use iced::advanced::Shell;
+    use iced::advanced::layout::{self, Layout};
+    use iced::advanced::renderer;
+    use iced::advanced::widget::{Tree, Widget};
+    use iced::mouse::{self, Cursor};
+    use iced::time::Instant;
+    use iced::{Background, Element, Event, Length, Point, Rectangle, Size, Transformation};
+    use iced_runtime::UserInterface;
+    use iced_runtime::user_interface::Cache;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    struct EventProbe {
+        redraw_count: Rc<Cell<usize>>,
+        pointer_count: Rc<Cell<usize>>,
+    }
+
+    #[derive(Default)]
+    struct LayerRecordingRenderer {
+        layers: Vec<Rectangle>,
+    }
+
+    impl renderer::Renderer for LayerRecordingRenderer {
+        fn start_layer(&mut self, bounds: Rectangle) {
+            self.layers.push(bounds);
+        }
+
+        fn end_layer(&mut self) {}
+
+        fn start_transformation(&mut self, _transformation: Transformation) {}
+
+        fn end_transformation(&mut self) {}
+
+        fn fill_quad(&mut self, _quad: renderer::Quad, _background: impl Into<Background>) {}
+
+        fn allocate_image(
+            &self,
+            _handle: &iced::advanced::image::Handle,
+            _callback: impl FnOnce(
+                Result<iced::advanced::image::Allocation, iced::advanced::image::Error>,
+            ) + Send
+            + 'static,
+        ) {
+        }
+
+        fn hint(&mut self, _scale: renderer::Scale) {}
+
+        fn scale(&self) -> Option<renderer::Scale> {
+            None
+        }
+
+        fn reset(&mut self, _new_bounds: Rectangle) {}
+
+        fn settings(&self) -> renderer::Settings {
+            renderer::Settings::default()
+        }
+    }
+
+    struct DrawViewportProbe {
+        viewports: Rc<RefCell<Vec<Rectangle>>>,
+    }
+
+    impl Widget<(), (), LayerRecordingRenderer> for DrawViewportProbe {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fixed(50.0))
+        }
+
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &LayerRecordingRenderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(50.0), Size::ZERO))
+        }
+
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut LayerRecordingRenderer,
+            _theme: &(),
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: Cursor,
+            viewport: &Rectangle,
+        ) {
+            self.viewports.borrow_mut().push(*viewport);
+        }
+    }
+
+    impl<Message> Widget<Message, (), ()> for EventProbe {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fixed(50.0))
+        }
+
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &(),
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(50.0), Size::ZERO))
+        }
+
+        fn update(
+            &mut self,
+            _tree: &mut Tree,
+            event: &Event,
+            _layout: Layout<'_>,
+            _cursor: Cursor,
+            _renderer: &(),
+            _shell: &mut Shell<'_, Message>,
+            _viewport: &Rectangle,
+        ) {
+            if matches!(
+                event,
+                Event::Window(iced::window::Event::RedrawRequested(_))
+            ) {
+                self.redraw_count.set(self.redraw_count.get() + 1);
+            }
+            if matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            ) {
+                self.pointer_count.set(self.pointer_count.get() + 1);
+            }
+        }
+
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut (),
+            _theme: &(),
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+    }
+
+    #[test]
+    fn visible_range_includes_overscan_and_stays_within_item_count() {
+        let mut state = VirtualListState::new(20, 50.0);
+        state.update(20, 50.0, 200.0);
+
+        assert_eq!(state.visible_range(), (0, 13));
+
+        state.scroll_offset = 500.0;
+        assert_eq!(state.visible_range(), (2, 20));
+    }
+
+    #[test]
+    fn visible_range_has_bounded_bootstrap_before_layout() {
+        let state = VirtualListState::new(100, 50.0);
+
+        assert_eq!(state.visible_range(), (0, 18));
+    }
+
+    #[test]
+    fn immediate_scrolling_and_jumps_are_clamped() {
+        let mut state = VirtualListState::new(20, 50.0);
+        state.update(20, 50.0, 200.0);
+
+        assert_eq!(state.scroll_by_immediate(120.0), 120.0);
+        assert_eq!(state.scroll_offset, 120.0);
+
+        assert_eq!(state.scroll_by_immediate(-500.0), -120.0);
+        assert_eq!(state.scroll_offset, 0.0);
+
+        state.jump_to(f32::MAX);
+        assert_eq!(state.scroll_offset, 800.0);
+    }
+
+    #[test]
+    fn redraw_events_reach_visible_children() {
+        let redraw_count = Rc::new(Cell::new(0));
+        let probe_count = Rc::clone(&redraw_count);
+        let list: VirtualList<'_, (), (), ()> =
+            VirtualList::new(1, 50.0, UiTokens::default(), move |_| {
+                Element::new(EventProbe {
+                    redraw_count: Rc::clone(&probe_count),
+                    pointer_count: Rc::new(Cell::new(0)),
+                })
+            })
+            .scrollbar(false);
+        let mut renderer = ();
+        let mut user_interface = UserInterface::build(
+            list,
+            Size::new(200.0, 100.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let redraw = Event::Window(iced::window::Event::RedrawRequested(Instant::now()));
+        let window = iced::window::Headless;
+        let waker = iced::advanced::shell::Waker::noop();
+        let mut messages = iced::advanced::shell::Bus::new();
+
+        user_interface.update(
+            &window,
+            &waker,
+            &[redraw],
+            Cursor::Unavailable,
+            &mut renderer,
+            &mut messages,
+        );
+
+        assert_eq!(redraw_count.get(), 1);
+    }
+
+    #[test]
+    fn initial_redraw_publishes_the_visible_range() {
+        let list: VirtualList<'_, (usize, usize), (), ()> =
+            VirtualList::new(100, 50.0, UiTokens::default(), move |_| {
+                Element::new(EventProbe {
+                    redraw_count: Rc::new(Cell::new(0)),
+                    pointer_count: Rc::new(Cell::new(0)),
+                })
+            })
+            .scrollbar(false)
+            .on_visible_range(|range| range);
+        let mut renderer = ();
+        let mut user_interface = UserInterface::build(
+            list,
+            Size::new(200.0, 100.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let redraw = Event::Window(iced::window::Event::RedrawRequested(Instant::now()));
+        let window = iced::window::Headless;
+        let waker = iced::advanced::shell::Waker::noop();
+        let mut messages = iced::advanced::shell::Bus::new();
+
+        user_interface.update(
+            &window,
+            &waker,
+            &[redraw],
+            Cursor::Unavailable,
+            &mut renderer,
+            &mut messages,
+        );
+
+        assert_eq!(messages.into_iter().collect::<Vec<_>>(), vec![(0, 11)]);
+    }
+
+    #[test]
+    fn pointer_events_only_reach_the_hit_row() {
+        let pointer_counts = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
+        let probe_counts = pointer_counts.clone();
+        let list: VirtualList<'_, (), (), ()> =
+            VirtualList::new(2, 50.0, UiTokens::default(), move |index| {
+                Element::new(EventProbe {
+                    redraw_count: Rc::new(Cell::new(0)),
+                    pointer_count: Rc::clone(&probe_counts[index]),
+                })
+            })
+            .scrollbar(false);
+        let mut renderer = ();
+        let mut user_interface = UserInterface::build(
+            list,
+            Size::new(200.0, 100.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let window = iced::window::Headless;
+        let waker = iced::advanced::shell::Waker::noop();
+        let mut messages = iced::advanced::shell::Bus::new();
+
+        user_interface.update(
+            &window,
+            &waker,
+            &[click],
+            Cursor::Available(Point::new(20.0, 75.0)),
+            &mut renderer,
+            &mut messages,
+        );
+
+        assert_eq!(pointer_counts[0].get(), 0);
+        assert_eq!(pointer_counts[1].get(), 1);
+    }
+
+    #[test]
+    fn drawing_layers_and_children_use_the_parent_viewport_intersection() {
+        let child_viewports = Rc::new(RefCell::new(Vec::new()));
+        let observed_viewports = Rc::clone(&child_viewports);
+        let mut list: VirtualList<'_, (), (), LayerRecordingRenderer> =
+            VirtualList::new(3, 50.0, UiTokens::default(), move |_| {
+                Element::new(DrawViewportProbe {
+                    viewports: Rc::clone(&observed_viewports),
+                })
+            });
+        let mut tree = Tree::new(&list as &dyn Widget<(), (), LayerRecordingRenderer>);
+        let mut renderer = LayerRecordingRenderer::default();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(200.0, 100.0));
+        let node = list.layout(&mut tree, &renderer, &limits);
+        let viewport = Rectangle {
+            x: 0.0,
+            y: 20.0,
+            width: 200.0,
+            height: 60.0,
+        };
+
+        list.draw(
+            &tree,
+            &mut renderer,
+            &(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            Cursor::Unavailable,
+            &viewport,
+        );
+
+        assert_eq!(renderer.layers, vec![viewport, viewport]);
+        assert_eq!(child_viewports.borrow().as_slice(), &[viewport, viewport]);
     }
 }

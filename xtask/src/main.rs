@@ -49,8 +49,39 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     run_cargo(root, &["fmt", "--all", "--check"])?;
-    run_cargo(root, &["check", "--locked", "--workspace", "--all-targets"])?;
-    run_cargo(root, &["test", "--locked", "--workspace", "--all-targets"])
+    run_cargo(
+        root,
+        &[
+            "check",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+        ],
+    )?;
+    run_cargo(
+        root,
+        &[
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    run_cargo(
+        root,
+        &[
+            "test",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+        ],
+    )
 }
 
 fn print_metadata(root: &Path) -> XtaskResult<()> {

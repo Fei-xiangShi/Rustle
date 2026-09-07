@@ -255,45 +255,6 @@ fn personal_feature_row<'a>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{feature_cards_fit, personal_fm_action};
-    use crate::app::Message;
-    use crate::ui::components::NavItem;
-    use crate::ui::responsive::ResponsiveContext;
-    use iced::Size;
-
-    #[test]
-    fn personal_fm_card_reuses_sidebar_navigation_action() {
-        assert!(matches!(
-            personal_fm_action(),
-            Message::Navigate(NavItem::Radio)
-        ));
-    }
-
-    #[test]
-    fn feature_cards_scroll_as_one_horizontal_sequence_when_three_do_not_fit() {
-        let fixtures = [
-            (Size::new(1_920.0, 1_080.0), 1_575.0, true),
-            (Size::new(2_560.0, 1_440.0), 2_100.0, true),
-            (Size::new(960.0, 1_080.0), 833.0, false),
-            (Size::new(768.0, 1_024.0), 647.0, false),
-            (Size::new(720.0, 800.0), 605.0, false),
-            (Size::new(960.0, 540.0), 845.0, false),
-            (Size::new(560.0, 800.0), 506.0, false),
-        ];
-
-        for (viewport, available_width, expected_inline) in fixtures {
-            let context = ResponsiveContext::from_viewport(viewport);
-            assert_eq!(
-                feature_cards_fit(available_width, context),
-                expected_inline,
-                "unexpected feature-card composition for {viewport:?}"
-            );
-        }
-    }
-}
-
 fn feature_cards_fit(available_width: f32, context: ResponsiveContext) -> bool {
     let metrics = context.tokens.card(CardRole::Feature);
     calculate_grid_columns_clamped(available_width, metrics.width, metrics.gap, 3) == 3
@@ -333,4 +294,43 @@ fn view_all_playlists<'a>(
     .height(Fill)
     .style(theme::main_content)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{feature_cards_fit, personal_fm_action};
+    use crate::app::Message;
+    use crate::ui::components::NavItem;
+    use crate::ui::responsive::ResponsiveContext;
+    use iced::Size;
+
+    #[test]
+    fn personal_fm_card_reuses_sidebar_navigation_action() {
+        assert!(matches!(
+            personal_fm_action(),
+            Message::Navigate(NavItem::Radio)
+        ));
+    }
+
+    #[test]
+    fn feature_cards_scroll_as_one_horizontal_sequence_when_three_do_not_fit() {
+        let fixtures = [
+            (Size::new(1_920.0, 1_080.0), 1_575.0, true),
+            (Size::new(2_560.0, 1_440.0), 2_100.0, true),
+            (Size::new(960.0, 1_080.0), 833.0, false),
+            (Size::new(768.0, 1_024.0), 647.0, false),
+            (Size::new(720.0, 800.0), 605.0, false),
+            (Size::new(960.0, 540.0), 845.0, false),
+            (Size::new(560.0, 800.0), 506.0, false),
+        ];
+
+        for (viewport, available_width, expected_inline) in fixtures {
+            let context = ResponsiveContext::from_viewport(viewport);
+            assert_eq!(
+                feature_cards_fit(available_width, context),
+                expected_inline,
+                "unexpected feature-card composition for {viewport:?}"
+            );
+        }
+    }
 }

@@ -13,6 +13,38 @@ use super::vertex::{GlobalUniform, LineUniform};
 pub const GLOW_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const GLOW_DOWNSAMPLE_FACTOR: f32 = 1.0;
 
+struct BlurPassInput<'a> {
+    device: &'a Device,
+    layout: &'a wgpu::BindGroupLayout,
+    sampler: &'a wgpu::Sampler,
+    source_view: &'a wgpu::TextureView,
+    texture_size: [u32; 2],
+    direction: [f32; 2],
+    radius: f32,
+    label: &'a str,
+}
+
+struct BlurPassResourcesInput<'a> {
+    device: &'a Device,
+    layout: &'a wgpu::BindGroupLayout,
+    sampler: &'a wgpu::Sampler,
+    source_view: &'a wgpu::TextureView,
+    scratch_view: &'a wgpu::TextureView,
+    texture_size: [u32; 2],
+    radius: f32,
+    label_prefix: &'a str,
+}
+
+pub(super) struct PreparedRenderInput<'a> {
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    pub target: &'a wgpu::TextureView,
+    pub clip_bounds: &'a iced::Rectangle<u32>,
+    pub text_pipeline: &'a wgpu::RenderPipeline,
+    pub glow_pipeline: &'a wgpu::RenderPipeline,
+    pub vertex_buffer: &'a wgpu::Buffer,
+    pub index_buffer: &'a wgpu::Buffer,
+}
+
 fn lyrics_plus_lighter_blend() -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -436,17 +468,17 @@ impl PerLineBlurRenderer {
         self.viewport_size = (width, height);
     }
 
-    fn create_blur_pass_bind_group(
-        device: &Device,
-        blur_bind_group_layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        source_view: &wgpu::TextureView,
-        texture_width: u32,
-        texture_height: u32,
-        direction: [f32; 2],
-        radius: f32,
-        label: &str,
-    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+    fn create_blur_pass_bind_group(input: BlurPassInput<'_>) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let BlurPassInput {
+            device,
+            layout,
+            sampler,
+            source_view,
+            texture_size: [texture_width, texture_height],
+            direction,
+            radius,
+            label,
+        } = input;
         let uniform = BlurPassUniform {
             texture_size_and_direction: [
                 texture_width as f32,
@@ -463,7 +495,7 @@ impl PerLineBlurRenderer {
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
-            layout: blur_bind_group_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -483,48 +515,50 @@ impl PerLineBlurRenderer {
     }
 
     fn create_blur_pass_resources(
-        device: &Device,
-        blur_bind_group_layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        source_view: &wgpu::TextureView,
-        scratch_view: &wgpu::TextureView,
-        texture_width: u32,
-        texture_height: u32,
-        radius: f32,
-        label_prefix: &str,
+        input: BlurPassResourcesInput<'_>,
     ) -> (
         Option<wgpu::Buffer>,
         Option<wgpu::BindGroup>,
         Option<wgpu::Buffer>,
         Option<wgpu::BindGroup>,
     ) {
+        let BlurPassResourcesInput {
+            device,
+            layout,
+            sampler,
+            source_view,
+            scratch_view,
+            texture_size,
+            radius,
+            label_prefix,
+        } = input;
         if radius < 0.5 {
             return (None, None, None, None);
         }
 
-        let (horizontal_buffer, horizontal_bind_group) = Self::create_blur_pass_bind_group(
-            device,
-            blur_bind_group_layout,
-            sampler,
-            source_view,
-            texture_width,
-            texture_height,
-            [1.0, 0.0],
-            radius,
-            &format!("{label_prefix} Blur Horizontal Bind Group"),
-        );
+        let (horizontal_buffer, horizontal_bind_group) =
+            Self::create_blur_pass_bind_group(BlurPassInput {
+                device,
+                layout,
+                sampler,
+                source_view,
+                texture_size,
+                direction: [1.0, 0.0],
+                radius,
+                label: &format!("{label_prefix} Blur Horizontal Bind Group"),
+            });
 
-        let (vertical_buffer, vertical_bind_group) = Self::create_blur_pass_bind_group(
-            device,
-            blur_bind_group_layout,
-            sampler,
-            scratch_view,
-            texture_width,
-            texture_height,
-            [0.0, 1.0],
-            radius,
-            &format!("{label_prefix} Blur Vertical Bind Group"),
-        );
+        let (vertical_buffer, vertical_bind_group) =
+            Self::create_blur_pass_bind_group(BlurPassInput {
+                device,
+                layout,
+                sampler,
+                source_view: scratch_view,
+                texture_size,
+                direction: [0.0, 1.0],
+                radius,
+                label: &format!("{label_prefix} Blur Vertical Bind Group"),
+            });
 
         (
             Some(horizontal_buffer),
@@ -534,7 +568,6 @@ impl PerLineBlurRenderer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare_lines(
         &mut self,
         device: &Device,
@@ -680,17 +713,16 @@ impl PerLineBlurRenderer {
                 blur_horizontal_bind_group,
                 blur_vertical_uniform,
                 blur_vertical_bind_group,
-            ) = Self::create_blur_pass_resources(
+            ) = Self::create_blur_pass_resources(BlurPassResourcesInput {
                 device,
-                &self.blur_bind_group_layout,
-                &self.sampler,
+                layout: &self.blur_bind_group_layout,
+                sampler: &self.sampler,
                 source_view,
                 scratch_view,
-                line_texture_width,
-                line_texture_height,
-                line.blur_level,
-                "Per-Line Text",
-            );
+                texture_size: [line_texture_width, line_texture_height],
+                radius: line.blur_level,
+                label_prefix: "Per-Line Text",
+            });
 
             let composite_uniform = LineCompositeUniform {
                 target_size: globals.viewport_size,
@@ -791,29 +823,27 @@ impl PerLineBlurRenderer {
                     });
 
                     let (first_blur_uniform, first_blur_bind_group) =
-                        Self::create_blur_pass_bind_group(
+                        Self::create_blur_pass_bind_group(BlurPassInput {
                             device,
-                            &self.blur_bind_group_layout,
-                            &self.sampler,
-                            mask_view,
-                            full_width,
-                            full_height,
-                            [1.0, 0.0],
-                            line.glow_blur_level,
-                            "Per-Line Glow Blur Horizontal Bind Group",
-                        );
+                            layout: &self.blur_bind_group_layout,
+                            sampler: &self.sampler,
+                            source_view: mask_view,
+                            texture_size: [full_width, full_height],
+                            direction: [1.0, 0.0],
+                            radius: line.glow_blur_level,
+                            label: "Per-Line Glow Blur Horizontal Bind Group",
+                        });
                     let (second_blur_uniform, second_blur_bind_group) =
-                        Self::create_blur_pass_bind_group(
+                        Self::create_blur_pass_bind_group(BlurPassInput {
                             device,
-                            &self.blur_bind_group_layout,
-                            &self.sampler,
-                            blur_view_a,
-                            blur_width,
-                            blur_height,
-                            [0.0, 1.0],
-                            line.glow_blur_level * GLOW_DOWNSAMPLE_FACTOR,
-                            "Per-Line Glow Blur Vertical Bind Group",
-                        );
+                            layout: &self.blur_bind_group_layout,
+                            sampler: &self.sampler,
+                            source_view: blur_view_a,
+                            texture_size: [blur_width, blur_height],
+                            direction: [0.0, 1.0],
+                            radius: line.glow_blur_level * GLOW_DOWNSAMPLE_FACTOR,
+                            label: "Per-Line Glow Blur Vertical Bind Group",
+                        });
 
                     let composite_uniform = LineCompositeUniform {
                         target_size: globals.viewport_size,
@@ -890,16 +920,16 @@ impl PerLineBlurRenderer {
         }
     }
 
-    pub fn render_prepared(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        clip_bounds: &iced::Rectangle<u32>,
-        text_pipeline: &wgpu::RenderPipeline,
-        glow_pipeline: &wgpu::RenderPipeline,
-        vertex_buffer: &wgpu::Buffer,
-        index_buffer: &wgpu::Buffer,
-    ) {
+    pub(super) fn render_prepared(&self, input: PreparedRenderInput<'_>) {
+        let PreparedRenderInput {
+            encoder,
+            target,
+            clip_bounds,
+            text_pipeline,
+            glow_pipeline,
+            vertex_buffer,
+            index_buffer,
+        } = input;
         if self.prepared_lines.is_empty() {
             return;
         }

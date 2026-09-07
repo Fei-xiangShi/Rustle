@@ -336,16 +336,16 @@ impl App {
             return Task::none();
         }
 
-        if let Some(path_or_url) = song.cover_path.as_deref() {
-            if crate::image::is_remote_url(path_or_url) {
-                let enqueue_task = self.enqueue_image_download_scoped(
-                    kind,
-                    id,
-                    path_or_url,
-                    ImageRequestScope::Global,
-                );
-                return Task::batch([enqueue_task, self.pump_image_downloads()]);
-            }
+        if let Some(path_or_url) = song.cover_path.as_deref()
+            && crate::image::is_remote_url(path_or_url)
+        {
+            let enqueue_task = self.enqueue_image_download_scoped(
+                kind,
+                id,
+                path_or_url,
+                ImageRequestScope::Global,
+            );
+            return Task::batch([enqueue_task, self.pump_image_downloads()]);
         }
 
         self.register_cached_image(kind, id)

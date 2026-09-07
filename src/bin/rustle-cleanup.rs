@@ -99,11 +99,11 @@ fn remove_data() -> io::Result<()> {
 
 #[cfg(windows)]
 fn main() {
-    if std::env::args().any(|arg| arg == "--remove-data") {
-        if let Err(error) = remove_data() {
-            eprintln!("Rustle data removal failed: {error}");
-            std::process::exit(1);
-        }
+    if std::env::args().any(|arg| arg == "--remove-data")
+        && let Err(error) = remove_data()
+    {
+        eprintln!("Rustle data removal failed: {error}");
+        std::process::exit(1);
     }
 }
 

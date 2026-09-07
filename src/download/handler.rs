@@ -128,15 +128,15 @@ impl App {
                                     let _ = db.update_song_cover(song_id_val, cp).await;
                                 }
                                 let _ = db
-                                    .insert_download(
-                                        song_id_val,
-                                        ncm_id_for_db,
-                                        &title,
-                                        &artist,
-                                        &new_path,
+                                    .insert_download(crate::database::NewDownload {
+                                        song_id: song_id_val,
+                                        ncm_id: ncm_id_for_db,
+                                        title: &title,
+                                        artist: &artist,
+                                        file_path: &new_path,
                                         file_size,
-                                        &quality_str,
-                                    )
+                                        quality: &quality_str,
+                                    })
                                     .await;
                             },
                             |_| crate::app::Message::Noop,
@@ -236,7 +236,7 @@ impl App {
                     .cloned()
             });
 
-        let Some(info) = song_info else { return None };
+        let info = song_info?;
         let Some(client) = self.core.ncm_client.clone() else {
             return Some(Self::toast_error("未登录网易云账号"));
         };
