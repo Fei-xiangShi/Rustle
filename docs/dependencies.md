@@ -12,6 +12,7 @@ version and run the xtask-owned policy command:
 ```bash
 cargo install cargo-deny --version 0.20.2 --locked
 cargo xtask supply-chain
+cargo xtask check-production
 ```
 
 `deny.toml` checks every workspace member with all features. Xtask evaluates
@@ -24,6 +25,20 @@ record.
 The desktop package is explicitly `publish = false`. Cargo-deny therefore
 permits revision-pinned git/path dependencies while still rejecting wildcard
 registry versions; Rustle is an application artifact, not a crates.io library.
+
+## Production features
+
+The default build excludes Iced's debug/devtools graph. Developers can opt into
+it explicitly when investigating renderer or widget behavior:
+
+```bash
+cargo run --features devtools
+```
+
+`cargo xtask check-production` compiles the default workspace graph and rejects
+`iced_devtools` or `iced_beacon` in normal production dependencies. The full
+quality gate still uses all features so the opt-in developer path remains
+compiled, linted, and tested.
 
 ## Git source register
 

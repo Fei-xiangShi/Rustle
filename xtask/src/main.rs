@@ -16,6 +16,7 @@ const SUPPLY_CHAIN_TARGETS: &[&str] = &[
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
 ];
+const FORBIDDEN_PRODUCTION_PACKAGES: &[&str] = &["iced_beacon", "iced_devtools"];
 
 fn main() {
     if let Err(error) = run() {
@@ -36,6 +37,10 @@ fn run() -> XtaskResult<()> {
         Some("check-native") => {
             reject_extra_args(args)?;
             check_native(&root)
+        }
+        Some("check-production") => {
+            reject_extra_args(args)?;
+            check_production(&root)
         }
         Some("supply-chain") => {
             reject_extra_args(args)?;
@@ -64,10 +69,49 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
     run_cargo(root, &["fmt", "--all", "--check"])?;
+    check_production_workspace(root)?;
     check_workspace(root)?;
     clippy_workspace(root)?;
     test_workspace(root)?;
     doc_workspace(root)
+}
+
+fn check_production(root: &Path) -> XtaskResult<()> {
+    verify_toolchain(root)?;
+    check_production_workspace(root)
+}
+
+fn check_production_workspace(root: &Path) -> XtaskResult<()> {
+    run_cargo(root, &["check", "--locked", "--workspace", "--all-targets"])?;
+    verify_production_dependency_graph(root)
+}
+
+fn verify_production_dependency_graph(root: &Path) -> XtaskResult<()> {
+    let tree = capture_cargo(
+        root,
+        &["tree", "--locked", "--workspace", "--edges", "normal"],
+    )?;
+    let forbidden = forbidden_packages_in_tree(&tree);
+    if forbidden.is_empty() {
+        println!("production dependency graph: ok");
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "production dependency graph contains forbidden debug/devtools packages: {}",
+            forbidden.join(", ")
+        )))
+    }
+}
+
+fn forbidden_packages_in_tree(tree: &str) -> Vec<&'static str> {
+    FORBIDDEN_PRODUCTION_PACKAGES
+        .iter()
+        .copied()
+        .filter(|package| {
+            tree.lines()
+                .any(|line| line.contains(&format!("{package} v")))
+        })
+        .collect()
 }
 
 fn check_native(root: &Path) -> XtaskResult<()> {
@@ -295,6 +339,7 @@ fn release_preflight(root: &Path, mut args: impl Iterator<Item = String>) -> Xta
     reject_extra_args(args)?;
 
     let toolchain = verify_toolchain(root)?;
+    verify_production_dependency_graph(root)?;
     let lockfile = root.join("Cargo.lock");
     if !lockfile.is_file() {
         return Err(failure(format!(
@@ -496,6 +541,7 @@ fn usage() -> &'static str {
     "Rustle engineering tasks:\n\
      \n  cargo xtask check\
      \n  cargo xtask check-native\
+     \n  cargo xtask check-production\
      \n  cargo xtask supply-chain\
      \n  cargo xtask metadata\
      \n  cargo xtask release-preflight [--tag vX.Y.Z]"
@@ -503,7 +549,10 @@ fn usage() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{inline_quoted_setting, normalize_release_tag, quoted_setting, tool_version};
+    use super::{
+        forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag, quoted_setting,
+        tool_version,
+    };
 
     #[test]
     fn reads_quoted_toolchain_setting() {
@@ -540,5 +589,15 @@ mod tests {
             Some("0123456789012345678901234567890123456789")
         );
         assert_eq!(inline_quoted_setting(dependency, "branch"), None);
+    }
+
+    #[test]
+    fn production_tree_rejects_debug_only_packages() {
+        let tree = "rustle v0.5.2\n└── iced v0.15.0-dev\n    ├── iced_beacon v0.15.0-dev\n    └── iced_devtools v0.15.0-dev";
+        assert_eq!(
+            forbidden_packages_in_tree(tree),
+            vec!["iced_beacon", "iced_devtools"]
+        );
+        assert!(forbidden_packages_in_tree("rustle v0.5.2\n└── iced v0.15.0-dev").is_empty());
     }
 }
