@@ -18,6 +18,85 @@ const SUPPLY_CHAIN_TARGETS: &[&str] = &[
 ];
 const FORBIDDEN_PRODUCTION_PACKAGES: &[&str] = &["iced_beacon", "iced_devtools"];
 
+struct SourceContractRule {
+    path: &'static str,
+    forbidden: &'static str,
+    rationale: &'static str,
+}
+
+const ERROR_SOURCE_CONTRACTS: &[SourceContractRule] = &[
+    SourceContractRule {
+        path: "src/audio/player.rs",
+        forbidden: "classify_playback_error",
+        rationale: "playback failures must be classified by the producer, never by parsing text",
+    },
+    SourceContractRule {
+        path: "src/app/update/song_resolver.rs",
+        forbidden: "Result<ResolvedAudioSource, String>",
+        rationale: "audio-source resolution is a stable typed application boundary",
+    },
+    SourceContractRule {
+        path: "src/app/update/song_resolver.rs",
+        forbidden: "Result<ResolvedSong, String>",
+        rationale: "song resolution must preserve stable codes and source chains",
+    },
+    SourceContractRule {
+        path: "src/platform/global_hotkeys.rs",
+        forbidden: "Result<(), String>",
+        rationale: "native registration and rollback failures require typed semantics",
+    },
+    SourceContractRule {
+        path: "src/platform/global_hotkeys.rs",
+        forbidden: "GlobalHotkeyError::new",
+        rationale: "platform errors must select an explicit typed kind",
+    },
+    SourceContractRule {
+        path: "src/app/message.rs",
+        forbidden: "DatabaseError(String)",
+        rationale: "application error messages must carry AppError",
+    },
+    SourceContractRule {
+        path: "src/app/message.rs",
+        forbidden: "SongResolveFailed(PlaybackContext, String)",
+        rationale: "application error messages must carry AppError",
+    },
+    SourceContractRule {
+        path: "src/app/message.rs",
+        forbidden: "DownloadError(i64, String)",
+        rationale: "application error messages must carry AppError",
+    },
+    SourceContractRule {
+        path: "src/app/message.rs",
+        forbidden: "LyricsLoadFailed(i64, String)",
+        rationale: "application error messages must carry AppError",
+    },
+    SourceContractRule {
+        path: "src/app/message.rs",
+        forbidden: "NcmPlaylistLoadFailed(u64, i64, String)",
+        rationale: "application error messages must carry AppError",
+    },
+    SourceContractRule {
+        path: "src/audio/events.rs",
+        forbidden: "error: String",
+        rationale: "audio events must transport PlaybackError without a parallel text classifier",
+    },
+    SourceContractRule {
+        path: "src/audio/streaming.rs",
+        forbidden: "Error(String)",
+        rationale: "streaming terminal events must retain PlaybackError",
+    },
+    SourceContractRule {
+        path: "src/audio/streaming.rs",
+        forbidden: "    Failed(String),",
+        rationale: "streaming health must retain PlaybackError",
+    },
+    SourceContractRule {
+        path: "src/audio/streaming.rs",
+        forbidden: "Fatal(String)",
+        rationale: "range failures must be classified at production",
+    },
+];
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("xtask error: {error}");
@@ -68,6 +147,7 @@ fn workspace_root() -> XtaskResult<PathBuf> {
 
 fn check(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
+    verify_error_source_contracts(root)?;
     run_cargo(root, &["fmt", "--all", "--check"])?;
     check_production_workspace(root)?;
     check_workspace(root)?;
@@ -78,6 +158,7 @@ fn check(root: &Path) -> XtaskResult<()> {
 
 fn check_production(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
+    verify_error_source_contracts(root)?;
     check_production_workspace(root)
 }
 
@@ -114,8 +195,52 @@ fn forbidden_packages_in_tree(tree: &str) -> Vec<&'static str> {
         .collect()
 }
 
+fn verify_error_source_contracts(root: &Path) -> XtaskResult<()> {
+    let mut violations = Vec::new();
+    for rule in ERROR_SOURCE_CONTRACTS {
+        let path = root.join(rule.path);
+        let contents = fs::read_to_string(&path)?;
+        violations.extend(source_contract_violations(rule.path, &contents));
+    }
+
+    violations.sort();
+    violations.dedup();
+    if violations.is_empty() {
+        println!("typed error source contracts: ok");
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "typed error source contract violations:\n{}",
+            violations.join("\n")
+        )))
+    }
+}
+
+fn source_contract_violations(path: &str, contents: &str) -> Vec<String> {
+    ERROR_SOURCE_CONTRACTS
+        .iter()
+        .filter(|rule| rule.path == path)
+        .flat_map(|rule| {
+            contents
+                .lines()
+                .enumerate()
+                .filter(move |(_, line)| line.contains(rule.forbidden))
+                .map(move |(line_index, _)| {
+                    format!(
+                        "{}:{} contains forbidden `{}`: {}",
+                        rule.path,
+                        line_index + 1,
+                        rule.forbidden,
+                        rule.rationale
+                    )
+                })
+        })
+        .collect()
+}
+
 fn check_native(root: &Path) -> XtaskResult<()> {
     verify_toolchain(root)?;
+    verify_error_source_contracts(root)?;
     check_workspace(root)?;
     clippy_workspace(root)?;
     test_workspace(root)
@@ -586,7 +711,7 @@ fn usage() -> &'static str {
 mod tests {
     use super::{
         forbidden_packages_in_tree, inline_quoted_setting, normalize_release_tag, quoted_setting,
-        tool_version,
+        source_contract_violations, tool_version,
     };
 
     #[test]
@@ -634,5 +759,30 @@ mod tests {
             vec!["iced_beacon", "iced_devtools"]
         );
         assert!(forbidden_packages_in_tree("rustle v0.5.2\n└── iced v0.15.0-dev").is_empty());
+    }
+
+    #[test]
+    fn typed_error_source_contracts_reject_string_regressions() {
+        assert!(
+            !source_contract_violations(
+                "src/audio/player.rs",
+                "fn classify_playback_error(message: &str) {}"
+            )
+            .is_empty()
+        );
+        assert!(
+            !source_contract_violations(
+                "src/app/message.rs",
+                "SongResolveFailed(PlaybackContext, String),"
+            )
+            .is_empty()
+        );
+        assert!(
+            source_contract_violations(
+                "src/app/message.rs",
+                "SongResolveFailed(PlaybackContext, AppError),"
+            )
+            .is_empty()
+        );
     }
 }

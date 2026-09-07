@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::audio::identity::{PlaybackContext, PreloadIdentity};
+use crate::audio::player::{PlaybackError, PlaybackResult};
 use parking_lot::{Condvar, Mutex, RwLock};
 
 // ============ Constants ============
@@ -229,30 +230,32 @@ fn validate_range_response(
     response: &reqwest::Response,
     expected_start: u64,
     expected_end: u64,
-) -> Result<ContentRange, String> {
+) -> PlaybackResult<ContentRange> {
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(format!(
-            "UnsupportedStreaming: expected HTTP 206, got {}",
+        return Err(PlaybackError::UnsupportedStreaming(format!(
+            "expected HTTP 206, got {}",
             response.status()
-        ));
+        )));
     }
     let range = response
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range)
-        .ok_or_else(|| "UnsupportedStreaming: invalid Content-Range".to_string())?;
+        .ok_or_else(|| PlaybackError::UnsupportedStreaming("invalid Content-Range".to_string()))?;
     if range.start != expected_start || range.end != expected_end {
-        return Err(format!(
-            "UnsupportedStreaming: unexpected range {}-{}, expected {}-{}",
+        return Err(PlaybackError::UnsupportedStreaming(format!(
+            "unexpected range {}-{}, expected {}-{}",
             range.start, range.end, expected_start, expected_end
-        ));
+        )));
     }
     let expected_length = expected_end
         .saturating_sub(expected_start)
         .saturating_add(1);
     if response.content_length() != Some(expected_length) {
-        return Err("UnsupportedStreaming: invalid Range response length".to_string());
+        return Err(PlaybackError::UnsupportedStreaming(
+            "invalid Range response length".to_string(),
+        ));
     }
     Ok(range)
 }
@@ -287,7 +290,7 @@ pub enum StreamingEventKind {
     /// Cache persistence failed; ring playback may still continue.
     CacheFinalizationFailed(String),
     /// Download error.
-    Error(String),
+    Error(PlaybackError),
 }
 
 #[derive(Debug, Clone)]
@@ -327,24 +330,26 @@ pub enum SharedBufferHealth {
     /// The owning generation explicitly cancelled the stream.
     Cancelled,
     /// The coordinator stored a terminal failure.
-    Failed(String),
+    Failed(PlaybackError),
     /// The coordinator exited without completion or a stored error.
     CoordinatorStopped,
 }
 
 impl SharedBufferHealth {
-    pub fn promotion_error(&self) -> Option<String> {
+    pub fn promotion_error(&self) -> Option<PlaybackError> {
         Self::health_for_promotion(self).err()
     }
 
-    fn health_for_promotion(&self) -> Result<(), String> {
+    fn health_for_promotion(&self) -> PlaybackResult<()> {
         match self {
             Self::Refillable | Self::Complete => Ok(()),
-            Self::Cancelled => Err("streaming preload was cancelled".to_string()),
-            Self::Failed(error) => Err(format!("streaming preload failed: {error}")),
-            Self::CoordinatorStopped => {
-                Err("streaming preload coordinator stopped before completion".to_string())
-            }
+            Self::Cancelled => Err(PlaybackError::Cancelled(
+                "streaming preload was cancelled".to_string(),
+            )),
+            Self::Failed(error) => Err(PlaybackError::UnhealthyPreload(error.to_string())),
+            Self::CoordinatorStopped => Err(PlaybackError::UnhealthyPreload(
+                "streaming preload coordinator stopped before completion".to_string(),
+            )),
         }
     }
 }
@@ -389,7 +394,7 @@ struct SharedBufferInner {
     download_complete: AtomicBool,
     cache_finalized: AtomicBool,
     cancelled: AtomicBool,
-    error: RwLock<Option<String>>,
+    error: RwLock<Option<PlaybackError>>,
     demand_stall_timeout: Duration,
     data_available: Condvar,
     wait_mutex: Mutex<()>,
@@ -904,7 +909,7 @@ impl SharedBuffer {
 
         if let Some(err) = self.inner.error.read().as_ref() {
             tracing::debug!("read_at: error at position {}: {}", position, err);
-            return Err(io::Error::other(err.clone()));
+            return Err(io::Error::other(err.to_string()));
         }
 
         // Wait for data if needed
@@ -995,7 +1000,7 @@ impl SharedBuffer {
                     position,
                     err
                 );
-                return Err(io::Error::other(err.clone()));
+                return Err(io::Error::other(err.to_string()));
             }
 
             if !self.inner.coordinator_active.load(Ordering::Acquire) {
@@ -1014,10 +1019,11 @@ impl SharedBuffer {
             let stalled_for = last_progress_at.elapsed();
             if stalled_for >= self.inner.demand_stall_timeout {
                 let message = format!(
-                    "Network: decoder demand at byte {position} made no progress for {} ms",
+                    "decoder demand at byte {position} made no progress for {} ms",
                     stalled_for.as_millis()
                 );
-                let stored_timeout = self.set_error_if_absent(message.clone());
+                let stored_timeout =
+                    self.set_error_if_absent(PlaybackError::NetworkError(message.clone()));
                 if stored_timeout {
                     tracing::warn!(
                         position,
@@ -1036,7 +1042,7 @@ impl SharedBuffer {
                     ));
                 }
                 if !stored_timeout && let Some(error) = self.error_message() {
-                    return Err(io::Error::other(error));
+                    return Err(io::Error::other(error.to_string()));
                 }
                 return Err(io::Error::new(io::ErrorKind::TimedOut, message));
             }
@@ -1117,7 +1123,7 @@ impl SharedBuffer {
         self.inner.error.read().is_some()
     }
 
-    pub fn error_message(&self) -> Option<String> {
+    pub fn error_message(&self) -> Option<PlaybackError> {
         self.inner.error.read().clone()
     }
 
@@ -1152,12 +1158,12 @@ impl SharedBuffer {
     }
 
     /// Set error state
-    pub fn set_error(&self, error: String) {
+    pub fn set_error(&self, error: PlaybackError) {
         *self.inner.error.write() = Some(error);
         self.inner.data_available.notify_all();
     }
 
-    fn set_error_if_absent(&self, error: String) -> bool {
+    fn set_error_if_absent(&self, error: PlaybackError) -> bool {
         let mut stored = self.inner.error.write();
         if stored.is_some() || self.is_cancelled() {
             return false;
@@ -1332,7 +1338,7 @@ enum RangeFetchResult {
     Data(Vec<u8>),
     Superseded,
     Cancelled,
-    Fatal(String),
+    Fatal(PlaybackError),
 }
 
 async fn fetch_range_chunk(
@@ -1372,11 +1378,11 @@ async fn fetch_range_chunk(
                     return RangeFetchResult::Superseded;
                 }
                 let Some(backoff) = range_retry_backoff(retries_completed) else {
-                    return RangeFetchResult::Fatal(format!(
-                        "Network: Range request failed after {} retries: {}",
+                    return RangeFetchResult::Fatal(PlaybackError::NetworkError(format!(
+                        "Range request failed after {} retries: {}",
                         retries_completed,
                         error.without_url()
-                    ));
+                    )));
                 };
                 retries_completed += 1;
                 tracing::warn!(
@@ -1420,11 +1426,11 @@ async fn fetch_range_chunk(
                 if body.len() == expected {
                     return RangeFetchResult::Data(body.to_vec());
                 }
-                return RangeFetchResult::Fatal(format!(
-                    "UnsupportedStreaming: Range body length {}, expected {}",
+                return RangeFetchResult::Fatal(PlaybackError::UnsupportedStreaming(format!(
+                    "Range body length {}, expected {}",
                     body.len(),
                     expected
-                ));
+                )));
             }
             Err(error) => {
                 if buffer.is_cancelled() {
@@ -1437,11 +1443,11 @@ async fn fetch_range_chunk(
                     return RangeFetchResult::Superseded;
                 }
                 let Some(backoff) = range_retry_backoff(retries_completed) else {
-                    return RangeFetchResult::Fatal(format!(
-                        "Network: Range body failed after {} retries: {}",
+                    return RangeFetchResult::Fatal(PlaybackError::NetworkError(format!(
+                        "Range body failed after {} retries: {}",
                         retries_completed,
                         error.without_url()
-                    ));
+                    )));
                 };
                 retries_completed += 1;
                 tracing::warn!(
@@ -1536,9 +1542,13 @@ fn follow_existing_download(
                         "shared download finished without a published cache file".to_string(),
                     )
                 } else if buffer.is_cancelled() {
-                    StreamingEventKind::Error("shared download was cancelled".to_string())
+                    StreamingEventKind::Error(PlaybackError::Cancelled(
+                        "shared download was cancelled".to_string(),
+                    ))
                 } else {
-                    StreamingEventKind::Error("shared download coordinator stopped".to_string())
+                    StreamingEventKind::Error(PlaybackError::StreamingFailed(
+                        "shared download coordinator stopped".to_string(),
+                    ))
                 };
                 let _ = event_tx.send(StreamingEvent::new(identity, kind)).await;
                 return;
@@ -1613,49 +1623,53 @@ pub fn start_buffer_download(
         {
             Ok(client) => client,
             Err(error) => {
-                let message = format!("Network: HTTP client setup failed: {error}");
-                buffer_clone.set_error(message.clone());
+                let error =
+                    PlaybackError::NetworkError(format!("HTTP client setup failed: {error}"));
+                buffer_clone.set_error(error.clone());
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
                 return;
             }
         };
-        let fail = |message: String, buffer: &SharedBuffer| {
-            buffer.set_error(message);
+        let fail = |error: PlaybackError, buffer: &SharedBuffer| {
+            buffer.set_error(error);
         };
 
         let _head = match client.head(&url).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                let message = format!(
-                    "UnsupportedStreaming: HEAD returned HTTP {}",
+                let error = PlaybackError::UnsupportedStreaming(format!(
+                    "HEAD returned HTTP {}",
                     response.status()
-                );
-                fail(message.clone(), &buffer_clone);
+                ));
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
                 return;
             }
             Err(error) => {
-                let message = format!("Network: HEAD request failed: {}", error.without_url());
-                fail(message.clone(), &buffer_clone);
+                let error = PlaybackError::NetworkError(format!(
+                    "HEAD request failed: {}",
+                    error.without_url()
+                ));
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
@@ -1670,13 +1684,16 @@ pub fn start_buffer_download(
         {
             Ok(response) => response,
             Err(error) => {
-                let message = format!("Network: Range probe failed: {}", error.without_url());
-                fail(message.clone(), &buffer_clone);
+                let error = PlaybackError::NetworkError(format!(
+                    "Range probe failed: {}",
+                    error.without_url()
+                ));
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
@@ -1685,13 +1702,13 @@ pub fn start_buffer_download(
         };
         let probe_range = match validate_range_response(&probe, 0, 0) {
             Ok(range) => range,
-            Err(message) => {
-                fail(message.clone(), &buffer_clone);
+            Err(error) => {
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
@@ -1701,29 +1718,32 @@ pub fn start_buffer_download(
         let probe_body = match probe.bytes().await {
             Ok(body) if body.len() == 1 => body,
             Ok(body) => {
-                let message = format!(
-                    "UnsupportedStreaming: Range probe body length {}, expected 1",
+                let error = PlaybackError::UnsupportedStreaming(format!(
+                    "Range probe body length {}, expected 1",
                     body.len()
-                );
-                fail(message.clone(), &buffer_clone);
+                ));
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
                 return;
             }
             Err(error) => {
-                let message = format!("Network: Range probe body failed: {}", error.without_url());
-                fail(message.clone(), &buffer_clone);
+                let error = PlaybackError::NetworkError(format!(
+                    "Range probe body failed: {}",
+                    error.without_url()
+                ));
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
@@ -1743,13 +1763,13 @@ pub fn start_buffer_download(
         {
             Ok(file) => file,
             Err(error) => {
-                let message = format!("I/O: could not create cache file: {}", error);
-                fail(message.clone(), &buffer_clone);
+                let error = PlaybackError::IoError(format!("could not create cache file: {error}"));
+                fail(error.clone(), &buffer_clone);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message),
+                            StreamingEventKind::Error(error),
                         ))
                         .await;
                 }
@@ -1759,15 +1779,15 @@ pub fn start_buffer_download(
 
         let mut playable_sent = false;
         if let Err(error) = file.write_all(&probe_body) {
-            let message = format!("I/O: cache write failed: {}", error);
-            fail(message.clone(), &buffer_clone);
+            let error = PlaybackError::IoError(format!("cache write failed: {error}"));
+            fail(error.clone(), &buffer_clone);
             drop(file);
             crate::cache::cleanup_temp_file(&temp_path);
             if let Some(tx) = &event_tx {
                 let _ = tx
                     .send(StreamingEvent::new(
                         identity.clone(),
-                        StreamingEventKind::Error(message),
+                        StreamingEventKind::Error(error),
                     ))
                     .await;
             }
@@ -1868,15 +1888,15 @@ pub fn start_buffer_download(
                     .seek(SeekFrom::Start(start))
                     .and_then(|_| file.read_exact(&mut body))
                 {
-                    let message = format!("I/O: cache read failed: {error}");
-                    fail(message.clone(), &buffer_clone);
+                    let error = PlaybackError::IoError(format!("cache read failed: {error}"));
+                    fail(error.clone(), &buffer_clone);
                     drop(file);
                     crate::cache::cleanup_temp_file(&temp_path);
                     if let Some(tx) = &event_tx {
                         let _ = tx
                             .send(StreamingEvent::new(
                                 identity.clone(),
-                                StreamingEventKind::Error(message),
+                                StreamingEventKind::Error(error),
                             ))
                             .await;
                     }
@@ -1898,15 +1918,15 @@ pub fn start_buffer_download(
                         crate::cache::cleanup_temp_file(&temp_path);
                         return;
                     }
-                    RangeFetchResult::Fatal(message) => {
-                        fail(message.clone(), &buffer_clone);
+                    RangeFetchResult::Fatal(error) => {
+                        fail(error.clone(), &buffer_clone);
                         drop(file);
                         crate::cache::cleanup_temp_file(&temp_path);
                         if let Some(tx) = &event_tx {
                             let _ = tx
                                 .send(StreamingEvent::new(
                                     identity.clone(),
-                                    StreamingEventKind::Error(message),
+                                    StreamingEventKind::Error(error),
                                 ))
                                 .await;
                         }
@@ -1920,15 +1940,15 @@ pub fn start_buffer_download(
                     .seek(SeekFrom::Start(start))
                     .and_then(|_| file.write_all(&body))
                 {
-                    let message = format!("I/O: cache write failed: {}", error);
-                    fail(message.clone(), &buffer_clone);
+                    let error = PlaybackError::IoError(format!("cache write failed: {error}"));
+                    fail(error.clone(), &buffer_clone);
                     drop(file);
                     crate::cache::cleanup_temp_file(&temp_path);
                     if let Some(tx) = &event_tx {
                         let _ = tx
                             .send(StreamingEvent::new(
                                 identity.clone(),
-                                StreamingEventKind::Error(message),
+                                StreamingEventKind::Error(error),
                             ))
                             .await;
                     }
@@ -1987,30 +2007,30 @@ pub fn start_buffer_download(
         }
 
         if let Err(error) = file.flush() {
-            let message = format!("I/O: cache flush failed: {error}");
-            fail(message.clone(), &buffer_clone);
+            let error = PlaybackError::IoError(format!("cache flush failed: {error}"));
+            fail(error.clone(), &buffer_clone);
             drop(file);
             crate::cache::cleanup_temp_file(&temp_path);
             if let Some(tx) = &event_tx {
                 let _ = tx
                     .send(StreamingEvent::new(
                         identity.clone(),
-                        StreamingEventKind::Error(message),
+                        StreamingEventKind::Error(error),
                     ))
                     .await;
             }
             return;
         }
         if let Err(error) = file.sync_all() {
-            let message = format!("I/O: cache sync failed: {error}");
-            fail(message.clone(), &buffer_clone);
+            let error = PlaybackError::IoError(format!("cache sync failed: {error}"));
+            fail(error.clone(), &buffer_clone);
             drop(file);
             crate::cache::cleanup_temp_file(&temp_path);
             if let Some(tx) = &event_tx {
                 let _ = tx
                     .send(StreamingEvent::new(
                         identity.clone(),
-                        StreamingEventKind::Error(message),
+                        StreamingEventKind::Error(error),
                     ))
                     .await;
             }
@@ -2025,38 +2045,38 @@ pub fn start_buffer_download(
                 match crate::utils::detect_audio_format(&prefix[..len]) {
                     Some(extension) => extension.to_string(),
                     None => {
-                        let message =
-                            "UnsupportedFormat: unknown or damaged audio prefix".to_string();
+                        let error = PlaybackError::UnsupportedFormat(
+                            "unknown or damaged audio prefix".to_string(),
+                        );
                         drop(reader);
                         crate::cache::cleanup_temp_file(&temp_path);
                         if let Some(tx) = &event_tx {
                             let _ = tx
                                 .send(StreamingEvent::new(
                                     identity.clone(),
-                                    StreamingEventKind::Error(message),
+                                    StreamingEventKind::Error(error.clone()),
                                 ))
                                 .await;
                         }
-                        fail(
-                            "UnsupportedFormat: unknown or damaged audio prefix".to_string(),
-                            &buffer_clone,
-                        );
+                        fail(error, &buffer_clone);
                         return;
                     }
                 }
             }
             Err(error) => {
-                let message = format!("I/O: could not open cache for format detection: {error}");
+                let error = PlaybackError::IoError(format!(
+                    "could not open cache for format detection: {error}"
+                ));
                 crate::cache::cleanup_temp_file(&temp_path);
                 if let Some(tx) = &event_tx {
                     let _ = tx
                         .send(StreamingEvent::new(
                             identity.clone(),
-                            StreamingEventKind::Error(message.clone()),
+                            StreamingEventKind::Error(error.clone()),
                         ))
                         .await;
                 }
-                fail(message, &buffer_clone);
+                fail(error, &buffer_clone);
                 return;
             }
         };
@@ -2301,11 +2321,11 @@ mod tests {
         assert!(complete.health().promotion_error().is_none());
 
         let failed = SharedBuffer::new(100);
-        failed.set_error("Network: connection reset".to_string());
-        assert_eq!(
+        failed.set_error(PlaybackError::NetworkError("connection reset".to_string()));
+        assert!(matches!(
             failed.health(),
-            SharedBufferHealth::Failed("Network: connection reset".to_string())
-        );
+            SharedBufferHealth::Failed(PlaybackError::NetworkError(_))
+        ));
         assert!(failed.health().promotion_error().is_some());
 
         let cancelled = SharedBuffer::new(100);
@@ -2334,7 +2354,7 @@ mod tests {
             .inner
             .coordinator_active
             .store(true, Ordering::Release);
-        buffer.set_error("Network: body failed".to_string());
+        buffer.set_error(PlaybackError::NetworkError("body failed".to_string()));
         drop(CoordinatorGuard {
             buffer: buffer.clone(),
             key: AudioCacheKey {
@@ -2343,10 +2363,10 @@ mod tests {
             },
         });
 
-        assert_eq!(
+        assert!(matches!(
             buffer.health(),
-            SharedBufferHealth::Failed("Network: body failed".to_string())
-        );
+            SharedBufferHealth::Failed(PlaybackError::NetworkError(_))
+        ));
     }
 
     #[test]
@@ -2362,9 +2382,10 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(
-            matches!(buffer.health(), SharedBufferHealth::Failed(message) if message.contains("decoder demand"))
-        );
+        assert!(matches!(
+            buffer.health(),
+            SharedBufferHealth::Failed(PlaybackError::NetworkError(_))
+        ));
     }
 
     #[test]
@@ -2888,7 +2909,7 @@ mod tests {
     #[test]
     fn test_shared_buffer_error() {
         let buffer = SharedBuffer::new(100);
-        buffer.set_error("Test error".to_string());
+        buffer.set_error(PlaybackError::StreamingFailed("Test error".to_string()));
 
         // Read should return error
         let mut buf = [0u8; 5];

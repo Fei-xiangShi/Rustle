@@ -272,7 +272,10 @@ impl App {
                     ),
                     Task::perform(load_playback_state(db.clone()), |state| match state {
                         Some(state) => Message::PlaybackStateLoaded(state),
-                        None => Message::DatabaseError("No playback state".into()),
+                        None => Message::DatabaseError(crate::error::AppError::new(
+                            crate::error::ErrorCode::StorageNotFound,
+                            "No saved playback state was found",
+                        )),
                     }),
                     Task::perform(load_queue(db.clone()), Message::QueueRestored),
                     Task::perform(load_download_history(db.clone()), Message::DownloadsLoaded),
@@ -281,7 +284,7 @@ impl App {
 
             Message::DatabaseError(err) => {
                 tracing::error!("Database error: {}", err);
-                self.core.db_error = Some(err.clone());
+                self.core.db_error = Some(err.user_summary().to_owned());
                 Some(Task::none())
             }
 
@@ -401,7 +404,9 @@ impl App {
                                     context,
                                 )
                             } else {
-                                Err("Resolved NCM song has neither a streaming buffer nor a finalized cache path".to_string())
+                                Err(crate::audio::PlaybackError::SourceUnavailable(
+                                    "resolved NCM song has neither a streaming buffer nor a finalized cache path".to_string(),
+                                ))
                             };
 
                             if let Err(err) = restore_result {

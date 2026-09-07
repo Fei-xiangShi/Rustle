@@ -139,21 +139,28 @@ impl App {
             .global_binding(&action)
             .cloned();
 
-        let registration_result = if let Some(service) = &mut self.core.global_hotkeys {
+        let registration_result: Result<(), crate::error::AppError> = if let Some(service) =
+            &mut self.core.global_hotkeys
+        {
             service
                 .replace(action, new_binding.as_ref())
-                .map_err(|error| error.to_string())
+                .map_err(crate::error::AppError::from)
         } else if new_binding.is_none() {
             Ok(())
         } else {
-            Err("global hotkeys are not supported in the current desktop session".to_string())
+            Err(crate::platform::global_hotkeys::GlobalHotkeyError::unsupported_session().into())
         };
 
         if let Err(error) = registration_result {
+            tracing::warn!(
+                code = %error.code(),
+                recovery = ?error.recovery(),
+                "Global shortcut update was rejected"
+            );
             return Self::toast_error(format!(
                 "{}: {}",
                 self.core.locale.get(I18nKey::SettingsGlobalShortcutError),
-                error
+                error.user_summary()
             ));
         }
 
@@ -167,20 +174,31 @@ impl App {
                 .settings
                 .keybindings
                 .set_global(action, old_binding.clone().into_iter().collect());
-            let mut error_details = error.to_string();
+            let save_error = crate::error::AppError::with_source(
+                crate::error::ErrorCode::StorageQueryFailed,
+                "Rustle could not save the shortcut settings",
+                error,
+            );
             if let Some(service) = &mut self.core.global_hotkeys
                 && let Err(rollback_error) = service.replace(action, old_binding.as_ref())
             {
-                tracing::error!(%rollback_error, "Failed to restore global shortcut after settings save failure");
-                error_details.push_str(&format!(
-                    "; failed to restore previous shortcut: {rollback_error}"
-                ));
+                let rollback_error = crate::error::AppError::from(rollback_error);
+                tracing::error!(
+                    code = %rollback_error.code(),
+                    recovery = ?rollback_error.recovery(),
+                    "Failed to restore global shortcut after settings save failure"
+                );
             }
 
+            tracing::error!(
+                code = %save_error.code(),
+                recovery = ?save_error.recovery(),
+                "Failed to persist global shortcut settings"
+            );
             return Self::toast_error(format!(
                 "{}: {}",
                 self.core.locale.get(I18nKey::SettingsGlobalShortcutError),
-                error_details
+                save_error.user_summary()
             ));
         }
 

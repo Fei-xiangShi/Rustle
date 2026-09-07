@@ -77,7 +77,7 @@ pub fn init_audio(
 }
 
 /// Initialize database connection
-pub async fn init_database() -> anyhow::Result<Database> {
+pub async fn init_database() -> crate::database::StorageResult<Database> {
     let data_dir = directories::ProjectDirs::from("com", "rustle", "Rustle")
         .map(|dirs| dirs.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -299,7 +299,7 @@ pub async fn create_playlist_from_import(
     name: String,
     cover_path: Option<String>,
     scanned_paths: Vec<std::path::PathBuf>,
-) -> anyhow::Result<i64> {
+) -> crate::database::StorageResult<i64> {
     let playlist = NewPlaylist {
         name,
         description: None,
@@ -332,7 +332,7 @@ pub async fn sync_playlist_from_import(
     name: String,
     cover_path: Option<String>,
     scanned_paths: Vec<std::path::PathBuf>,
-) -> anyhow::Result<i64> {
+) -> crate::database::StorageResult<i64> {
     db.update_playlist_full(playlist_id, &name, None, cover_path.as_deref())
         .await?;
 

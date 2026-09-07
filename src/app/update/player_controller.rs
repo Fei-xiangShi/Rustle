@@ -256,7 +256,7 @@ impl App {
     fn playback_source_from_resolved_song(
         song: &DbSong,
         resolved: &ResolvedSong,
-    ) -> Result<PlaybackSource, String> {
+    ) -> crate::audio::PlaybackResult<PlaybackSource> {
         if let Some(buffer) = resolved.shared_buffer.clone() {
             return Ok(PlaybackSource::StreamingBuffer {
                 buffer,
@@ -337,7 +337,7 @@ impl App {
         song: &DbSong,
         path: PathBuf,
         gain_mode: TrackGainMode,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let track_gain = self.resolve_track_gain_for_song(song, gain_mode);
         let fade_in = self.fade_in_enabled();
         self.play_audio_file(path, fade_in, track_gain)
@@ -349,7 +349,7 @@ impl App {
         path: PathBuf,
         gain_mode: TrackGainMode,
         position: std::time::Duration,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let track_gain = self.resolve_track_gain_for_song(song, gain_mode);
         let fade_in = self.fade_in_enabled();
         self.play_audio_file_at_position(path, position, fade_in, track_gain)
@@ -361,7 +361,7 @@ impl App {
         buffer: crate::audio::SharedBuffer,
         duration_secs: Option<u64>,
         finalized_cache_path: Option<String>,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let track_gain = self.resolve_track_gain_for_song(song, TrackGainMode::MetadataOnly);
         let fade_in = self.fade_in_enabled();
         let duration =
@@ -374,7 +374,7 @@ impl App {
         &mut self,
         identity: crate::audio::identity::PreloadIdentity,
         buffer: Option<crate::audio::SharedBuffer>,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let transition = self.playback.pending_transition.take();
         let trigger_at = self.playback.pending_transition_trigger.take();
         match (trigger_at, transition) {
@@ -410,10 +410,14 @@ impl App {
         }
     }
 
-    pub(super) fn audio_path_source_for_song(song: &DbSong) -> Result<PlaybackSource, String> {
+    pub(super) fn audio_path_source_for_song(
+        song: &DbSong,
+    ) -> crate::audio::PlaybackResult<PlaybackSource> {
         let path = PathBuf::from(&song.file_path);
         if song.file_path.is_empty() || !path.exists() {
-            return Err(format!("File not found: {}", song.file_path));
+            return Err(crate::audio::PlaybackError::FileNotFound(
+                song.file_path.clone(),
+            ));
         }
 
         Ok(PlaybackSource::AudioPath {
@@ -426,10 +430,12 @@ impl App {
     pub(super) fn audio_path_source_for_song_at_position(
         song: &DbSong,
         position: std::time::Duration,
-    ) -> Result<PlaybackSource, String> {
+    ) -> crate::audio::PlaybackResult<PlaybackSource> {
         let path = PathBuf::from(&song.file_path);
         if song.file_path.is_empty() || !path.exists() {
-            return Err(format!("File not found: {}", song.file_path));
+            return Err(crate::audio::PlaybackError::FileNotFound(
+                song.file_path.clone(),
+            ));
         }
 
         Ok(PlaybackSource::AudioPath {
@@ -443,7 +449,7 @@ impl App {
         &mut self,
         song: &DbSong,
         source: PlaybackSource,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         match source {
             PlaybackSource::AudioPath {
                 path,
@@ -484,7 +490,7 @@ impl App {
         song: &DbSong,
         source: PlaybackSource,
         context: &crate::audio::identity::PlaybackContext,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         match source {
             PlaybackSource::AudioPath {
                 path,
@@ -529,7 +535,9 @@ impl App {
                 Ok(request_id)
             }
             PlaybackSource::Preloaded { .. } => {
-                Err("resolved playback cannot promote a preload".to_string())
+                Err(crate::audio::PlaybackError::InvariantViolation(
+                    "resolved playback cannot promote a preload".to_string(),
+                ))
             }
         }
     }
@@ -539,7 +547,7 @@ impl App {
         song: &DbSong,
         path: PathBuf,
         position: std::time::Duration,
-    ) -> Result<(), String> {
+    ) -> crate::audio::PlaybackResult<()> {
         let track_gain = self.resolve_track_gain_for_song(song, TrackGainMode::AnalyzeIfMissing);
         let request_id = self.load_audio_file_paused(path, position, track_gain)?;
         let queue_index = self.resolve_queue_index_for_song(song);
@@ -559,7 +567,7 @@ impl App {
         path: PathBuf,
         position: std::time::Duration,
         context: &crate::audio::identity::PlaybackContext,
-    ) -> Result<(), String> {
+    ) -> crate::audio::PlaybackResult<()> {
         let track_gain = self.resolve_track_gain_for_song(song, TrackGainMode::AnalyzeIfMissing);
         let request_id =
             self.load_audio_file_paused_in_context(context, path, position, track_gain)?;
@@ -582,7 +590,7 @@ impl App {
         finalized_cache_path: Option<String>,
         position: std::time::Duration,
         context: &crate::audio::identity::PlaybackContext,
-    ) -> Result<(), String> {
+    ) -> crate::audio::PlaybackResult<()> {
         let track_gain = self.resolve_track_gain_for_song(song, TrackGainMode::MetadataOnly);
         let duration =
             std::time::Duration::from_secs(duration_secs.unwrap_or(song.duration_secs as u64));
@@ -610,7 +618,7 @@ impl App {
         &mut self,
         song: &DbSong,
         position: std::time::Duration,
-    ) -> Result<(), String> {
+    ) -> crate::audio::PlaybackResult<()> {
         let source = Self::audio_path_source_for_song_at_position(song, position)?;
         let request_id = self.start_audio_source_for_song(song, source)?;
         let queue_index = self.resolve_queue_index_for_song(song);
@@ -628,7 +636,7 @@ impl App {
         idx: usize,
         song: DbSong,
         source: PlaybackSource,
-    ) -> Result<Task<Message>, String> {
+    ) -> crate::audio::PlaybackResult<Task<Message>> {
         let request_id = self.start_audio_source_for_song(&song, source)?;
         self.queue_pending_playback_request(
             request_id,
@@ -645,7 +653,7 @@ impl App {
         song: DbSong,
         source: PlaybackSource,
         context: &crate::audio::identity::PlaybackContext,
-    ) -> Result<Task<Message>, String> {
+    ) -> crate::audio::PlaybackResult<Task<Message>> {
         let request_id = self.start_resolved_audio_source_for_song(&song, source, context)?;
         self.queue_pending_playback_request(
             request_id,
@@ -679,7 +687,7 @@ impl App {
             Ok(source) => source,
             Err(err) => {
                 tracing::error!("Failed to play {}: {}", song.title, err);
-                return self.handle_playback_failure(idx, &err);
+                return self.handle_playback_failure(idx, &err.to_string());
             }
         };
 
@@ -687,7 +695,7 @@ impl App {
             Ok(task) => task,
             Err(err) => {
                 tracing::error!("Failed to play {}: {}", song.title, err);
-                self.handle_playback_failure(idx, &err)
+                self.handle_playback_failure(idx, &err.to_string())
             }
         }
     }
@@ -887,34 +895,26 @@ impl App {
     pub fn handle_audio_error_event(
         &mut self,
         request_id: Option<u64>,
-        message: String,
-        error_kind: Option<crate::audio::PlaybackError>,
+        error: crate::audio::PlaybackError,
     ) -> Task<Message> {
-        tracing::error!(
-            "Audio error: request_id={:?}, message={}, kind={:?}",
-            request_id,
-            message,
-            error_kind
-        );
+        tracing::error!("Audio error: request_id={:?}, error={}", request_id, error);
 
-        let unhealthy_preload = matches!(
-            &error_kind,
-            Some(crate::audio::PlaybackError::UnhealthyPreload(_))
-        );
-        let toast_message = match &error_kind {
-            Some(crate::audio::PlaybackError::UnsupportedFormat(_)) => {
-                "不支持的音频格式".to_string()
-            }
-            Some(crate::audio::PlaybackError::UnsupportedStreaming(_)) => {
+        let unhealthy_preload = matches!(&error, crate::audio::PlaybackError::UnhealthyPreload(_));
+        let toast_message = match &error {
+            crate::audio::PlaybackError::UnsupportedFormat(_)
+            | crate::audio::PlaybackError::SeekUnsupported(_) => "不支持的音频格式".to_string(),
+            crate::audio::PlaybackError::UnsupportedStreaming(_) => {
                 "音频源不支持 Range 流式播放".to_string()
             }
-            Some(crate::audio::PlaybackError::NetworkError(_)) => "网络读取出错".to_string(),
-            Some(crate::audio::PlaybackError::FileNotFound(_)) => "文件不存在".to_string(),
-            Some(crate::audio::PlaybackError::IoError(_)) => "文件读取出错".to_string(),
-            Some(crate::audio::PlaybackError::UnhealthyPreload(_)) => {
+            crate::audio::PlaybackError::NetworkError(_)
+            | crate::audio::PlaybackError::StreamingFailed(_) => "网络读取出错".to_string(),
+            crate::audio::PlaybackError::FileNotFound(_)
+            | crate::audio::PlaybackError::SourceUnavailable(_) => "文件不存在".to_string(),
+            crate::audio::PlaybackError::IoError(_) => "文件读取出错".to_string(),
+            crate::audio::PlaybackError::UnhealthyPreload(_) => {
                 "预加载已失效，正在重新加载".to_string()
             }
-            _ => format!("播放错误: {}", message),
+            _ => format!("播放错误: {}", error),
         };
 
         if let Some(request_id) = request_id {
@@ -941,7 +941,7 @@ impl App {
                             self.replace_active_streaming_buffer(None);
                             fallback
                         } else {
-                            self.handle_playback_failure(idx, &message)
+                            self.handle_playback_failure(idx, &error.to_string())
                         }
                     } else {
                         Self::toast_error(toast_message)
@@ -1423,7 +1423,7 @@ impl App {
                 Ok(context) => context,
                 Err(error) => {
                     self.playback.pending_resolution_index = None;
-                    return Self::toast_warning(error);
+                    return Self::toast_warning(error.to_string());
                 }
             };
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
@@ -1435,7 +1435,6 @@ impl App {
                     super::song_resolver::resolve_song(client, &song, resolve_context, event_tx)
                         .await
                         .map(|resolved| (idx, resolved))
-                        .map_err(|error| error.to_string())
                 },
                 move |result| match result {
                     Ok((idx, resolved)) => Message::SongResolvedStreaming(
@@ -1572,7 +1571,10 @@ impl App {
             tracing::info!("Playing preloaded next (index {}) - zero delay", next_idx);
             return match self.start_queue_song_from_source(next_idx, song, source) {
                 Ok(play_task) => Task::batch([fetch_task, play_task]),
-                Err(err) => Task::batch([fetch_task, self.handle_playback_failure(next_idx, &err)]),
+                Err(err) => Task::batch([
+                    fetch_task,
+                    self.handle_playback_failure(next_idx, &err.to_string()),
+                ]),
             };
         }
 
@@ -1625,7 +1627,7 @@ impl App {
             tracing::info!("Playing preloaded prev (index {}) - zero delay", prev_idx);
             return match self.start_queue_song_from_source(prev_idx, song, source) {
                 Ok(task) => task,
-                Err(err) => self.handle_playback_failure(prev_idx, &err),
+                Err(err) => self.handle_playback_failure(prev_idx, &err.to_string()),
             };
         }
 

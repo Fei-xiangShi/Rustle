@@ -6,6 +6,7 @@ mod audio;
 mod cache;
 mod database;
 mod download;
+pub mod error;
 mod features;
 mod i18n;
 mod image;

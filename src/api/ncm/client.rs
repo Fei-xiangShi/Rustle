@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 use futures_util::stream::{self, StreamExt};
 use ncm_api_rs::{ApiClient, CryptoType, Query, RequestOption, create_client};
 use serde::{Deserialize, Serialize};
@@ -10,6 +9,7 @@ use tracing::error;
 
 use super::mapper::{self, AlbumSource, PlaylistSource};
 use super::models::*;
+use super::{NcmError, NcmResult as Result};
 
 const COOKIE_FILE: &str = "cookies.json";
 const DEFAULT_QUALITY: u32 = 2;
@@ -240,7 +240,7 @@ impl NcmClient {
             .and_then(|data| data.get("unikey"))
             .or_else(|| response.body.get("unikey"))
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow!("QR key missing"))?
+            .ok_or_else(|| NcmError::protocol("QR key missing"))?
             .to_string();
         let qr_url = format!("https://music.163.com/login?codekey={}", unikey);
 
@@ -263,8 +263,11 @@ impl NcmClient {
             .unwrap_or(0);
         let path = cache_dir.join(format!("qrimage_{}.png", timestamp));
         let symbol = qrcode_generator::qr::Encoder::new(qrcode_generator::qr::ErrorCorrection::Low)
-            .encode_text(&qr_url)?;
-        qrcode_generator::Renderer::new(&symbol, 200).save_png(&path)?;
+            .encode_text(&qr_url)
+            .map_err(|error| NcmError::protocol_source("encode QR login", error))?;
+        qrcode_generator::Renderer::new(&symbol, 200)
+            .save_png(&path)
+            .map_err(|error| NcmError::protocol_source("render QR login", error))?;
         Ok((path, unikey))
     }
 
@@ -363,7 +366,7 @@ impl NcmClient {
         if detail.track_count > detail.tracks.len() as u64 {
             let track_ids = mapper::playlist_track_ids(&body);
             if track_ids.is_empty() {
-                return Err(anyhow!("playlist track ids missing"));
+                return Err(NcmError::protocol("playlist track ids missing"));
             }
 
             let fetch_limit = detail.track_count.min(track_ids.len() as u64) as usize;
@@ -387,11 +390,10 @@ impl NcmClient {
             }
 
             if tracks.len() < fetch_limit {
-                return Err(anyhow!(
-                    "playlist tracks incomplete: expected {}, got {}",
-                    fetch_limit,
+                return Err(NcmError::protocol(format!(
+                    "playlist tracks incomplete: expected {fetch_limit}, got {}",
                     tracks.len()
-                ));
+                )));
             }
 
             detail.tracks = tracks;
@@ -433,7 +435,7 @@ impl NcmClient {
             track_ids = detail.tracks.iter().map(|track| track.id).collect();
         }
         if detail.track_count > 0 && track_ids.is_empty() {
-            return Err(anyhow!("playlist track ids missing"));
+            return Err(NcmError::protocol("playlist track ids missing"));
         }
         Ok((detail, track_ids))
     }
@@ -531,11 +533,11 @@ impl NcmClient {
                     .find(|url| url.id == *song_id)
                     .cloned()
                     .ok_or_else(|| {
-                        anyhow!(
+                        NcmError::protocol(format!(
                             "official URL response omitted song {} for quality preference {}",
                             song_id,
                             requested.api_level()
-                        )
+                        ))
                     })
             })
             .collect()
@@ -563,9 +565,9 @@ impl NcmClient {
                 .into_iter()
                 .find(|level| detail.best_for(*level).is_some())
                 .ok_or_else(|| {
-                    anyhow!(
+                    NcmError::business(format!(
                         "Dolby and the SPlayer adaptation ladder are unavailable for song {song_id}"
-                    )
+                    ))
                 })?
             };
 
@@ -577,7 +579,7 @@ impl NcmClient {
             let mut url = urls
                 .drain(..)
                 .find(|track| track.id == song_id)
-                .ok_or_else(|| anyhow!("no playable URL for song {song_id}"))?;
+                .ok_or_else(|| NcmError::business(format!("no playable URL for song {song_id}")))?;
             url.requested_level = requested;
             return Ok(url);
         }
@@ -587,10 +589,10 @@ impl NcmClient {
             .into_iter()
             .find(|track| track.id == song_id)
             .ok_or_else(|| {
-                anyhow!(
+                NcmError::protocol(format!(
                     "official URL response omitted song {song_id} for quality preference {}",
                     requested.api_level()
-                )
+                ))
             })
     }
 

@@ -1,7 +1,8 @@
 //! Database schema migrations
 
-use anyhow::Result;
 use sqlx::{Pool, Sqlite};
+
+use super::StorageResult as Result;
 
 /// Run database migrations to create/update schema
 pub async fn run_migrations(pool: &Pool<Sqlite>) -> Result<()> {

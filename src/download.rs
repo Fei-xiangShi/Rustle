@@ -1,5 +1,6 @@
 //! Download manager types — queue, concurrency, progress tracking
 
+mod error;
 pub mod handler;
 pub mod task;
 
@@ -10,13 +11,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::features::settings::MusicQuality;
 use crate::metadata::SongMetadata;
 
+pub use error::{DownloadError, DownloadResult};
+
 /// Download status for a single task
 #[derive(Debug, Clone)]
 pub enum DownloadStatus {
     Pending,
     Active { progress: f32, speed: String },
     Completed(PathBuf),
-    Failed(String),
+    Failed(crate::error::AppError),
 }
 
 /// A single download task — operational fields + unified metadata
@@ -130,7 +133,7 @@ impl DownloadManager {
         self.abort_handles.remove(&song_id);
     }
 
-    pub fn fail(&mut self, song_id: i64, error: String) {
+    pub fn fail(&mut self, song_id: i64, error: crate::error::AppError) {
         if let Some(pos) = self.active.iter().position(|t| t.song_id == song_id) {
             let mut task = self.active.remove(pos);
             task.status = DownloadStatus::Failed(error);

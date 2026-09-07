@@ -9,22 +9,20 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use crate::download::{DownloadError, DownloadResult as Result};
 use crate::utils::{detect_audio_format, sanitize_filename};
 
 /// Verify downloaded audio file integrity using lofty
-pub fn verify_integrity(path: &Path) -> Result<(), String> {
+pub fn verify_integrity(path: &Path) -> Result<()> {
     use lofty::prelude::*;
     use lofty::probe::Probe;
 
-    let tagged_file = Probe::open(path)
-        .map_err(|e| format!("Failed to open: {}", e))?
-        .read()
-        .map_err(|e| format!("Failed to read: {}", e))?;
+    let tagged_file = Probe::open(path)?.read()?;
 
     let props = tagged_file.properties();
     let duration = props.duration().as_secs();
     if duration == 0 {
-        return Err("File has zero duration".to_string());
+        return Err(DownloadError::ZeroDuration);
     }
 
     info!(
@@ -44,10 +42,10 @@ pub async fn download_song(
     download_dir: &Path,
     meta: &crate::metadata::SongMetadata,
     on_progress: impl Fn(u64, u64),
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     // Ensure the download directory exists.
     fs::create_dir_all(download_dir)
-        .map_err(|e| format!("Failed to create download dir: {}", e))?;
+        .map_err(|error| DownloadError::io("create download directory", error))?;
 
     // Build filename and paths.
     let stem = format!(
@@ -70,20 +68,16 @@ pub async fn download_song(
 
     // Download audio stream.
     let client = reqwest::Client::new();
-    let response = client
-        .get(song_url)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
+    let response = client.get(song_url).send().await?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("HTTP error: {}", status));
+        return Err(DownloadError::HttpStatus(status));
     }
 
     let total = response.content_length().unwrap_or(0);
-    let mut file =
-        fs::File::create(&tmp).map_err(|e| format!("Failed to create temp file: {}", e))?;
+    let mut file = fs::File::create(&tmp)
+        .map_err(|error| DownloadError::io("create temporary download", error))?;
     let mut downloaded: u64 = 0;
     let mut stream = response.bytes_stream();
 
@@ -94,13 +88,13 @@ pub async fn download_song(
             Err(error) => {
                 drop(file);
                 crate::cache::cleanup_temp_file(&tmp);
-                return Err(format!("Download error: {}", error));
+                return Err(DownloadError::Request(error));
             }
         };
         if let Err(error) = file.write_all(&chunk) {
             drop(file);
             crate::cache::cleanup_temp_file(&tmp);
-            return Err(format!("Write error: {}", error));
+            return Err(DownloadError::io("write temporary download", error));
         }
         downloaded += chunk.len() as u64;
         on_progress(downloaded, total);
@@ -109,25 +103,25 @@ pub async fn download_song(
     if let Err(error) = file.flush() {
         drop(file);
         crate::cache::cleanup_temp_file(&tmp);
-        return Err(format!("Flush error: {}", error));
+        return Err(DownloadError::io("flush temporary download", error));
     }
     if let Err(error) = file.sync_all() {
         drop(file);
         crate::cache::cleanup_temp_file(&tmp);
-        return Err(format!("Sync error: {}", error));
+        return Err(DownloadError::io("sync temporary download", error));
     }
     drop(file);
 
     if downloaded == 0 {
         crate::cache::cleanup_temp_file(&tmp);
-        return Err("Downloaded 0 bytes".to_string());
+        return Err(DownloadError::Empty);
     }
     if total > 0 && downloaded != total {
         crate::cache::cleanup_temp_file(&tmp);
-        return Err(format!(
-            "Downloaded size {} does not match expected {}",
-            downloaded, total
-        ));
+        return Err(DownloadError::SizeMismatch {
+            actual: downloaded,
+            expected: total,
+        });
     }
 
     // Detect format from magic bytes, then rename.
@@ -137,9 +131,9 @@ pub async fn download_song(
             Ok(file) => file,
             Err(error) => {
                 crate::cache::cleanup_temp_file(&tmp);
-                return Err(format!(
-                    "Failed to open temp for format detection: {}",
-                    error
+                return Err(DownloadError::io(
+                    "open temporary download for format detection",
+                    error,
                 ));
             }
         };
@@ -147,18 +141,20 @@ pub async fn download_song(
         let Some(extension) = detect_audio_format(&buf[..n]) else {
             drop(f);
             crate::cache::cleanup_temp_file(&tmp);
-            return Err("Downloaded file has an unknown or damaged audio format".to_string());
+            return Err(DownloadError::UnsupportedFormat);
         };
         extension.to_string()
     };
     let dest = download_dir.join(format!("{}.{}", stem, ext));
     crate::cache::publish_or_reuse(&tmp, &dest, (total > 0).then_some(total))
-        .map_err(|e| format!("Failed to publish downloaded file: {}", e))?;
+        .map_err(|error| DownloadError::io("publish downloaded file", error))?;
 
     // Verify the final file is playable.
     if let Err(e) = verify_integrity(&dest) {
         let _ = fs::remove_file(&dest);
-        return Err(format!("Downloaded file is corrupt: {}", e));
+        return Err(DownloadError::Integrity {
+            source: Box::new(e),
+        });
     }
 
     // Write metadata tags, reusing the unified image cache when available.

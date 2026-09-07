@@ -157,7 +157,7 @@ fn fetch_ncm_playlist_chunks(
                             yield Message::NcmPlaylistLoadFailed(
                                 generation,
                                 playlist_id,
-                                "加载歌单歌曲失败".to_string(),
+                                error.into(),
                             );
                             return;
                         }
@@ -436,7 +436,7 @@ impl App {
                         }
                         Err(e) => {
                             error!("Failed to load daily recommend: {:?}", e);
-                            Err("加载每日推荐失败".to_string())
+                            Err(crate::error::AppError::from(e))
                         }
                     }
                 },
@@ -847,9 +847,15 @@ impl App {
                                 801 => QrLoginStatus::WaitingForScan,
                                 802 => QrLoginStatus::WaitingForConfirm,
                                 803 => QrLoginStatus::Success,
-                                _ => QrLoginStatus::Error(format!("Unknown code: {}", msg.code)),
+                                _ => QrLoginStatus::Error(
+                                    crate::error::AppError::with_message_source(
+                                        crate::error::ErrorCode::ProtocolInvalidResponse,
+                                        "The login service returned an unknown status",
+                                        format!("Unknown QR login code: {}", msg.code),
+                                    ),
+                                ),
                             },
-                            Err(e) => QrLoginStatus::Error(e.to_string()),
+                            Err(e) => QrLoginStatus::Error(e.into()),
                         }
                     },
                     Message::QrLoginResult,
@@ -1218,7 +1224,7 @@ impl App {
                                 Message::NcmPlaylistLoadFailed(
                                     generation,
                                     internal_id,
-                                    "加载歌单失败".to_string(),
+                                    error.into(),
                                 )
                             }
                         },
@@ -1403,7 +1409,7 @@ impl App {
                 }
                 self.ui.playlist_page.load_state =
                     crate::app::update::page_loader::PlaylistLoadState::Idle;
-                Some(Self::toast_error(message.clone()))
+                Some(Self::toast_error(message.user_summary().to_owned()))
             }
 
             Message::NcmPlaylistSongsChunk(
@@ -1910,7 +1916,7 @@ impl App {
                         },
                         move |result| match result {
                             Ok(()) => Message::NcmPlaylistAddResult(sid, pid, Ok(())),
-                            Err(e) => Message::NcmPlaylistAddResult(sid, pid, Err(e.to_string())),
+                            Err(e) => Message::NcmPlaylistAddResult(sid, pid, Err(e.into())),
                         },
                     ));
                 }

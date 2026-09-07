@@ -289,7 +289,7 @@ pub enum AudioEvent {
     SeekFailed {
         context: PlaybackContext,
         nonce: SeekNonce,
-        error: String,
+        error: PlaybackError,
     },
     /// Seek started
     SeekStarted {
@@ -328,7 +328,7 @@ pub enum AudioEvent {
     /// Preload failed
     PreloadFailed {
         identity: PreloadIdentity,
-        error: String,
+        error: PlaybackError,
     },
     /// Device switched successfully
     DeviceSwitched {
@@ -337,7 +337,7 @@ pub enum AudioEvent {
     },
     /// Device switch failed
     DeviceSwitchFailed {
-        error: String,
+        error: PlaybackError,
     },
     Finished {
         context: PlaybackContext,
@@ -346,8 +346,7 @@ pub enum AudioEvent {
     Error {
         context: PlaybackContext,
         request_id: Option<u64>,
-        message: String,
-        error_kind: Option<PlaybackError>,
+        error: PlaybackError,
     },
 }
 
@@ -717,5 +716,22 @@ mod tests {
         assert_eq!(state.cache_progress(), Some(0.5));
         state.set_cache_bytes(0, 0);
         assert_eq!(state.cache_progress(), None);
+    }
+
+    #[test]
+    fn audio_error_events_retain_the_typed_playback_error() {
+        let controller = super::super::identity::PlaybackGenerationController::new();
+        let context = controller.activate_generation();
+        let event = AudioEvent::Error {
+            context,
+            request_id: Some(7),
+            error: PlaybackError::Cancelled("stale generation".to_string()),
+        };
+
+        let AudioEvent::Error { error, .. } = event else {
+            panic!("constructed the wrong audio event variant");
+        };
+        assert!(matches!(error, PlaybackError::Cancelled(_)));
+        assert_eq!(error.code(), crate::error::ErrorCode::OperationCancelled);
     }
 }

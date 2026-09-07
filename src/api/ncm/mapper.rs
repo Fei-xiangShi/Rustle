@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+use super::error::{NcmError, NcmResult as Result};
 use super::models::*;
 
 fn code_ok(value: &Value) -> bool {
@@ -142,11 +142,11 @@ fn vip_info_from_nodes(profile: Option<&Value>, root: Option<&Value>) -> VipInfo
 /// or legacy URL is synthesized.
 pub fn merge_membership_vip(base: &VipInfo, value: &Value) -> Result<VipInfo> {
     if !code_ok(value) {
-        return Err(anyhow!("VIP membership request failed"));
+        return Err(NcmError::business("VIP membership request failed"));
     }
     let data = value
         .get("data")
-        .ok_or_else(|| anyhow!("VIP membership payload missing data"))?;
+        .ok_or_else(|| NcmError::protocol("VIP membership payload missing data"))?;
     let icon_url = |section: &str| {
         data.get(section)
             .and_then(|node| node.get("iconUrl"))
@@ -345,7 +345,7 @@ pub fn track_from_value(track: &Value, album_override: Option<&Value>) -> Result
         id: track
             .get("id")
             .and_then(as_u64)
-            .ok_or_else(|| anyhow!("track id missing"))?,
+            .ok_or_else(|| NcmError::protocol("track id missing"))?,
         title: str_value(track, "name"),
         artists,
         album,
@@ -382,7 +382,7 @@ pub fn tracks_from_array(items: Option<&Vec<Value>>, album_override: Option<&Val
 
 pub fn track_urls(value: &Value, requested_level: NcmQualityLevel) -> Result<Vec<TrackUrl>> {
     if !code_ok(value) {
-        return Err(anyhow!("track url request failed"));
+        return Err(NcmError::business("track URL request failed"));
     }
     Ok(value
         .get("data")
@@ -426,7 +426,7 @@ pub fn track_urls(value: &Value, requested_level: NcmQualityLevel) -> Result<Vec
 
 pub fn song_quality_detail(value: &Value, song_id: u64) -> Result<SongQualityDetail> {
     if !code_ok(value) {
-        return Err(anyhow!("song quality detail request failed"));
+        return Err(NcmError::business("song quality detail request failed"));
     }
     let data = value.get("data").unwrap_or(value);
     let mut options = quality_options_from_object(data);
@@ -446,7 +446,7 @@ pub fn song_quality_detail(value: &Value, song_id: u64) -> Result<SongQualityDet
 
 pub fn track_detail(value: &Value) -> Result<Vec<Track>> {
     if !code_ok(value) {
-        return Err(anyhow!("track detail request failed"));
+        return Err(NcmError::business("track detail request failed"));
     }
     Ok(tracks_from_array(
         value.get("songs").and_then(Value::as_array),
@@ -456,7 +456,7 @@ pub fn track_detail(value: &Value) -> Result<Vec<Track>> {
 
 pub fn lyrics(value: &Value) -> Result<Lyrics> {
     if !code_ok(value) {
-        return Err(anyhow!("lyrics request failed"));
+        return Err(NcmError::business("lyrics request failed"));
     }
 
     let split_lyric = |key: &str| {
@@ -523,7 +523,7 @@ mod lyric_tests {
 /// Dolby level is also the server-declared actual level for this API path.
 pub fn legacy_track_urls(value: &Value, requested_level: NcmQualityLevel) -> Result<Vec<TrackUrl>> {
     if !code_ok(value) {
-        return Err(anyhow!("legacy track url request failed"));
+        return Err(NcmError::business("legacy track URL request failed"));
     }
     Ok(value
         .get("data")
@@ -730,11 +730,11 @@ mod quality_tests {
 
 pub fn playlist_detail(value: &Value) -> Result<PlaylistDetail> {
     if !code_ok(value) {
-        return Err(anyhow!("playlist detail request failed"));
+        return Err(NcmError::business("playlist detail request failed"));
     }
     let playlist = value
         .get("playlist")
-        .ok_or_else(|| anyhow!("playlist missing"))?;
+        .ok_or_else(|| NcmError::protocol("playlist missing"))?;
     let tracks = playlist.get("tracks").and_then(Value::as_array);
     let privileges = value.get("privileges").and_then(Value::as_array);
 
@@ -788,14 +788,14 @@ pub fn playlist_track_ids(value: &Value) -> Vec<u64> {
 
 pub fn artist_detail(value: &Value) -> Result<ArtistDetail> {
     if !code_ok(value) {
-        return Err(anyhow!("artist detail request failed"));
+        return Err(NcmError::business("artist detail request failed"));
     }
 
     let artist = value
         .get("artist")
         .or_else(|| value.get("data").and_then(|data| data.get("artist")))
         .or_else(|| value.get("data"))
-        .ok_or_else(|| anyhow!("artist missing"))?;
+        .ok_or_else(|| NcmError::protocol("artist missing"))?;
 
     let tracks = tracks_from_array(value.get("hotSongs").and_then(Value::as_array), None);
 
@@ -822,10 +822,12 @@ pub fn artist_detail(value: &Value) -> Result<ArtistDetail> {
 
 pub fn album_detail(value: &Value) -> Result<AlbumDetail> {
     if !code_ok(value) {
-        return Err(anyhow!("album detail request failed"));
+        return Err(NcmError::business("album detail request failed"));
     }
 
-    let album = value.get("album").ok_or_else(|| anyhow!("album missing"))?;
+    let album = value
+        .get("album")
+        .ok_or_else(|| NcmError::protocol("album missing"))?;
     let summary = album_summary_from_value(album).unwrap_or_default();
     let tracks = tracks_from_array(value.get("songs").and_then(Value::as_array), Some(album));
 
@@ -852,11 +854,11 @@ pub fn album_detail(value: &Value) -> Result<AlbumDetail> {
 
 pub fn user_detail(value: &Value) -> Result<UserDetail> {
     if !code_ok(value) {
-        return Err(anyhow!("user detail request failed"));
+        return Err(NcmError::business("user detail request failed"));
     }
     let profile = value
         .get("profile")
-        .ok_or_else(|| anyhow!("profile missing"))?;
+        .ok_or_else(|| NcmError::protocol("profile missing"))?;
 
     Ok(UserDetail {
         user_id: profile.get("userId").and_then(as_u64).unwrap_or_default(),
@@ -877,7 +879,7 @@ pub fn user_detail(value: &Value) -> Result<UserDetail> {
 
 pub fn playlist_summaries(value: &Value, source: PlaylistSource) -> Result<Vec<PlaylistSummary>> {
     if !code_ok(value) {
-        return Err(anyhow!("playlist summary request failed"));
+        return Err(NcmError::business("playlist summary request failed"));
     }
 
     let items = match source {
@@ -942,7 +944,7 @@ mod playlist_summary_tests {
 
 pub fn album_summaries(value: &Value, source: AlbumSource) -> Result<Vec<AlbumSummary>> {
     if !code_ok(value) {
-        return Err(anyhow!("album summary request failed"));
+        return Err(NcmError::business("album summary request failed"));
     }
 
     let items = match source {
@@ -968,7 +970,7 @@ pub enum AlbumSource {
 
 pub fn artist_summaries(value: &Value) -> Result<Vec<ArtistSummary>> {
     if !code_ok(value) {
-        return Err(anyhow!("artist summary request failed"));
+        return Err(NcmError::business("artist summary request failed"));
     }
 
     Ok(value
@@ -1053,7 +1055,7 @@ fn radio_summaries(value: &Value) -> Vec<RadioSummary> {
 
 pub fn liked_song_ids(value: &Value) -> Result<Vec<u64>> {
     if !code_ok(value) {
-        return Err(anyhow!("liked song ids request failed"));
+        return Err(NcmError::business("liked song IDs request failed"));
     }
     Ok(value
         .get("ids")
@@ -1085,7 +1087,7 @@ pub fn login_info(value: &Value) -> Result<LoginInfo> {
 
     let profile = value
         .get("profile")
-        .ok_or_else(|| anyhow!("login profile missing"))?;
+        .ok_or_else(|| NcmError::protocol("login profile missing"))?;
 
     let vip = vip_info_from_nodes(Some(profile), Some(value));
     Ok(LoginInfo {
@@ -1101,12 +1103,12 @@ pub fn login_info(value: &Value) -> Result<LoginInfo> {
 
 pub fn account_info(value: &Value) -> Result<LoginInfo> {
     if !code_ok(value) {
-        return Err(anyhow!("account info request failed"));
+        return Err(NcmError::business("account info request failed"));
     }
     let profile = value
         .get("profile")
         .or_else(|| value.get("userProfile"))
-        .ok_or_else(|| anyhow!("account profile missing"))?;
+        .ok_or_else(|| NcmError::protocol("account profile missing"))?;
     let vip = vip_info_from_nodes(Some(profile), Some(value));
     Ok(LoginInfo {
         code: 200,
@@ -1133,7 +1135,7 @@ pub fn msg(value: &Value) -> Msg {
 
 pub fn search(value: &Value, search_type: SearchType) -> Result<SearchResponse> {
     if !code_ok(value) {
-        return Err(anyhow!("search request failed"));
+        return Err(NcmError::business("search request failed"));
     }
     let result = value.get("result").unwrap_or(&Value::Null);
     let mut response = SearchResponse::default();

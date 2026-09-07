@@ -9,6 +9,7 @@ mod view;
 use iced::{Task, Theme};
 use std::sync::Arc;
 
+use crate::error::{AppError, ErrorCode};
 use crate::i18n::{Language, Locale};
 pub use message::{
     ContextMenuAction, IconId, Message, PlaylistViewPayload, SettingsSection, SidebarId,
@@ -175,11 +176,15 @@ impl App {
             },
             Task::perform(helpers::init_database(), |result| match result {
                 Ok(db) => Message::DatabaseReady(Arc::new(db)),
-                Err(e) => Message::DatabaseError(e.to_string()),
+                Err(e) => Message::DatabaseError(e.into()),
             }),
             Task::perform(helpers::init_cover_cache(), |result| match result {
                 Ok(cache) => Message::CoverCacheReady(Arc::new(cache)),
-                Err(e) => Message::DatabaseError(format!("Cover cache error: {}", e)),
+                Err(e) => Message::DatabaseError(AppError::with_message_source(
+                    ErrorCode::StorageOpenFailed,
+                    "Rustle could not initialize the cover cache",
+                    e.to_string(),
+                )),
             }),
             Task::perform(helpers::init_font_system(), |font_system| {
                 Message::LyricsFontSystemReady(font_system)

@@ -129,7 +129,7 @@ impl App {
                 if let Some(idx) = self.playback.current_index {
                     return Some(Task::batch([
                         Self::toast_error(format!("无法播放：{reason}")),
-                        self.handle_playback_failure(idx, reason),
+                        self.handle_playback_failure(idx, reason.user_summary()),
                     ]));
                 }
                 Some(Self::toast_error(format!("无法加载歌曲：{reason}")))

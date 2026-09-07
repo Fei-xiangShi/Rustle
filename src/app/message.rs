@@ -14,6 +14,7 @@ use crate::app::state::UserInfo;
 use crate::app::update::audio_preload_manager::PreloadDirection;
 use crate::audio::identity::{PlaybackContext, PreloadIdentity};
 use crate::database::{Database, DbPlaybackState, DbPlaylist, DbSong, DbWatchedFolder};
+use crate::error::AppError;
 use crate::features::Action;
 use crate::features::import::{CoverCache, ScanProgress, WatchEvent};
 use crate::ui::animation::SmoothScrollEvent;
@@ -65,7 +66,7 @@ pub struct SearchRequestContext {
 #[derive(Debug, Clone)]
 pub struct SearchErrorPayload {
     pub context: SearchRequestContext,
-    pub error: String,
+    pub error: AppError,
 }
 
 /// Search results payload for async loading
@@ -206,7 +207,7 @@ pub enum Message {
     /// Database initialized
     DatabaseReady(Arc<Database>),
     /// Database error
-    DatabaseError(String),
+    DatabaseError(AppError),
     /// Songs loaded from database
     SongsLoaded(Vec<DbSong>),
     /// Playlists loaded from database
@@ -221,7 +222,7 @@ pub enum Message {
     /// (queue_index, resolved_result, saved_position_secs, playback_context)
     SongResolvedForRestore(
         usize,
-        Result<crate::app::update::song_resolver::ResolvedSong, String>,
+        Result<crate::app::update::song_resolver::ResolvedSong, AppError>,
         f64,
         PlaybackContext,
     ),
@@ -244,7 +245,7 @@ pub enum Message {
     /// Scan progress update
     ScanProgressUpdate(ScanProgress),
     /// Import completed and local library playlist was created
-    ImportedPlaylistCreated(Result<i64, String>),
+    ImportedPlaylistCreated(Result<i64, AppError>),
     /// File watcher event
     WatcherEvent(WatchEvent),
     /// Background watcher mutation completed for a local playlist
@@ -350,13 +351,13 @@ pub enum Message {
     /// Lyrics loaded from online (song_id, lyrics_lines)
     LyricsLoaded(i64, Vec<crate::ui::pages::LyricLine>),
     /// Lyrics loading failed
-    LyricsLoadFailed(i64, String),
+    LyricsLoadFailed(i64, AppError),
     /// Start online lyrics fetch for display loading (song_id, ncm_id)
     FetchLyricsOnline(i64, u64),
     /// Warm lyrics cache for a song in the background (song_id, ncm_id)
     WarmLyricsCache(i64, u64),
     /// Background lyrics cache warmup completed
-    LyricsWarmupFinished(i64, Result<(), String>),
+    LyricsWarmupFinished(i64, Result<(), AppError>),
     /// Local/cached lyrics loaded asynchronously (song_id, lyrics_lines)
     LocalLyricsReady(i64, Vec<crate::ui::pages::LyricLine>),
     /// Engine lines pre-computed asynchronously (song_id, engine_lines)
@@ -442,7 +443,7 @@ pub enum Message {
         PlaybackContext,
     ),
     /// Song resolution failed (playback context, explicit reason)
-    SongResolveFailed(PlaybackContext, String),
+    SongResolveFailed(PlaybackContext, AppError),
     /// Remove song from queue by index
     RemoveFromQueue(usize),
     /// Clear the entire queue
@@ -468,7 +469,7 @@ pub enum Message {
     /// Download completed (song_id, file_path)
     DownloadCompleted(i64, String),
     /// Download failed (song_id, error_message)
-    DownloadError(i64, String),
+    DownloadError(i64, AppError),
     /// Delete a download history entry by song_id
     DeleteDownloadHistory(i64),
     /// Switch download panel tab
@@ -592,7 +593,7 @@ pub enum Message {
     NcmPlaylistCreatorDetailLoaded(u64, i64, UserDetail),
     /// NCM playlist request failed. The generation prevents an old request
     /// from changing a page that has since been opened again.
-    NcmPlaylistLoadFailed(u64, i64, String),
+    NcmPlaylistLoadFailed(u64, i64, AppError),
     /// Artist detail loaded
     ArtistDetailLoaded(ArtistDetail),
     /// Album detail loaded
@@ -709,7 +710,7 @@ pub enum Message {
     /// Add an NCM song to an NCM online playlist (song_ncm_id, ncm_playlist_id)
     AddToNcmPlaylist(u64, u64),
     /// Result of adding song to NCM playlist
-    NcmPlaylistAddResult(u64, u64, Result<(), String>),
+    NcmPlaylistAddResult(u64, u64, Result<(), AppError>),
 
     // ============ Overlay System (Unified) ============
     /// Dismiss the topmost dismissible overlay
@@ -743,7 +744,7 @@ pub enum Message {
     /// Song edits save failed
     SongEditsFailed {
         song_id: i64,
-        error: String,
+        error: AppError,
     },
 }
 
@@ -794,7 +795,7 @@ pub enum QrLoginStatus {
     /// Success (803)
     Success,
     /// Error
-    Error(String),
+    Error(AppError),
 }
 
 // Manual Debug implementation to avoid slow formatting of large data structures

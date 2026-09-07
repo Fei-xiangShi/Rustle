@@ -177,7 +177,10 @@ impl App {
         let Some(client) = &self.core.ncm_client else {
             return Task::done(Message::SearchFailed(SearchErrorPayload {
                 context: SearchRequestContext { keyword, tab, page },
-                error: "未登录".to_string(),
+                error: crate::error::AppError::new(
+                    crate::error::ErrorCode::AuthenticationRequired,
+                    "Please sign in to search",
+                ),
             }));
         };
 
@@ -263,7 +266,7 @@ impl App {
                     }
                     Err(e) => Message::SearchFailed(SearchErrorPayload {
                         context: SearchRequestContext { keyword, tab, page },
-                        error: e.to_string(),
+                        error: e.into(),
                     }),
                 }
             },

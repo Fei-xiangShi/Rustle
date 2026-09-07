@@ -202,7 +202,14 @@ impl App {
                                                 crate::features::lyrics::to_ui_lyrics(lines);
                                             Message::LyricsLoaded(song_id, ui_lines)
                                         }
-                                        Err(e) => Message::LyricsLoadFailed(song_id, e.to_string()),
+                                        Err(e) => Message::LyricsLoadFailed(
+                                            song_id,
+                                            crate::error::AppError::with_message_source(
+                                                crate::error::ErrorCode::MediaReadFailed,
+                                                "Rustle could not load lyrics",
+                                                e.to_string(),
+                                            ),
+                                        ),
                                     }
                                 },
                                 |msg| msg,
@@ -213,7 +220,10 @@ impl App {
                                 .finish_warmup(song_id, Err("No NCM client".to_string()));
                             Some(Task::done(Message::LyricsLoadFailed(
                                 song_id,
-                                "No NCM client".to_string(),
+                                crate::error::AppError::new(
+                                    crate::error::ErrorCode::AuthenticationRequired,
+                                    "Please sign in to load online lyrics",
+                                ),
                             )))
                         }
                     }
@@ -238,14 +248,23 @@ impl App {
                             crate::features::lyrics::fetch_lyrics(&client, ncm_id)
                                 .await
                                 .map(|_| ())
-                                .map_err(|err| err.to_string())
+                                .map_err(|err| {
+                                    crate::error::AppError::with_message_source(
+                                        crate::error::ErrorCode::MediaReadFailed,
+                                        "Rustle could not warm the lyrics cache",
+                                        err.to_string(),
+                                    )
+                                })
                         },
                         move |result| Message::LyricsWarmupFinished(song_id, result),
                     ))
                 } else {
                     Some(Task::done(Message::LyricsWarmupFinished(
                         song_id,
-                        Err("No NCM client".to_string()),
+                        Err(crate::error::AppError::new(
+                            crate::error::ErrorCode::AuthenticationRequired,
+                            "Please sign in to load online lyrics",
+                        )),
                     )))
                 }
             }
@@ -257,9 +276,13 @@ impl App {
                         tracing::debug!("Lyrics warmup failed for song {}: {}", song_id, error)
                     }
                 }
-                self.playback
-                    .lyrics_preload_manager
-                    .finish_warmup(*song_id, result.clone());
+                self.playback.lyrics_preload_manager.finish_warmup(
+                    *song_id,
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| error.user_summary().to_owned()),
+                );
                 if result.is_ok() {
                     self.playback
                         .preload_coordinator
@@ -306,9 +329,9 @@ impl App {
                     if *song_id < 0 {
                         self.playback
                             .lyrics_preload_manager
-                            .finish_warmup(*song_id, Err(error.clone()));
+                            .finish_warmup(*song_id, Err(error.user_summary().to_owned()));
                     }
-                    self.apply_lyrics_error(*song_id, error.clone());
+                    self.apply_lyrics_error(*song_id, error);
                     tracing::warn!("Failed to load lyrics for song {}: {}", song_id, error);
                 }
                 Some(Task::none())
@@ -1360,7 +1383,7 @@ impl App {
         }
     }
 
-    fn apply_lyrics_error(&mut self, song_id: i64, error: String) {
+    fn apply_lyrics_error(&mut self, song_id: i64, error: &crate::error::AppError) {
         if self.ui.lyrics.pending_song_id != Some(song_id) {
             return;
         }
@@ -1375,7 +1398,7 @@ impl App {
         self.ui.lyrics.shape_generation = self.ui.lyrics.shape_generation.wrapping_add(1);
         self.clear_pending_lyrics_shape();
         self.ui.lyrics.is_loading = false;
-        self.ui.lyrics.load_error = Some(error);
+        self.ui.lyrics.load_error = Some(error.user_summary().to_owned());
         self.ui.lyrics.current_line_idx = None;
 
         if let Some(engine_cell) = &self.ui.lyrics.engine {
@@ -1416,7 +1439,10 @@ impl App {
                 Some(lines) => Message::LocalLyricsReady(song_id, lines),
                 None => Message::LyricsLoadFailed(
                     song_id,
-                    "Cached lyrics unavailable after warmup".to_string(),
+                    crate::error::AppError::new(
+                        crate::error::ErrorCode::MediaReadFailed,
+                        "Cached lyrics are unavailable",
+                    ),
                 ),
             },
         )
@@ -1741,7 +1767,13 @@ impl App {
                     } else if !lines.is_empty() {
                         Message::LocalLyricsReady(song_id, lines)
                     } else {
-                        Message::LyricsLoadFailed(song_id, "No lyrics found".to_string())
+                        Message::LyricsLoadFailed(
+                            song_id,
+                            crate::error::AppError::new(
+                                crate::error::ErrorCode::MediaReadFailed,
+                                "No lyrics were found",
+                            ),
+                        )
                     }
                 }
                 None => Message::Noop,

@@ -289,10 +289,15 @@ impl App {
             }
             AudioEvent::SeekFailed { error, .. } => {
                 tracing::warn!("Seek failed: {}", error);
-                if error.contains("not supported") {
+                if matches!(error, crate::audio::PlaybackError::SeekUnsupported(_)) {
                     return Self::toast_warning("该格式不支持拖动进度条".to_string());
                 }
-                if error.contains("end of stream") || error.contains("streaming") {
+                if matches!(
+                    error,
+                    crate::audio::PlaybackError::StreamingFailed(_)
+                        | crate::audio::PlaybackError::UnsupportedStreaming(_)
+                        | crate::audio::PlaybackError::NetworkError(_)
+                ) {
                     let progress = self
                         .playback
                         .active_streaming_buffer
@@ -374,11 +379,8 @@ impl App {
                 }
             }
             AudioEvent::Error {
-                request_id,
-                message,
-                error_kind,
-                ..
-            } => return self.handle_audio_error_event(request_id, message, error_kind),
+                request_id, error, ..
+            } => return self.handle_audio_error_event(request_id, error),
         }
 
         if should_sync_mpris {

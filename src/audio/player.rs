@@ -23,6 +23,7 @@ use super::chain::{AudioProcessingChain, PlaybackProcessingRuntime};
 use super::streaming::{SharedBuffer, StreamingBuffer, StreamingReaderCancellation};
 
 pub(crate) type PreparedStreamingSource = Decoder<StreamingBuffer>;
+pub type PlaybackResult<T> = Result<T, PlaybackError>;
 
 /// Build the decoder outside the audio control actor.
 ///
@@ -32,16 +33,18 @@ pub(crate) type PreparedStreamingSource = Decoder<StreamingBuffer>;
 /// worker rather than blocking lifecycle commands.
 pub(crate) fn prepare_streaming_source(
     buffer: StreamingBuffer,
-) -> Result<PreparedStreamingSource, String> {
+) -> PlaybackResult<PreparedStreamingSource> {
     let shared = buffer.shared();
     let byte_len = shared.total_size();
     if byte_len == 0 {
-        return Err(
-            "UnsupportedStreaming: source preparation requires a validated total size".to_string(),
-        );
+        return Err(PlaybackError::UnsupportedStreaming(
+            "source preparation requires a validated total size".to_string(),
+        ));
     }
     if shared.is_cancelled() {
-        return Err("Cancelled: streaming source preparation was cancelled".to_string());
+        return Err(PlaybackError::Cancelled(
+            "streaming source preparation was cancelled".to_string(),
+        ));
     }
     if let Some(error) = shared.error_message() {
         return Err(error);
@@ -52,7 +55,7 @@ pub(crate) fn prepare_streaming_source(
         .with_byte_len(byte_len)
         .with_seekable(true)
         .build()
-        .map_err(|e| format!("Failed to decode streaming audio: {}", e))
+        .map_err(|error| PlaybackError::DecodeError(error.to_string()))
 }
 
 /// Cached audio devices to avoid repeated enumeration (which triggers Jack/ALSA warnings)
@@ -177,7 +180,7 @@ impl AudioPlayer {
     const FADE_DURATION: Duration = Duration::from_millis(300);
 
     /// Create a new audio player with default output device
-    pub fn new(chain: AudioProcessingChain) -> Result<Self, String> {
+    pub fn new(chain: AudioProcessingChain) -> PlaybackResult<Self> {
         Self::with_device(None, chain)
     }
 
@@ -185,12 +188,12 @@ impl AudioPlayer {
     pub fn with_device(
         device_name: Option<&str>,
         chain: AudioProcessingChain,
-    ) -> Result<Self, String> {
+    ) -> PlaybackResult<Self> {
         let stream = if let Some(name) = device_name {
             Self::create_stream_for_device(name)?
         } else {
             OutputStreamBuilder::open_default_sink()
-                .map_err(|e| format!("Failed to create audio output: {}", e))?
+                .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
         };
 
         let state = PlayerState {
@@ -216,38 +219,41 @@ impl AudioPlayer {
     }
 
     /// Create output stream for a specific device by name
-    fn create_stream_for_device(device_name: &str) -> Result<OutputStream, String> {
+    fn create_stream_for_device(device_name: &str) -> PlaybackResult<OutputStream> {
         let host = rodio::cpal::default_host();
 
         let device = host
             .output_devices()
-            .map_err(|e| format!("Failed to enumerate devices: {}", e))?
+            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
             .find(|device| {
                 device
                     .description()
                     .map(|description| description.name() == device_name)
                     .unwrap_or(false)
             })
-            .ok_or_else(|| format!("Device not found: {}", device_name))?;
+            .ok_or_else(|| PlaybackError::DeviceUnavailable(device_name.to_string()))?;
 
         let config = device
             .default_output_config()
-            .map_err(|e| format!("Failed to get device config: {}", e))?;
-        let sample_rate = rodio::SampleRate::new(config.sample_rate())
-            .ok_or_else(|| "Output device reported a zero sample rate".to_string())?;
+            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?;
+        let sample_rate = rodio::SampleRate::new(config.sample_rate()).ok_or_else(|| {
+            PlaybackError::DeviceUnavailable(
+                "output device reported a zero sample rate".to_string(),
+            )
+        })?;
 
         OutputStreamBuilder::from_device(device)
-            .map_err(|e| format!("Failed to create stream builder: {}", e))?
+            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
             .with_sample_rate(sample_rate)
             .open_stream()
-            .map_err(|e| format!("Failed to open stream: {}", e))
+            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))
     }
 
     /// Switch to a different audio output device
     pub fn switch_device(
         &mut self,
         device_name: Option<&str>,
-    ) -> Result<Option<(PathBuf, Duration, bool)>, String> {
+    ) -> PlaybackResult<Option<(PathBuf, Duration, bool)>> {
         let playback_state = self.current_path.clone().map(|path| {
             let info = self.get_info();
             let was_playing = info.status == PlaybackStatus::Playing;
@@ -261,7 +267,7 @@ impl AudioPlayer {
             Self::create_stream_for_device(name)?
         } else {
             OutputStreamBuilder::open_default_sink()
-                .map_err(|e| format!("Failed to create audio output: {}", e))?
+                .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
         };
 
         {
@@ -280,8 +286,14 @@ impl AudioPlayer {
         self.state.lock().unwrap().volume
     }
 
-    fn decode_local_file(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
-        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    fn decode_local_file(path: &Path) -> PlaybackResult<Decoder<BufReader<File>>> {
+        let file = File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PlaybackError::FileNotFound(path.display().to_string())
+            } else {
+                PlaybackError::IoError(error.to_string())
+            }
+        })?;
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let reader = BufReader::new(file);
 
@@ -290,7 +302,7 @@ impl AudioPlayer {
             .with_byte_len(file_len)
             .with_seekable(true)
             .build()
-            .map_err(|e| format!("Failed to decode audio: {}", e))
+            .map_err(|error| PlaybackError::DecodeError(error.to_string()))
     }
 
     fn prepare_runtime(&self, fade_in: bool) -> PlaybackProcessingRuntime {
@@ -299,7 +311,7 @@ impl AudioPlayer {
         runtime
     }
 
-    fn try_seek_on_start(sink: &Sink, position: Duration, path: &Path) -> Option<String> {
+    fn try_seek_on_start(sink: &Sink, position: Duration, path: &Path) -> Option<PlaybackError> {
         if position.is_zero() {
             return None;
         }
@@ -311,7 +323,9 @@ impl AudioPlayer {
                 path,
                 err
             );
-            return Some("Seek not supported for this format".to_string());
+            return Some(PlaybackError::SeekUnsupported(
+                "seek is not supported for this format".to_string(),
+            ));
         }
 
         None
@@ -323,7 +337,7 @@ impl AudioPlayer {
         path: PathBuf,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.stop();
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(fade_in);
@@ -368,7 +382,7 @@ impl AudioPlayer {
         &self,
         path: &Path,
         track_gain: f32,
-    ) -> Result<(Sink, Duration, PlaybackProcessingRuntime), String> {
+    ) -> PlaybackResult<(Sink, Duration, PlaybackProcessingRuntime)> {
         let source = Self::decode_local_file(path)?;
         let duration = source.total_duration().unwrap_or(Duration::ZERO);
 
@@ -389,7 +403,7 @@ impl AudioPlayer {
         path: PathBuf,
         position: Duration,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.stop();
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(false);
@@ -439,10 +453,12 @@ impl AudioPlayer {
         cache_path: Option<PathBuf>,
         position: Duration,
         track_gain: f32,
-    ) -> Result<Option<String>, String> {
+    ) -> PlaybackResult<Option<PlaybackError>> {
         self.stop();
         if !reader_cancellation.activate() {
-            return Err("streaming reader demand lease is owned by another decoder".to_string());
+            return Err(PlaybackError::InvariantViolation(
+                "streaming reader demand lease is owned by another decoder".to_string(),
+            ));
         }
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(false);
@@ -497,7 +513,7 @@ impl AudioPlayer {
         position: Duration,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<Option<String>, String> {
+    ) -> PlaybackResult<Option<PlaybackError>> {
         self.stop();
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(fade_in);
@@ -548,7 +564,7 @@ impl AudioPlayer {
         source: PreparedStreamingSource,
         duration: Duration,
         track_gain: f32,
-    ) -> Result<(Sink, Duration, PlaybackProcessingRuntime), String> {
+    ) -> PlaybackResult<(Sink, Duration, PlaybackProcessingRuntime)> {
         // Use provided duration since streaming buffer may not know total duration
         let actual_duration = source.total_duration().unwrap_or(duration);
 
@@ -568,12 +584,12 @@ impl AudioPlayer {
     pub(crate) fn preloaded_will_overlap(
         &self,
         transition: &TransitionDirective,
-    ) -> Result<bool, String> {
+    ) -> PlaybackResult<bool> {
         if self.last_transition_group == Some(transition.group) {
-            return Err(format!(
+            return Err(PlaybackError::Cancelled(format!(
                 "stale Automix transition group {}",
                 transition.group.0
-            ));
+            )));
         }
         Ok(self.current_sink.is_some()
             && self
@@ -599,7 +615,7 @@ impl AudioPlayer {
         reader_cancellation: Option<StreamingReaderCancellation>,
         outgoing_shared_buffer: Option<SharedBuffer>,
         mut transition: TransitionDirective,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.pending_pause_fade = false;
         let can_overlap = self.preloaded_will_overlap(&transition)?;
 
@@ -609,7 +625,9 @@ impl AudioPlayer {
                     .as_ref()
                     .is_some_and(StreamingReaderCancellation::activate)
             {
-                return Err("streaming preload shares an active retained-window lease".to_string());
+                return Err(PlaybackError::InvariantViolation(
+                    "streaming preload shares an active retained-window lease".to_string(),
+                ));
             }
             self.last_transition_group = Some(transition.group);
             if let Some(previous) = self.outgoing_transition.take() {
@@ -686,9 +704,9 @@ impl AudioPlayer {
                     .as_ref()
                     .is_some_and(StreamingReaderCancellation::activate)
             {
-                return Err(
-                    "streaming preload could not acquire retained-window demand".to_string()
-                );
+                return Err(PlaybackError::InvariantViolation(
+                    "streaming preload could not acquire retained-window demand".to_string(),
+                ));
             }
             sink.set_volume(self.get_sink_volume());
             if fade_in {
@@ -734,10 +752,12 @@ impl AudioPlayer {
         cache_path: Option<PathBuf>,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.stop();
         if !reader_cancellation.activate() {
-            return Err("streaming reader demand lease is owned by another decoder".to_string());
+            return Err(PlaybackError::InvariantViolation(
+                "streaming reader demand lease is owned by another decoder".to_string(),
+            ));
         }
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(fade_in);
@@ -956,7 +976,7 @@ impl AudioPlayer {
     }
 
     /// Seek to position
-    pub fn seek(&mut self, position: Duration) -> Result<(), String> {
+    pub fn seek(&mut self, position: Duration) -> PlaybackResult<()> {
         self.pending_pause_fade = false;
         self.last_transition_group = None;
         if let Some(transition) = self.outgoing_transition.take() {
@@ -991,14 +1011,18 @@ impl AudioPlayer {
                 }
             }
         } else {
-            return Err("No audio loaded".to_string());
+            return Err(PlaybackError::SourceUnavailable(
+                "no audio is loaded".to_string(),
+            ));
         }
 
         // Direct seek failed, try reloading the file
         let path = match self.current_path.clone() {
             Some(p) => p,
             None => {
-                return Err("Seek failed: end of stream (streaming playback)".to_string());
+                return Err(PlaybackError::SeekUnsupported(
+                    "the streaming source reached end of stream".to_string(),
+                ));
             }
         };
 
@@ -1064,7 +1088,9 @@ impl AudioPlayer {
         self.position_offset = Duration::ZERO;
 
         if seek_failed {
-            Err("Seek not supported for this format".to_string())
+            Err(PlaybackError::SeekUnsupported(
+                "seek is not supported for this format".to_string(),
+            ))
         } else {
             Ok(())
         }
@@ -1075,9 +1101,11 @@ impl AudioPlayer {
     pub(crate) fn take_streaming_sink_for_seek(
         &mut self,
         position: Duration,
-    ) -> Result<DetachedStreamingPlayback, String> {
+    ) -> PlaybackResult<DetachedStreamingPlayback> {
         if !self.is_streaming {
-            return Err("current source is not streaming".to_string());
+            return Err(PlaybackError::InvariantViolation(
+                "current source is not streaming".to_string(),
+            ));
         }
         self.pending_pause_fade = false;
         self.last_transition_group = None;
@@ -1095,10 +1123,9 @@ impl AudioPlayer {
             runtime.reset_automix_transition();
             runtime.reset_natural_end();
         }
-        let sink = self
-            .current_sink
-            .take()
-            .ok_or_else(|| "streaming seek is already pending".to_string())?;
+        let sink = self.current_sink.take().ok_or_else(|| {
+            PlaybackError::Cancelled("streaming seek is already pending".to_string())
+        })?;
         let (duration, track_gain, was_paused) = self
             .state
             .lock()
@@ -1142,12 +1169,12 @@ impl AudioPlayer {
         position: Duration,
         track_gain: f32,
         paused: bool,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.stop();
         if !reader_cancellation.activate() {
-            return Err(
+            return Err(PlaybackError::InvariantViolation(
                 "streaming seek reader could not acquire retained-window demand".to_string(),
-            );
+            ));
         }
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(false);
@@ -1278,7 +1305,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.starts_with("UnsupportedStreaming:"));
+        assert!(matches!(error, PlaybackError::UnsupportedStreaming(_)));
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
@@ -1470,6 +1497,7 @@ fn get_cpal_devices() -> Vec<AudioDevice> {
 /// Classified playback error types for UI display
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackError {
+    Cancelled(String),
     FileNotFound(String),
     UnsupportedStreaming(String),
     UnhealthyPreload(String),
@@ -1477,11 +1505,18 @@ pub enum PlaybackError {
     NetworkError(String),
     IoError(String),
     DecodeError(String),
+    StreamingFailed(String),
+    DeviceUnavailable(String),
+    ControlUnavailable(String),
+    SourceUnavailable(String),
+    SeekUnsupported(String),
+    InvariantViolation(String),
 }
 
 impl std::fmt::Display for PlaybackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PlaybackError::Cancelled(m) => write!(f, "Playback cancelled: {}", m),
             PlaybackError::FileNotFound(m) => write!(f, "File not found: {}", m),
             PlaybackError::UnsupportedStreaming(m) => write!(f, "Unsupported streaming: {}", m),
             PlaybackError::UnhealthyPreload(m) => write!(f, "Unhealthy preload: {}", m),
@@ -1489,42 +1524,44 @@ impl std::fmt::Display for PlaybackError {
             PlaybackError::NetworkError(m) => write!(f, "Network error: {}", m),
             PlaybackError::IoError(m) => write!(f, "IO error: {}", m),
             PlaybackError::DecodeError(m) => write!(f, "Decode error: {}", m),
+            PlaybackError::StreamingFailed(m) => write!(f, "Streaming failed: {}", m),
+            PlaybackError::DeviceUnavailable(m) => write!(f, "Audio device unavailable: {}", m),
+            PlaybackError::ControlUnavailable(m) => write!(f, "Audio control unavailable: {}", m),
+            PlaybackError::SourceUnavailable(m) => write!(f, "Audio source unavailable: {}", m),
+            PlaybackError::SeekUnsupported(m) => write!(f, "Seek unsupported: {}", m),
+            PlaybackError::InvariantViolation(m) => write!(f, "Audio invariant violated: {}", m),
         }
     }
 }
 
-/// Classify an error message from rodio/IO into a PlaybackError.
-pub fn classify_playback_error(error_msg: &str) -> PlaybackError {
-    let lower = error_msg.to_lowercase();
-    if lower.contains("not found") || lower.contains("no such file") {
-        PlaybackError::FileNotFound(error_msg.to_string())
-    } else if lower.contains("unsupportedstreaming")
-        || lower.contains("unsupported streaming")
-        || lower.contains("content-range")
-        || lower.contains("expected http 206")
-    {
-        PlaybackError::UnsupportedStreaming(error_msg.to_string())
-    } else if lower.contains("network:")
-        || lower.contains("http request")
-        || lower.contains("connection")
-        || lower.contains("timed out")
-    {
-        PlaybackError::NetworkError(error_msg.to_string())
-    } else if lower.contains("unsupportedformat")
-        || lower.contains("unsupported format")
-        || lower.contains("unsupported codec")
-        || lower.contains("unrecognized format")
-    {
-        PlaybackError::UnsupportedFormat(error_msg.to_string())
-    } else if lower.contains("permission")
-        || lower.contains("denied")
-        || lower.contains("i/o")
-        || lower.contains("io error")
-        || lower.contains("cache write")
-    {
-        PlaybackError::IoError(error_msg.to_string())
-    } else {
-        PlaybackError::DecodeError(error_msg.to_string())
+impl std::error::Error for PlaybackError {}
+
+impl PlaybackError {
+    pub const fn code(&self) -> crate::error::ErrorCode {
+        match self {
+            Self::Cancelled(_) => crate::error::ErrorCode::OperationCancelled,
+            Self::FileNotFound(_) | Self::SourceUnavailable(_) | Self::UnhealthyPreload(_) => {
+                crate::error::ErrorCode::AudioSourceUnavailable
+            }
+            Self::UnsupportedStreaming(_) => crate::error::ErrorCode::ProtocolUnsupported,
+            Self::UnsupportedFormat(_) | Self::SeekUnsupported(_) => {
+                crate::error::ErrorCode::MediaUnsupportedFormat
+            }
+            Self::NetworkError(_) => crate::error::ErrorCode::NetworkRequestFailed,
+            Self::IoError(_) => crate::error::ErrorCode::MediaReadFailed,
+            Self::DecodeError(_) => crate::error::ErrorCode::AudioDecodeFailed,
+            Self::StreamingFailed(_) => crate::error::ErrorCode::AudioStreamingFailed,
+            Self::DeviceUnavailable(_) => crate::error::ErrorCode::AudioDeviceUnavailable,
+            Self::ControlUnavailable(_) => crate::error::ErrorCode::AudioControlUnavailable,
+            Self::InvariantViolation(_) => crate::error::ErrorCode::InvariantViolation,
+        }
+    }
+}
+
+impl From<PlaybackError> for crate::error::AppError {
+    fn from(error: PlaybackError) -> Self {
+        let code = error.code();
+        crate::error::AppError::with_source(code, code.default_summary(), error)
     }
 }
 
@@ -1533,26 +1570,70 @@ mod error_tests {
     use super::*;
 
     #[test]
-    fn playback_errors_keep_streaming_network_format_decode_and_io_distinct() {
-        assert!(matches!(
-            classify_playback_error("UnsupportedStreaming: expected HTTP 206"),
-            PlaybackError::UnsupportedStreaming(_)
-        ));
-        assert!(matches!(
-            classify_playback_error("Network: Range request timed out"),
-            PlaybackError::NetworkError(_)
-        ));
-        assert!(matches!(
-            classify_playback_error("UnsupportedFormat: unknown audio prefix"),
-            PlaybackError::UnsupportedFormat(_)
-        ));
-        assert!(matches!(
-            classify_playback_error("Failed to decode packet"),
-            PlaybackError::DecodeError(_)
-        ));
-        assert!(matches!(
-            classify_playback_error("I/O: cache write failed"),
-            PlaybackError::IoError(_)
-        ));
+    fn every_playback_error_variant_has_a_stable_application_code() {
+        use crate::error::ErrorCode;
+
+        let cases = [
+            (
+                PlaybackError::Cancelled("cancelled".into()),
+                ErrorCode::OperationCancelled,
+            ),
+            (
+                PlaybackError::FileNotFound("missing".into()),
+                ErrorCode::AudioSourceUnavailable,
+            ),
+            (
+                PlaybackError::UnsupportedStreaming("range".into()),
+                ErrorCode::ProtocolUnsupported,
+            ),
+            (
+                PlaybackError::UnhealthyPreload("preload".into()),
+                ErrorCode::AudioSourceUnavailable,
+            ),
+            (
+                PlaybackError::UnsupportedFormat("codec".into()),
+                ErrorCode::MediaUnsupportedFormat,
+            ),
+            (
+                PlaybackError::NetworkError("timeout".into()),
+                ErrorCode::NetworkRequestFailed,
+            ),
+            (
+                PlaybackError::IoError("cache".into()),
+                ErrorCode::MediaReadFailed,
+            ),
+            (
+                PlaybackError::DecodeError("packet".into()),
+                ErrorCode::AudioDecodeFailed,
+            ),
+            (
+                PlaybackError::StreamingFailed("stream".into()),
+                ErrorCode::AudioStreamingFailed,
+            ),
+            (
+                PlaybackError::DeviceUnavailable("device".into()),
+                ErrorCode::AudioDeviceUnavailable,
+            ),
+            (
+                PlaybackError::ControlUnavailable("queue".into()),
+                ErrorCode::AudioControlUnavailable,
+            ),
+            (
+                PlaybackError::SourceUnavailable("source".into()),
+                ErrorCode::AudioSourceUnavailable,
+            ),
+            (
+                PlaybackError::SeekUnsupported("seek".into()),
+                ErrorCode::MediaUnsupportedFormat,
+            ),
+            (
+                PlaybackError::InvariantViolation("state".into()),
+                ErrorCode::InvariantViolation,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.code(), expected, "unexpected mapping for {error:?}");
+        }
     }
 }

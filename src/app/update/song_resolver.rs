@@ -9,12 +9,14 @@ use std::sync::Arc;
 
 use crate::api::NcmClient;
 use crate::api::{NcmQualityLevel, TrackUrl};
+use crate::audio::PlaybackError;
 use crate::audio::identity::PlaybackContext;
 use crate::audio::streaming::{
-    AudioCacheKey, SharedBuffer, StreamingEvent, StreamingEventKind, StreamingIdentity,
-    start_buffer_download, wait_for_buffer_playable,
+    AudioCacheKey, SharedBuffer, SharedBufferHealth, StreamingEvent, StreamingEventKind,
+    StreamingIdentity, start_buffer_download, wait_for_buffer_playable,
 };
 use crate::database::DbSong;
+use crate::error::{AppError, ErrorCode};
 
 /// Result of resolving a song with streaming support
 #[derive(Debug, Clone)]
@@ -105,11 +107,16 @@ fn cached_quality(
 pub(crate) async fn resolve_audio_source(
     client: &NcmClient,
     song: &DbSong,
-) -> Result<ResolvedAudioSource, String> {
+) -> Result<ResolvedAudioSource, AppError> {
     let ncm_id = get_ncm_id(song);
     let song_cache_dir = crate::utils::songs_cache_dir();
-    std::fs::create_dir_all(&song_cache_dir)
-        .map_err(|error| format!("failed to create song cache directory: {error}"))?;
+    std::fs::create_dir_all(&song_cache_dir).map_err(|error| {
+        AppError::with_source(
+            ErrorCode::StorageOpenFailed,
+            "Rustle could not prepare the audio cache",
+            error,
+        )
+    })?;
 
     let requested_level = client.current_quality_level();
     let requested_stem = format!("{}_{}", ncm_id, requested_level.api_level());
@@ -126,12 +133,7 @@ pub(crate) async fn resolve_audio_source(
     let url = client
         .resolve_track_url(ncm_id, requested_level)
         .await
-        .map_err(|error| {
-            format!(
-                "歌曲 {ncm_id} 获取官方播放地址失败（音质偏好 {}）：{error}",
-                requested_level.api_level()
-            )
-        })?;
+        .map_err(AppError::from)?;
     let quality = ResolvedAudioQuality::from(&url);
     let actual_stem = format!("{}_{}", ncm_id, url.level.api_level());
     if actual_stem == requested_stem {
@@ -224,7 +226,7 @@ pub async fn resolve_song(
     song: &DbSong,
     context: PlaybackContext,
     event_tx: tokio::sync::mpsc::Sender<StreamingEvent>,
-) -> Result<ResolvedSong, String> {
+) -> Result<ResolvedSong, AppError> {
     let ncm_id = get_ncm_id(song);
     let identity = StreamingIdentity::Playback(context.clone());
     // Audio negotiation and stale-cover recovery are independent network work.
@@ -236,15 +238,20 @@ pub async fn resolve_song(
     );
     let source = match source {
         Ok(source) => source,
-        Err(message) => {
-            tracing::error!("{message}");
+        Err(error) => {
+            tracing::error!(
+                ncm_id,
+                code = %error.code(),
+                "Failed to resolve an authoritative audio source"
+            );
+            let playback_error = PlaybackError::SourceUnavailable(error.user_summary().to_string());
             let _ = event_tx
                 .send(StreamingEvent::new(
                     identity,
-                    StreamingEventKind::Error(message.clone()),
+                    StreamingEventKind::Error(playback_error),
                 ))
                 .await;
-            return Err(message);
+            return Err(error);
         }
     };
     let (shared_buffer, quality) = match source {
@@ -288,11 +295,26 @@ pub async fn resolve_song(
     };
 
     if !wait_for_buffer_playable(&shared_buffer, 30).await {
+        let playback_error = match shared_buffer.health() {
+            SharedBufferHealth::Failed(error) => error,
+            SharedBufferHealth::Cancelled => {
+                PlaybackError::Cancelled(format!("song {ncm_id} streaming startup was cancelled"))
+            }
+            SharedBufferHealth::CoordinatorStopped => PlaybackError::StreamingFailed(format!(
+                "song {ncm_id} streaming coordinator stopped before startup"
+            )),
+            SharedBufferHealth::Refillable | SharedBufferHealth::Complete => {
+                PlaybackError::StreamingFailed(format!(
+                    "song {ncm_id} did not reach the streaming startup watermark"
+                ))
+            }
+        };
         tracing::error!(
-            "Song {} did not reach the streaming startup watermark",
-            ncm_id
+            ncm_id,
+            code = %playback_error.code(),
+            "Song did not reach the streaming startup watermark"
         );
-        return Err(format!("歌曲 {ncm_id} 未达到流式播放启动缓冲水位"));
+        return Err(playback_error.into());
     }
 
     // The downloader continues filling the bounded window and sparse cache in

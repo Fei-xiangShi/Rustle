@@ -1,6 +1,6 @@
 //! Queue operations
 
-use anyhow::Result;
+use crate::database::StorageResult as Result;
 use sqlx::{Pool, Sqlite, SqliteConnection};
 
 use crate::database::DbSong;

@@ -606,7 +606,7 @@ fn build_failed_card(
     let artist = task.metadata.artist.clone();
     let song_id = task.song_id;
     let error = match &task.status {
-        DownloadStatus::Failed(error) => error.clone(),
+        DownloadStatus::Failed(error) => error.user_summary().to_owned(),
         _ => String::new(),
     };
 

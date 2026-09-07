@@ -22,7 +22,8 @@ use super::events::{
 };
 use super::handle::AudioHandle;
 use super::player::{
-    AudioPlayer, DetachedStreamingPlayback, PreparedStreamingSource, prepare_streaming_source,
+    AudioPlayer, DetachedStreamingPlayback, PlaybackError, PlaybackResult, PreparedStreamingSource,
+    prepare_streaming_source,
 };
 use super::streaming::{
     SharedBuffer, SharedBufferHealth, StreamingBuffer, StreamingReaderCancellation,
@@ -119,7 +120,7 @@ struct PreparedPlayback {
     request_id: u64,
     shared_buffer: SharedBuffer,
     reader_cancellation: StreamingReaderCancellation,
-    source: Result<PreparedStreamingSource, String>,
+    source: PlaybackResult<PreparedStreamingSource>,
     duration: Duration,
     cache_path: Option<PathBuf>,
     track_gain: f32,
@@ -137,7 +138,7 @@ struct PreparedPreload {
     identity: super::identity::PreloadIdentity,
     shared_buffer: SharedBuffer,
     reader_cancellation: StreamingReaderCancellation,
-    source: Result<PreparedStreamingSource, String>,
+    source: PlaybackResult<PreparedStreamingSource>,
     duration: Duration,
     track_gain: f32,
 }
@@ -190,7 +191,7 @@ struct StreamingSeekResult {
     context: super::identity::PlaybackContext,
     nonce: super::identity::SeekNonce,
     target_position: Duration,
-    source: Result<PreparedStreamingSource, String>,
+    source: PlaybackResult<PreparedStreamingSource>,
     sink: Sink,
     reader_cancellation: StreamingReaderCancellation,
     shared_buffer: SharedBuffer,
@@ -220,7 +221,7 @@ fn cancel_streaming_seek_runtime(
 }
 
 impl StreamingSeekWorker {
-    fn new(result_tx: tokio::sync::mpsc::Sender<StreamingSeekResult>) -> Result<Self, String> {
+    fn new(result_tx: tokio::sync::mpsc::Sender<StreamingSeekResult>) -> PlaybackResult<Self> {
         let (request_tx, request_rx) =
             std::sync::mpsc::sync_channel::<StreamingSeekRequest>(STREAMING_SEEK_QUEUE_CAPACITY);
         let active_cancellation =
@@ -246,7 +247,7 @@ impl StreamingSeekWorker {
                     let source = prepare_streaming_source(buffer).and_then(|mut source| {
                         source
                             .try_seek(position)
-                            .map_err(|error| format!("Streaming seek failed: {error}"))?;
+                            .map_err(|error| PlaybackError::SeekUnsupported(error.to_string()))?;
                         Ok(source)
                     });
                     tracing::debug!(
@@ -280,7 +281,7 @@ impl StreamingSeekWorker {
                     }
                 }
             })
-            .map_err(|error| format!("Failed to spawn streaming seek worker: {error}"))?;
+            .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
         Ok(Self {
             request_tx,
             active_cancellation,
@@ -290,18 +291,24 @@ impl StreamingSeekWorker {
     fn try_submit(
         &self,
         request: StreamingSeekRequest,
-    ) -> Result<(), Box<(String, StreamingSeekRequest)>> {
+    ) -> Result<(), Box<(PlaybackError, StreamingSeekRequest)>> {
         let reader_cancellation = request.reader_cancellation.clone();
         *self.active_cancellation.lock() = Some(reader_cancellation);
         self.request_tx.try_send(request).map_err(|error| {
             self.active_cancellation.lock().take();
             match error {
-                std::sync::mpsc::TrySendError::Full(request) => {
-                    Box::new(("streaming seek worker queue is full".to_string(), request))
-                }
-                std::sync::mpsc::TrySendError::Disconnected(request) => {
-                    Box::new(("streaming seek worker is unavailable".to_string(), request))
-                }
+                std::sync::mpsc::TrySendError::Full(request) => Box::new((
+                    PlaybackError::ControlUnavailable(
+                        "streaming seek worker queue is full".to_string(),
+                    ),
+                    request,
+                )),
+                std::sync::mpsc::TrySendError::Disconnected(request) => Box::new((
+                    PlaybackError::ControlUnavailable(
+                        "streaming seek worker is unavailable".to_string(),
+                    ),
+                    request,
+                )),
             }
         })
     }
@@ -327,7 +334,7 @@ struct StreamingPreparationPool {
 impl StreamingPreparationPool {
     fn new(
         result_tx: tokio::sync::mpsc::Sender<StreamingPreparationResult>,
-    ) -> Result<Self, String> {
+    ) -> PlaybackResult<Self> {
         let (playback_tx, playback_rx) =
             std::sync::mpsc::sync_channel(STREAMING_PREPARATION_QUEUE_CAPACITY);
         let active_playback_cancellation =
@@ -352,7 +359,7 @@ impl StreamingPreparationPool {
                     let source = prepare_streaming_source(buffer).and_then(|mut source| {
                         if let PlaybackPreparationMode::LoadPaused { position } = mode {
                             source.try_seek(position).map_err(|error| {
-                                format!("Streaming paused-load seek failed: {error}")
+                                PlaybackError::SeekUnsupported(error.to_string())
                             })?;
                         }
                         Ok(source)
@@ -382,7 +389,7 @@ impl StreamingPreparationPool {
                     }
                 }
             })
-            .map_err(|error| format!("Failed to spawn playback preparation worker: {error}"))?;
+            .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
         let (preload_tx, preload_rx) =
             std::sync::mpsc::sync_channel(STREAMING_PREPARATION_QUEUE_CAPACITY);
@@ -422,7 +429,7 @@ impl StreamingPreparationPool {
                     }
                 }
             })
-            .map_err(|error| format!("Failed to spawn preload preparation worker: {error}"))?;
+            .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
         Ok(Self {
             playback_tx,
@@ -431,17 +438,19 @@ impl StreamingPreparationPool {
         })
     }
 
-    fn prepare_playback(&self, request: PlaybackPreparationRequest) -> Result<(), String> {
+    fn prepare_playback(&self, request: PlaybackPreparationRequest) -> PlaybackResult<()> {
         let reader_cancellation = request.buffer.reader_cancellation();
         *self.active_playback_cancellation.lock() = Some(reader_cancellation);
         self.playback_tx.try_send(request).map_err(|error| {
             self.active_playback_cancellation.lock().take();
             match error {
-                std::sync::mpsc::TrySendError::Full(_) => {
-                    "streaming playback preparation queue is full".to_string()
-                }
+                std::sync::mpsc::TrySendError::Full(_) => PlaybackError::ControlUnavailable(
+                    "streaming playback preparation queue is full".to_string(),
+                ),
                 std::sync::mpsc::TrySendError::Disconnected(_) => {
-                    "streaming playback preparation worker is unavailable".to_string()
+                    PlaybackError::ControlUnavailable(
+                        "streaming playback preparation worker is unavailable".to_string(),
+                    )
                 }
             }
         })
@@ -463,15 +472,17 @@ impl StreamingPreparationPool {
         }
     }
 
-    fn prepare_preload(&self, request: PreloadPreparationRequest) -> Result<(), String> {
+    fn prepare_preload(&self, request: PreloadPreparationRequest) -> PlaybackResult<()> {
         self.preload_tx
             .try_send(request)
             .map_err(|error| match error {
-                std::sync::mpsc::TrySendError::Full(_) => {
-                    "streaming preload preparation queue is full".to_string()
-                }
+                std::sync::mpsc::TrySendError::Full(_) => PlaybackError::ControlUnavailable(
+                    "streaming preload preparation queue is full".to_string(),
+                ),
                 std::sync::mpsc::TrySendError::Disconnected(_) => {
-                    "streaming preload preparation worker is unavailable".to_string()
+                    PlaybackError::ControlUnavailable(
+                        "streaming preload preparation worker is unavailable".to_string(),
+                    )
                 }
             })
     }
@@ -512,7 +523,7 @@ impl Drop for AudioThreadHandle {
 pub fn spawn_audio_thread(
     device_name: Option<&str>,
     chain: AudioProcessingChain,
-) -> Result<AudioThreadHandle, String> {
+) -> PlaybackResult<AudioThreadHandle> {
     // Create channels
     let (command_tx, command_rx) = audio_command_channel();
     let (event_tx, event_rx) = audio_event_channel();
@@ -579,7 +590,7 @@ pub fn spawn_audio_thread(
                 }
             }
         })
-        .map_err(|e| format!("Failed to spawn audio thread: {}", e))?;
+        .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
     Ok(AudioThreadHandle {
         handle,
@@ -879,8 +890,7 @@ async fn audio_thread_main(
                     let _ = event_tx.send(AudioEvent::Error {
                         context: error_context,
                         request_id: Some(request_id),
-                        message: error,
-                        error_kind: None,
+                        error,
                     });
                 }
             }
@@ -944,8 +954,7 @@ async fn audio_thread_main(
                     let _ = event_tx.send(AudioEvent::Error {
                         context: error_context,
                         request_id: Some(request_id),
-                        message: error,
-                        error_kind: None,
+                        error,
                     });
                 }
             }
@@ -1081,7 +1090,7 @@ async fn audio_thread_main(
                                 },
                             )
                         }
-                        Err(error) if error == "streaming seek is already pending" => {
+                        Err(PlaybackError::Cancelled(_)) => {
                             seek_worker.cancel_active();
                             deferred_streaming_seeks.insert(
                                 context.generation,
@@ -1114,7 +1123,9 @@ async fn audio_thread_main(
                     let _ = event_tx.send(AudioEvent::SeekFailed {
                         context,
                         nonce,
-                        error: "audio source is still preparing".to_string(),
+                        error: PlaybackError::ControlUnavailable(
+                            "audio source is still preparing".to_string(),
+                        ),
                     });
                 }
                 finished_guard.reset();
@@ -1182,14 +1193,13 @@ async fn audio_thread_main(
                         tracing::warn!(
                             request_id = identity.request_id,
                             generation = identity.generation.0,
-                            error = %failure.message,
+                            error = %failure.error,
                             "Rejected preload before immediate promotion"
                         );
                         let _ = event_tx.send(AudioEvent::Error {
                             context: owner,
                             request_id: Some(playback_request_id),
-                            message: failure.message,
-                            error_kind: failure.error_kind,
+                            error: failure.error,
                         });
                         continue;
                     }
@@ -1201,8 +1211,7 @@ async fn audio_thread_main(
                         let _ = event_tx.send(AudioEvent::Error {
                             context: owner,
                             request_id: Some(playback_request_id),
-                            message: error,
-                            error_kind: None,
+                            error,
                         });
                         continue;
                     }
@@ -1263,8 +1272,9 @@ async fn audio_thread_main(
                     let _ = event_tx.send(AudioEvent::Error {
                         context: owner,
                         request_id: Some(playback_request_id),
-                        message: "Scheduled preload is no longer ready".to_string(),
-                        error_kind: None,
+                        error: PlaybackError::Cancelled(
+                            "scheduled preload is no longer ready".to_string(),
+                        ),
                     });
                     continue;
                 }
@@ -1279,8 +1289,7 @@ async fn audio_thread_main(
                     let _ = event_tx.send(AudioEvent::Error {
                         context: owner,
                         request_id: Some(playback_request_id),
-                        message: error.clone(),
-                        error_kind: Some(super::player::PlaybackError::UnhealthyPreload(error)),
+                        error,
                     });
                     continue;
                 }
@@ -1488,14 +1497,13 @@ fn run_control_maintenance(
                     tracing::warn!(
                         request_id = scheduled.identity.request_id,
                         generation = scheduled.identity.generation.0,
-                        error = %failure.message,
+                        error = %failure.error,
                         "Rejected preload at scheduled promotion deadline"
                     );
                     let _ = event_tx.send(AudioEvent::Error {
                         context: scheduled.owner,
                         request_id: Some(scheduled.playback_request_id),
-                        message: failure.message,
-                        error_kind: failure.error_kind,
+                        error: failure.error,
                     });
                 }
                 Ok(preloaded) => {
@@ -1506,8 +1514,7 @@ fn run_control_maintenance(
                             let _ = event_tx.send(AudioEvent::Error {
                                 context: scheduled.owner,
                                 request_id: Some(scheduled.playback_request_id),
-                                message: error,
-                                error_kind: None,
+                                error,
                             });
                             return false;
                         }
@@ -1559,8 +1566,9 @@ fn run_control_maintenance(
                 let _ = event_tx.send(AudioEvent::Error {
                     context: scheduled.owner,
                     request_id: Some(scheduled.playback_request_id),
-                    message: "Scheduled preload became unavailable before its deadline".to_string(),
-                    error_kind: None,
+                    error: PlaybackError::Cancelled(
+                        "scheduled preload became unavailable before its deadline".to_string(),
+                    ),
                 });
             }
         }
@@ -1627,19 +1635,21 @@ fn terminate_terminal_stream(
     tracing::warn!(
         generation = context.generation.0,
         cancelled = terminal_error.is_none(),
-        error = terminal_error.as_deref().unwrap_or("cancelled"),
+        error = terminal_error
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref()
+            .unwrap_or("cancelled"),
         "Terminated non-refillable streaming playback"
     );
     let _ = event_tx.send(AudioEvent::Stopped {
         context: context.clone(),
     });
-    if let Some(message) = terminal_error {
-        let error_kind = Some(super::player::classify_playback_error(&message));
+    if let Some(error) = terminal_error {
         let _ = event_tx.send(AudioEvent::Error {
             context,
             request_id: None,
-            message,
-            error_kind,
+            error,
         });
     }
     true
@@ -1649,7 +1659,7 @@ fn terminate_terminal_stream(
 enum TerminalStreamState {
     Healthy,
     Cancelled,
-    Failed(String),
+    Failed(PlaybackError),
 }
 
 fn terminal_stream_state(health: SharedBufferHealth) -> TerminalStreamState {
@@ -1659,16 +1669,18 @@ fn terminal_stream_state(health: SharedBufferHealth) -> TerminalStreamState {
         }
         SharedBufferHealth::Cancelled => TerminalStreamState::Cancelled,
         SharedBufferHealth::Failed(error) => TerminalStreamState::Failed(error),
-        SharedBufferHealth::CoordinatorStopped => TerminalStreamState::Failed(
-            "streaming coordinator stopped before completion".to_string(),
-        ),
+        SharedBufferHealth::CoordinatorStopped => {
+            TerminalStreamState::Failed(PlaybackError::StreamingFailed(
+                "streaming coordinator stopped before completion".to_string(),
+            ))
+        }
     }
 }
 
 fn preload_promotion_error(
     preloaded_sinks: &HashMap<u64, PreloadedSink>,
     identity: &super::identity::PreloadIdentity,
-) -> Option<String> {
+) -> Option<PlaybackError> {
     let preloaded = preloaded_sinks.get(&identity.request_id)?;
     if preloaded.identity != *identity {
         return None;
@@ -1676,13 +1688,14 @@ fn preload_promotion_error(
     streaming_preload_promotion_error(preloaded.shared_buffer.as_ref())
 }
 
-fn streaming_preload_promotion_error(shared_buffer: Option<&SharedBuffer>) -> Option<String> {
+fn streaming_preload_promotion_error(
+    shared_buffer: Option<&SharedBuffer>,
+) -> Option<PlaybackError> {
     shared_buffer.and_then(|buffer| buffer.health().promotion_error())
 }
 
 struct PreloadedPromotionFailure {
-    message: String,
-    error_kind: Option<super::player::PlaybackError>,
+    error: PlaybackError,
 }
 
 fn clear_preloaded_buffer_callback(preloaded: &PreloadedSink) {
@@ -1716,40 +1729,41 @@ fn take_healthy_preloaded_sink(
 ) -> Result<PreloadedSink, PreloadedPromotionFailure> {
     let Some(preloaded) = preloaded_sinks.remove(&identity.request_id) else {
         return Err(PreloadedPromotionFailure {
-            message: format!("Preloaded sink not found: {}", identity.request_id),
-            error_kind: None,
+            error: PlaybackError::SourceUnavailable(format!(
+                "preloaded sink {} was not found",
+                identity.request_id
+            )),
         });
     };
 
     if preloaded.identity != *identity {
         clear_preloaded_buffer_callback(&preloaded);
         return Err(PreloadedPromotionFailure {
-            message: format!("Preloaded sink identity mismatch: {}", identity.request_id),
-            error_kind: None,
+            error: PlaybackError::InvariantViolation(format!(
+                "preloaded sink identity mismatch: {}",
+                identity.request_id
+            )),
         });
     }
 
     if let Some(error) = streaming_preload_promotion_error(preloaded.shared_buffer.as_ref()) {
         clear_preloaded_buffer_callback(&preloaded);
-        return Err(PreloadedPromotionFailure {
-            message: error.clone(),
-            error_kind: Some(super::player::PlaybackError::UnhealthyPreload(error)),
-        });
+        return Err(PreloadedPromotionFailure { error });
     }
 
     Ok(preloaded)
 }
 
-fn streaming_playback_preparation_error(shared_buffer: &SharedBuffer) -> Option<String> {
+fn streaming_playback_preparation_error(shared_buffer: &SharedBuffer) -> Option<PlaybackError> {
     match shared_buffer.health() {
         SharedBufferHealth::Refillable | SharedBufferHealth::Complete => None,
-        SharedBufferHealth::Cancelled => {
-            Some("Cancelled: streaming playback preparation was cancelled".to_string())
-        }
+        SharedBufferHealth::Cancelled => Some(PlaybackError::Cancelled(
+            "streaming playback preparation was cancelled".to_string(),
+        )),
         SharedBufferHealth::Failed(error) => Some(error),
-        SharedBufferHealth::CoordinatorStopped => {
-            Some("streaming coordinator stopped before playback preparation".to_string())
-        }
+        SharedBufferHealth::CoordinatorStopped => Some(PlaybackError::StreamingFailed(
+            "streaming coordinator stopped before playback preparation".to_string(),
+        )),
     }
 }
 
@@ -1849,12 +1863,10 @@ fn handle_play(
             });
         }
         Err(e) => {
-            let kind = super::player::classify_playback_error(&e);
             let _ = event_tx.send(AudioEvent::Error {
                 context: context.clone(),
                 request_id: Some(request_id),
-                message: e,
-                error_kind: Some(kind),
+                error: e,
             });
         }
     }
@@ -1888,12 +1900,10 @@ fn handle_load_paused(
             });
         }
         Err(e) => {
-            let kind = super::player::classify_playback_error(&e);
             let _ = event_tx.send(AudioEvent::Error {
                 context: context.clone(),
                 request_id: Some(request_id),
-                message: e,
-                error_kind: Some(kind),
+                error: e,
             });
         }
     }
@@ -1927,22 +1937,18 @@ fn handle_play_at(
                 path: Some(path),
             });
             if let Some(error) = seek_error {
-                let kind = super::player::classify_playback_error(&error);
                 let _ = event_tx.send(AudioEvent::Error {
                     context: context.clone(),
                     request_id: Some(request_id),
-                    message: error,
-                    error_kind: Some(kind),
+                    error,
                 });
             }
         }
         Err(e) => {
-            let kind = super::player::classify_playback_error(&e);
             let _ = event_tx.send(AudioEvent::Error {
                 context: context.clone(),
                 request_id: Some(request_id),
-                message: e,
-                error_kind: Some(kind),
+                error: e,
             });
         }
     }
@@ -1999,7 +2005,6 @@ fn handle_streaming_preparation_result(
             let pause_requested = take_pending_preparation_pause(pause_after_preparation, &context);
 
             if let Some(error) = streaming_playback_preparation_error(&shared_buffer) {
-                let kind = super::player::classify_playback_error(&error);
                 tracing::warn!(
                     request_id,
                     generation = context.generation.0,
@@ -2009,8 +2014,7 @@ fn handle_streaming_preparation_result(
                 let _ = event_tx.send(AudioEvent::Error {
                     context,
                     request_id: Some(request_id),
-                    message: error,
-                    error_kind: Some(kind),
+                    error,
                 });
                 return;
             }
@@ -2018,12 +2022,10 @@ fn handle_streaming_preparation_result(
             let source = match source {
                 Ok(source) => source,
                 Err(error) => {
-                    let kind = super::player::classify_playback_error(&error);
                     let _ = event_tx.send(AudioEvent::Error {
                         context,
                         request_id: Some(request_id),
-                        message: error,
-                        error_kind: Some(kind),
+                        error,
                     });
                     return;
                 }
@@ -2221,12 +2223,10 @@ fn handle_play_streaming(
         }
         Err(e) => {
             shared_buffer.clear_buffer_callback();
-            let kind = super::player::classify_playback_error(&e);
             let _ = event_tx.send(AudioEvent::Error {
                 context: context.clone(),
                 request_id: Some(request_id),
-                message: e,
-                error_kind: Some(kind),
+                error: e,
             });
             false
         }
@@ -2288,24 +2288,20 @@ fn handle_load_paused_streaming(
                 position: player.get_info().position,
             });
             if let Some(error) = seek_error {
-                let kind = super::player::classify_playback_error(&error);
                 let _ = event_tx.send(AudioEvent::Error {
                     context: context.clone(),
                     request_id: Some(request_id),
-                    message: error,
-                    error_kind: Some(kind),
+                    error,
                 });
             }
             true
         }
         Err(e) => {
             shared_buffer.clear_buffer_callback();
-            let kind = super::player::classify_playback_error(&e);
             let _ = event_tx.send(AudioEvent::Error {
                 context: context.clone(),
                 request_id: Some(request_id),
-                message: e,
-                error_kind: Some(kind),
+                error: e,
             });
             false
         }
@@ -2722,12 +2718,10 @@ fn handle_play_preloaded(
             });
         }
         Err(e) => {
-            let kind = super::player::classify_playback_error(&e);
             let _ = event_tx.send(AudioEvent::Error {
                 context: context.clone(),
                 request_id: Some(playback_request_id),
-                message: e,
-                error_kind: Some(kind),
+                error: e,
             });
         }
     }
@@ -3140,16 +3134,16 @@ mod tests {
         assert!(streaming_preload_promotion_error(Some(&complete)).is_none());
 
         let failed = SharedBuffer::new(100);
-        failed.set_error("Network: connection reset".to_string());
+        failed.set_error(PlaybackError::NetworkError("connection reset".to_string()));
         assert!(
             streaming_preload_promotion_error(Some(&failed))
-                .is_some_and(|error| error.contains("connection reset"))
+                .is_some_and(|error| matches!(error, PlaybackError::UnhealthyPreload(_)))
         );
 
         let stopped = SharedBuffer::new(100);
         assert!(
             streaming_preload_promotion_error(Some(&stopped))
-                .is_some_and(|error| error.contains("stopped before completion"))
+                .is_some_and(|error| matches!(error, PlaybackError::UnhealthyPreload(_)))
         );
     }
 
@@ -3167,13 +3161,15 @@ mod tests {
             terminal_stream_state(SharedBufferHealth::Cancelled),
             TerminalStreamState::Cancelled
         );
-        assert_eq!(
-            terminal_stream_state(SharedBufferHealth::Failed("network".to_string())),
-            TerminalStreamState::Failed("network".to_string())
-        );
+        assert!(matches!(
+            terminal_stream_state(SharedBufferHealth::Failed(PlaybackError::NetworkError(
+                "network".to_string()
+            ))),
+            TerminalStreamState::Failed(PlaybackError::NetworkError(_))
+        ));
         assert!(matches!(
             terminal_stream_state(SharedBufferHealth::CoordinatorStopped),
-            TerminalStreamState::Failed(error) if error.contains("stopped before completion")
+            TerminalStreamState::Failed(PlaybackError::StreamingFailed(_))
         ));
     }
 

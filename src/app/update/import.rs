@@ -207,7 +207,10 @@ impl App {
                             load_playlist_view(db_for_playlist, playlist_id),
                             |result| match result {
                                 Some(payload) => Message::PlaylistViewLoaded(payload),
-                                None => Message::DatabaseError("Playlist not found".into()),
+                                None => Message::DatabaseError(crate::error::AppError::new(
+                                    crate::error::ErrorCode::StorageNotFound,
+                                    "The playlist was not found",
+                                )),
                             },
                         ));
                     }
@@ -654,11 +657,11 @@ impl App {
                                             enabled: true,
                                         })
                                         .await?;
-                                    Result::<i64>::Ok(playlist_id)
+                                    crate::database::StorageResult::Ok(playlist_id)
                                 }
                                 .await;
 
-                                create_result.map_err(|err| err.to_string())
+                                create_result.map_err(crate::error::AppError::from)
                             },
                             Message::ImportedPlaylistCreated,
                         ),

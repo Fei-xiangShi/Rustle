@@ -1,6 +1,6 @@
 //! Watched folder persistence for local library auto-sync
 
-use anyhow::Result;
+use crate::database::StorageResult as Result;
 use sqlx::{Pool, Sqlite};
 
 use super::current_timestamp;

@@ -877,7 +877,7 @@ mod playback_intent_tests {
 impl App {
     pub(crate) fn begin_audio_resolution_context(
         &self,
-    ) -> Result<crate::audio::identity::PlaybackContext, String> {
+    ) -> crate::audio::PlaybackResult<crate::audio::identity::PlaybackContext> {
         self.require_audio_handle()?.begin_playback_resolution()
     }
 
@@ -928,9 +928,12 @@ impl App {
         self.core.audio.as_ref()
     }
 
-    fn require_audio_handle(&self) -> Result<&crate::audio::AudioHandle, String> {
-        self.audio_handle()
-            .ok_or_else(|| "No audio player".to_string())
+    fn require_audio_handle(&self) -> crate::audio::PlaybackResult<&crate::audio::AudioHandle> {
+        self.audio_handle().ok_or_else(|| {
+            crate::audio::PlaybackError::DeviceUnavailable(
+                "the audio backend is unavailable".to_string(),
+            )
+        })
     }
 
     pub(crate) fn refresh_playback_runtime(&mut self) {
@@ -1001,7 +1004,7 @@ impl App {
         path: PathBuf,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let audio = self.require_audio_handle()?;
         audio.play_with_fade(path, fade_in, track_gain)
     }
@@ -1012,7 +1015,7 @@ impl App {
         path: PathBuf,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         self.require_audio_handle()?
             .play_with_fade_in_context(context, path, fade_in, track_gain)
     }
@@ -1023,7 +1026,7 @@ impl App {
         position: Duration,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let audio = self.require_audio_handle()?;
         audio.play_from_position_with_fade(path, position, fade_in, track_gain)
     }
@@ -1035,7 +1038,7 @@ impl App {
         position: Duration,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         self.require_audio_handle()?
             .play_from_position_with_fade_in_context(context, path, position, fade_in, track_gain)
     }
@@ -1047,7 +1050,7 @@ impl App {
         cache_path: Option<PathBuf>,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let audio = self.require_audio_handle()?;
         let streaming_buffer = crate::audio::StreamingBuffer::new(buffer);
         audio.play_streaming(streaming_buffer, duration, cache_path, fade_in, track_gain)
@@ -1061,7 +1064,7 @@ impl App {
         cache_path: Option<PathBuf>,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let streaming_buffer = crate::audio::StreamingBuffer::new(buffer);
         self.require_audio_handle()?.play_streaming_in_context(
             context,
@@ -1078,7 +1081,7 @@ impl App {
         identity: crate::audio::identity::PreloadIdentity,
         fade_in: bool,
         transition: Option<crate::audio::automix::TransitionDirective>,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let audio = self.require_audio_handle()?;
         audio.play_preloaded(identity, fade_in, transition)
     }
@@ -1089,7 +1092,7 @@ impl App {
         trigger_at: Duration,
         fade_in: bool,
         transition: crate::audio::automix::TransitionDirective,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         self.require_audio_handle()?
             .schedule_preloaded_transition(identity, trigger_at, fade_in, transition)
     }
@@ -1126,7 +1129,7 @@ impl App {
         path: PathBuf,
         position: Duration,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let audio = self.require_audio_handle()?;
         audio.load_paused(path, position, track_gain)
     }
@@ -1137,7 +1140,7 @@ impl App {
         path: PathBuf,
         position: Duration,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         self.require_audio_handle()?
             .load_paused_in_context(context, path, position, track_gain)
     }
@@ -1150,7 +1153,7 @@ impl App {
         cache_path: Option<PathBuf>,
         position: Duration,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> crate::audio::PlaybackResult<u64> {
         let streaming_buffer = crate::audio::StreamingBuffer::new(buffer);
         self.require_audio_handle()?
             .load_streaming_paused_in_context(
@@ -1165,19 +1168,27 @@ impl App {
 
     pub(crate) fn reserve_preload_identity(
         &self,
-    ) -> Result<crate::audio::identity::PreloadIdentity, String> {
+    ) -> crate::audio::PlaybackResult<crate::audio::identity::PreloadIdentity> {
         self.require_audio_handle()?
             .reserve_preload_identity()
-            .ok_or_else(|| "Preload requires active playback generation".to_string())
+            .ok_or_else(|| {
+                crate::audio::PlaybackError::SourceUnavailable(
+                    "preload requires active playback generation".to_string(),
+                )
+            })
     }
 
     pub(crate) fn reserve_preload_handoff(
         &self,
         parent: &crate::audio::identity::PreloadIdentity,
-    ) -> Result<crate::audio::identity::PreloadIdentity, String> {
+    ) -> crate::audio::PlaybackResult<crate::audio::identity::PreloadIdentity> {
         self.require_audio_handle()?
             .reserve_preload_handoff(parent)
-            .ok_or_else(|| "Preload handoff identity is stale or cancelled".to_string())
+            .ok_or_else(|| {
+                crate::audio::PlaybackError::Cancelled(
+                    "preload handoff identity is stale or cancelled".to_string(),
+                )
+            })
     }
 
     pub(crate) fn create_preload_sink_for_file(
@@ -1185,7 +1196,7 @@ impl App {
         identity: crate::audio::identity::PreloadIdentity,
         path: PathBuf,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> crate::audio::PlaybackResult<()> {
         let audio = self.require_audio_handle()?;
         audio.create_preload_sink(identity, path, track_gain)
     }
@@ -1196,7 +1207,7 @@ impl App {
         buffer: crate::audio::SharedBuffer,
         duration: Duration,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> crate::audio::PlaybackResult<()> {
         let audio = self.require_audio_handle()?;
         let streaming_buffer = crate::audio::StreamingBuffer::new(buffer);
         audio.create_preload_sink_streaming(identity, streaming_buffer, duration, track_gain)
@@ -1226,11 +1237,17 @@ impl App {
         }
     }
 
-    pub(crate) fn pause_audio_output_with_fade(&self, fade_out: bool) -> Result<(), String> {
+    pub(crate) fn pause_audio_output_with_fade(
+        &self,
+        fade_out: bool,
+    ) -> crate::audio::PlaybackResult<()> {
         self.require_audio_handle()?.pause_with_fade(fade_out)
     }
 
-    pub(crate) fn resume_audio_output_with_fade(&self, fade_in: bool) -> Result<(), String> {
+    pub(crate) fn resume_audio_output_with_fade(
+        &self,
+        fade_in: bool,
+    ) -> crate::audio::PlaybackResult<()> {
         self.require_audio_handle()?.resume_with_fade(fade_in)
     }
 

@@ -1,6 +1,8 @@
 //! Operating-system global shortcut registration and event delivery.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -21,9 +23,7 @@ impl GlobalHotkeyService {
     pub fn new(bindings: &KeyBindings) -> Result<Self, GlobalHotkeyError> {
         ensure_supported_desktop_session()?;
 
-        let manager = GlobalHotKeyManager::new().map_err(|error| {
-            GlobalHotkeyError::new(format!("failed to initialize global hotkeys: {error}"))
-        })?;
+        let manager = GlobalHotKeyManager::new().map_err(GlobalHotkeyError::backend_unavailable)?;
         let mut service = Self {
             manager,
             registered: HashMap::new(),
@@ -70,12 +70,7 @@ impl GlobalHotkeyService {
     ) -> Result<(), GlobalHotkeyError> {
         let new_hotkey = binding
             .map(|binding| {
-                hotkey_for_binding(binding).ok_or_else(|| {
-                    GlobalHotkeyError::new(format!(
-                        "unsupported global shortcut: {}",
-                        binding.display()
-                    ))
-                })
+                hotkey_for_binding(binding).ok_or_else(GlobalHotkeyError::unsupported_binding)
             })
             .transpose()?;
 
@@ -105,14 +100,12 @@ fn ensure_supported_desktop_session() -> Result<(), GlobalHotkeyError> {
     let wayland_display_present =
         std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
     if session_is_wayland(&session_type, wayland_display_present) {
-        return Err(GlobalHotkeyError::new(
-            "global hotkeys require an X11 desktop session; Wayland is not supported".to_string(),
-        ));
+        return Err(GlobalHotkeyError::unsupported_session());
     }
 
-    x11rb::connect(None).map(|_| ()).map_err(|error| {
-        GlobalHotkeyError::new(format!("failed to connect to the X11 display: {error}"))
-    })
+    x11rb::connect(None)
+        .map(|_| ())
+        .map_err(GlobalHotkeyError::backend_unavailable)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -231,17 +224,18 @@ pub fn install_event_handler() -> mpsc::UnboundedReceiver<u32> {
 }
 
 trait HotkeyRegistrar {
-    fn register_hotkey(&self, hotkey: HotKey) -> Result<(), String>;
-    fn unregister_hotkey(&self, hotkey: HotKey) -> Result<(), String>;
+    fn register_hotkey(&self, hotkey: HotKey) -> Result<(), HotkeyRegistrationError>;
+    fn unregister_hotkey(&self, hotkey: HotKey) -> Result<(), HotkeyRegistrationError>;
 }
 
 impl HotkeyRegistrar for GlobalHotKeyManager {
-    fn register_hotkey(&self, hotkey: HotKey) -> Result<(), String> {
-        self.register(hotkey).map_err(|error| error.to_string())
+    fn register_hotkey(&self, hotkey: HotKey) -> Result<(), HotkeyRegistrationError> {
+        self.register(hotkey).map_err(HotkeyRegistrationError::from)
     }
 
-    fn unregister_hotkey(&self, hotkey: HotKey) -> Result<(), String> {
-        self.unregister(hotkey).map_err(|error| error.to_string())
+    fn unregister_hotkey(&self, hotkey: HotKey) -> Result<(), HotkeyRegistrationError> {
+        self.unregister(hotkey)
+            .map_err(HotkeyRegistrationError::from)
     }
 }
 
@@ -257,9 +251,9 @@ fn replace_registration<R: HotkeyRegistrar>(
     }
 
     if let Some(old_hotkey) = old_hotkey {
-        registrar.unregister_hotkey(old_hotkey).map_err(|error| {
-            GlobalHotkeyError::new(format!("failed to unregister previous shortcut: {error}"))
-        })?;
+        registrar
+            .unregister_hotkey(old_hotkey)
+            .map_err(GlobalHotkeyError::lifecycle)?;
     }
 
     if let Some(new_hotkey) = new_hotkey {
@@ -271,16 +265,15 @@ fn replace_registration<R: HotkeyRegistrar>(
                     }
                     Err(rollback_error) => {
                         registered.remove(&action);
-                        return Err(GlobalHotkeyError::new(format!(
-                            "failed to register shortcut: {registration_error}; also failed to restore previous shortcut: {rollback_error}"
-                        )));
+                        return Err(GlobalHotkeyError::rollback(
+                            registration_error,
+                            rollback_error,
+                        ));
                     }
                 }
             }
 
-            return Err(GlobalHotkeyError::new(format!(
-                "failed to register shortcut: {registration_error}"
-            )));
+            return Err(GlobalHotkeyError::native_conflict(registration_error));
         }
 
         registered.insert(action, new_hotkey);
@@ -291,24 +284,156 @@ fn replace_registration<R: HotkeyRegistrar>(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalHotkeyErrorKind {
+    UnsupportedSession,
+    UnsupportedBinding,
+    NativeConflict,
+    BackendUnavailable,
+    Lifecycle,
+    Rollback,
+}
+
+type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+#[derive(Debug)]
 pub struct GlobalHotkeyError {
-    message: String,
+    kind: GlobalHotkeyErrorKind,
+    source: Option<BoxError>,
 }
 
 impl GlobalHotkeyError {
-    fn new(message: String) -> Self {
-        Self { message }
+    pub(crate) fn unsupported_session() -> Self {
+        Self {
+            kind: GlobalHotkeyErrorKind::UnsupportedSession,
+            source: None,
+        }
+    }
+
+    fn unsupported_binding() -> Self {
+        Self {
+            kind: GlobalHotkeyErrorKind::UnsupportedBinding,
+            source: None,
+        }
+    }
+
+    fn native_conflict(source: HotkeyRegistrationError) -> Self {
+        Self {
+            kind: GlobalHotkeyErrorKind::NativeConflict,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn backend_unavailable<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            kind: GlobalHotkeyErrorKind::BackendUnavailable,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn lifecycle(source: HotkeyRegistrationError) -> Self {
+        Self {
+            kind: GlobalHotkeyErrorKind::Lifecycle,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn rollback(registration: HotkeyRegistrationError, rollback: HotkeyRegistrationError) -> Self {
+        Self {
+            kind: GlobalHotkeyErrorKind::Rollback,
+            source: Some(Box::new(HotkeyRegistrationError::Rollback {
+                registration: Box::new(registration),
+                rollback: Box::new(rollback),
+            })),
+        }
+    }
+
+    pub const fn kind(&self) -> GlobalHotkeyErrorKind {
+        self.kind
+    }
+
+    pub const fn code(&self) -> crate::error::ErrorCode {
+        match self.kind {
+            GlobalHotkeyErrorKind::UnsupportedSession
+            | GlobalHotkeyErrorKind::UnsupportedBinding => {
+                crate::error::ErrorCode::PlatformUnsupported
+            }
+            GlobalHotkeyErrorKind::NativeConflict => crate::error::ErrorCode::PlatformConflict,
+            GlobalHotkeyErrorKind::BackendUnavailable
+            | GlobalHotkeyErrorKind::Lifecycle
+            | GlobalHotkeyErrorKind::Rollback => crate::error::ErrorCode::PlatformUnavailable,
+        }
     }
 }
 
-impl std::fmt::Display for GlobalHotkeyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+impl fmt::Display for GlobalHotkeyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let summary = match self.kind {
+            GlobalHotkeyErrorKind::UnsupportedSession => {
+                "Global shortcuts are not supported in the current desktop session"
+            }
+            GlobalHotkeyErrorKind::UnsupportedBinding => {
+                "This key combination cannot be registered as a global shortcut"
+            }
+            GlobalHotkeyErrorKind::NativeConflict => "This global shortcut is already in use",
+            GlobalHotkeyErrorKind::BackendUnavailable => {
+                "The global shortcut backend is unavailable"
+            }
+            GlobalHotkeyErrorKind::Lifecycle => "Rustle could not update the global shortcut",
+            GlobalHotkeyErrorKind::Rollback => {
+                "Rustle could not restore the previous global shortcut"
+            }
+        };
+        formatter.write_str(summary)
     }
 }
 
-impl std::error::Error for GlobalHotkeyError {}
+impl Error for GlobalHotkeyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+impl From<GlobalHotkeyError> for crate::error::AppError {
+    fn from(error: GlobalHotkeyError) -> Self {
+        let code = error.code();
+        let summary = error.to_string();
+        crate::error::AppError::with_source(code, summary, error)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum HotkeyRegistrationError {
+    #[error("native global hotkey operation failed")]
+    Native(#[source] global_hotkey::Error),
+    #[cfg(test)]
+    #[error("simulated global hotkey operation failed")]
+    Simulated(#[source] std::io::Error),
+    #[error("global hotkey registration and rollback both failed")]
+    Rollback {
+        registration: Box<Self>,
+        #[source]
+        rollback: Box<Self>,
+    },
+}
+
+impl From<global_hotkey::Error> for HotkeyRegistrationError {
+    fn from(error: global_hotkey::Error) -> Self {
+        Self::Native(error)
+    }
+}
+
+#[cfg(test)]
+impl HotkeyRegistrationError {
+    fn simulated(message: impl Into<String>) -> Self {
+        Self::Simulated(std::io::Error::other(message.into()))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -347,15 +472,17 @@ mod tests {
     }
 
     impl HotkeyRegistrar for FakeRegistrar {
-        fn register_hotkey(&self, hotkey: HotKey) -> Result<(), String> {
+        fn register_hotkey(&self, hotkey: HotKey) -> Result<(), HotkeyRegistrationError> {
             if *self.fail_registration_for.borrow() == Some(hotkey) {
-                return Err("reserved by another application".to_string());
+                return Err(HotkeyRegistrationError::simulated(
+                    "reserved by another application",
+                ));
             }
             self.active.borrow_mut().insert(hotkey);
             Ok(())
         }
 
-        fn unregister_hotkey(&self, hotkey: HotKey) -> Result<(), String> {
+        fn unregister_hotkey(&self, hotkey: HotKey) -> Result<(), HotkeyRegistrationError> {
             self.active.borrow_mut().remove(&hotkey);
             Ok(())
         }
@@ -378,10 +505,15 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(
+        assert_eq!(error.kind(), GlobalHotkeyErrorKind::NativeConflict);
+        assert_eq!(error.code(), crate::error::ErrorCode::PlatformConflict);
+        assert_eq!(
             error
-                .to_string()
-                .contains("reserved by another application")
+                .source()
+                .and_then(Error::source)
+                .expect("native source")
+                .to_string(),
+            "reserved by another application"
         );
         assert_eq!(registered.get(&Action::PlayPause), Some(&old_hotkey));
         assert!(registrar.active.borrow().contains(&old_hotkey));
@@ -440,5 +572,34 @@ mod tests {
         assert!(session_is_wayland("", true));
         assert!(!session_is_wayland("x11", true));
         assert!(!session_is_wayland("x11", false));
+    }
+
+    #[test]
+    fn platform_error_kinds_map_to_stable_application_codes() {
+        assert_eq!(
+            GlobalHotkeyError::unsupported_session().code(),
+            crate::error::ErrorCode::PlatformUnsupported
+        );
+        assert_eq!(
+            GlobalHotkeyError::native_conflict(HotkeyRegistrationError::simulated("conflict"))
+                .code(),
+            crate::error::ErrorCode::PlatformConflict
+        );
+        assert_eq!(
+            GlobalHotkeyError::backend_unavailable(std::io::Error::other("backend")).code(),
+            crate::error::ErrorCode::PlatformUnavailable
+        );
+        assert_eq!(
+            GlobalHotkeyError::lifecycle(HotkeyRegistrationError::simulated("lifecycle")).code(),
+            crate::error::ErrorCode::PlatformUnavailable
+        );
+        assert_eq!(
+            GlobalHotkeyError::rollback(
+                HotkeyRegistrationError::simulated("register"),
+                HotkeyRegistrationError::simulated("rollback"),
+            )
+            .code(),
+            crate::error::ErrorCode::PlatformUnavailable
+        );
     }
 }

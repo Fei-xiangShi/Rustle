@@ -10,7 +10,19 @@ use std::time::Duration;
 use super::PlaybackInfo;
 use super::events::{AudioCommand, AudioCommandSender, LatestControlMailbox, SharedPlaybackState};
 use super::identity::{PlaybackContext, PlaybackGenerationController, PreloadIdentity};
+use super::player::{PlaybackError, PlaybackResult};
 use super::streaming::StreamingBuffer;
+
+fn command_queue_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> PlaybackError {
+    match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+            PlaybackError::ControlUnavailable("audio command queue is full".to_string())
+        }
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            PlaybackError::ControlUnavailable("audio command queue is closed".to_string())
+        }
+    }
+}
 
 /// Handle for controlling audio from UI thread
 ///
@@ -36,18 +48,11 @@ impl std::fmt::Debug for AudioHandle {
 }
 
 impl AudioHandle {
-    fn send_critical<F>(&self, build: F) -> Result<(), String>
+    fn send_critical<F>(&self, build: F) -> PlaybackResult<()>
     where
         F: FnOnce() -> AudioCommand,
     {
-        let permit = self.command_tx.try_reserve().map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "audio command queue is full".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "audio command queue is closed".to_string()
-            }
-        })?;
+        let permit = self.command_tx.try_reserve().map_err(command_queue_error)?;
         permit.send(build());
         Ok(())
     }
@@ -56,21 +61,16 @@ impl AudioHandle {
         self.generation.next_request_id()
     }
 
-    fn send_with_context<F>(&self, context: &PlaybackContext, build: F) -> Result<u64, String>
+    fn send_with_context<F>(&self, context: &PlaybackContext, build: F) -> PlaybackResult<u64>
     where
         F: FnOnce(PlaybackContext, u64) -> AudioCommand,
     {
-        let permit = self.command_tx.try_reserve().map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "audio command queue is full".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "audio command queue is closed".to_string()
-            }
-        })?;
+        let permit = self.command_tx.try_reserve().map_err(command_queue_error)?;
 
         if !self.generation.accepts(context) {
-            return Err("playback context is stale or cancelled".to_string());
+            return Err(PlaybackError::Cancelled(
+                "playback context is stale or cancelled".to_string(),
+            ));
         }
 
         let request_id = self.next_playback_request_id();
@@ -118,15 +118,8 @@ impl AudioHandle {
     ///
     /// The stop command and the returned context share the same generation, so
     /// a later resolved source can be enqueued without cancelling its download.
-    pub fn begin_playback_resolution(&self) -> Result<PlaybackContext, String> {
-        let permit = self.command_tx.try_reserve().map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "audio command queue is full".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "audio command queue is closed".to_string()
-            }
-        })?;
+    pub fn begin_playback_resolution(&self) -> PlaybackResult<PlaybackContext> {
+        let permit = self.command_tx.try_reserve().map_err(command_queue_error)?;
         let context = self.generation.activate_generation();
         permit.send(AudioCommand::Stop {
             context: context.clone(),
@@ -140,7 +133,7 @@ impl AudioHandle {
         path: PathBuf,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         let request_id = self.next_playback_request_id();
         self.send_critical(|| AudioCommand::Play {
             context: self.generation.activate_generation(),
@@ -158,7 +151,7 @@ impl AudioHandle {
         path: PathBuf,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         self.send_with_context(context, |context, request_id| AudioCommand::Play {
             context,
             request_id,
@@ -173,7 +166,7 @@ impl AudioHandle {
         path: PathBuf,
         position: Duration,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         let request_id = self.next_playback_request_id();
         self.send_critical(|| AudioCommand::LoadPaused {
             context: self.generation.activate_generation(),
@@ -191,7 +184,7 @@ impl AudioHandle {
         path: PathBuf,
         position: Duration,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         self.send_with_context(context, |context, request_id| AudioCommand::LoadPaused {
             context,
             request_id,
@@ -209,7 +202,7 @@ impl AudioHandle {
         cache_path: Option<PathBuf>,
         position: Duration,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         self.send_with_context(context, |context, request_id| {
             AudioCommand::LoadPausedStreaming {
                 context,
@@ -229,7 +222,7 @@ impl AudioHandle {
         position: Duration,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         let request_id = self.next_playback_request_id();
         self.send_critical(|| AudioCommand::PlayAt {
             context: self.generation.activate_generation(),
@@ -249,7 +242,7 @@ impl AudioHandle {
         position: Duration,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         self.send_with_context(context, |context, request_id| AudioCommand::PlayAt {
             context,
             request_id,
@@ -267,7 +260,7 @@ impl AudioHandle {
         cache_path: Option<PathBuf>,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         let request_id = self.next_playback_request_id();
         self.send_critical(|| AudioCommand::PlayStreaming {
             context: self.generation.activate_generation(),
@@ -289,7 +282,7 @@ impl AudioHandle {
         cache_path: Option<PathBuf>,
         fade_in: bool,
         track_gain: f32,
-    ) -> Result<u64, String> {
+    ) -> PlaybackResult<u64> {
         self.send_with_context(context, |context, request_id| AudioCommand::PlayStreaming {
             context,
             request_id,
@@ -305,27 +298,29 @@ impl AudioHandle {
     ///
     /// Sends Pause command to audio thread.
     /// Note: Audio Thread will pause Sink before data runs out, so no interrupt needed.
-    pub fn pause_with_fade(&self, fade_out: bool) -> Result<(), String> {
-        let context = self
-            .generation
-            .active_context()
-            .ok_or_else(|| "pause requires active playback generation".to_string())?;
+    pub fn pause_with_fade(&self, fade_out: bool) -> PlaybackResult<()> {
+        let context = self.generation.active_context().ok_or_else(|| {
+            PlaybackError::SourceUnavailable(
+                "pause requires active playback generation".to_string(),
+            )
+        })?;
         self.send_critical(|| AudioCommand::Pause { context, fade_out })
     }
 
     /// Resume playback with optional fade in
-    pub fn resume_with_fade(&self, fade_in: bool) -> Result<(), String> {
-        let context = self
-            .generation
-            .active_context()
-            .ok_or_else(|| "resume requires active playback generation".to_string())?;
+    pub fn resume_with_fade(&self, fade_in: bool) -> PlaybackResult<()> {
+        let context = self.generation.active_context().ok_or_else(|| {
+            PlaybackError::SourceUnavailable(
+                "resume requires active playback generation".to_string(),
+            )
+        })?;
         self.send_critical(|| AudioCommand::Resume { context, fade_in })
     }
 
     /// Stop playback
     ///
     /// Sends Stop command to audio thread.
-    pub fn stop(&self) -> Result<(), String> {
+    pub fn stop(&self) -> PlaybackResult<()> {
         self.begin_playback_resolution().map(|_| ())
     }
 
@@ -337,19 +332,11 @@ impl AudioHandle {
     /// The shared state position is updated immediately to the target position,
     /// so UI shows the target position while seek is in progress (prevents
     /// "bounce back" effect during buffering).
-    pub fn seek(&self, position: Duration) -> Result<(), String> {
-        let permit = self.command_tx.try_reserve().map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "audio command queue is full".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "audio command queue is closed".to_string()
-            }
+    pub fn seek(&self, position: Duration) -> PlaybackResult<()> {
+        let permit = self.command_tx.try_reserve().map_err(command_queue_error)?;
+        let (context, nonce) = self.generation.seek_context().ok_or_else(|| {
+            PlaybackError::SourceUnavailable("seek requires active playback generation".to_string())
         })?;
-        let (context, nonce) = self
-            .generation
-            .seek_context()
-            .ok_or_else(|| "seek requires active playback generation".to_string())?;
         // Update position immediately so UI shows target position during seek.
         // This happens only after capacity and identity have both been secured.
         self.state.set_position(position);
@@ -388,7 +375,7 @@ impl AudioHandle {
         identity: PreloadIdentity,
         path: PathBuf,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.send_critical(|| AudioCommand::CreatePreloadSink {
             identity,
             path,
@@ -403,7 +390,7 @@ impl AudioHandle {
         buffer: StreamingBuffer,
         duration: Duration,
         track_gain: f32,
-    ) -> Result<(), String> {
+    ) -> PlaybackResult<()> {
         self.send_critical(|| AudioCommand::CreatePreloadSinkStreaming {
             identity,
             buffer,
@@ -421,15 +408,8 @@ impl AudioHandle {
         identity: PreloadIdentity,
         fade_in: bool,
         transition: Option<super::automix::TransitionDirective>,
-    ) -> Result<u64, String> {
-        let permit = self.command_tx.try_reserve().map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "audio command queue is full".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "audio command queue is closed".to_string()
-            }
-        })?;
+    ) -> PlaybackResult<u64> {
+        let permit = self.command_tx.try_reserve().map_err(command_queue_error)?;
         let playback_request_id = self.next_playback_request_id();
         let transition = transition.unwrap_or_else(|| {
             super::automix::TransitionDirective::manual(super::automix::ScheduleGroup(
@@ -440,7 +420,11 @@ impl AudioHandle {
             .generation
             .active_context()
             .filter(|_| self.generation.accepts_preload(&identity))
-            .ok_or_else(|| "preloaded audio identity is stale or cancelled".to_string())?;
+            .ok_or_else(|| {
+                PlaybackError::Cancelled(
+                    "preloaded audio identity is stale or cancelled".to_string(),
+                )
+            })?;
         permit.send(AudioCommand::PlayPreloaded {
             context,
             identity,
@@ -461,21 +445,17 @@ impl AudioHandle {
         trigger_at: Duration,
         fade_in: bool,
         transition: super::automix::TransitionDirective,
-    ) -> Result<u64, String> {
-        let permit = self.command_tx.try_reserve().map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "audio command queue is full".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "audio command queue is closed".to_string()
-            }
+    ) -> PlaybackResult<u64> {
+        let permit = self.command_tx.try_reserve().map_err(command_queue_error)?;
+        let owner = self.generation.active_context().ok_or_else(|| {
+            PlaybackError::SourceUnavailable(
+                "scheduled transition requires active playback".to_string(),
+            )
         })?;
-        let owner = self
-            .generation
-            .active_context()
-            .ok_or_else(|| "scheduled transition requires active playback".to_string())?;
         if !self.generation.accepts_preload(&identity) {
-            return Err("preloaded audio identity is stale or cancelled".to_string());
+            return Err(PlaybackError::Cancelled(
+                "preloaded audio identity is stale or cancelled".to_string(),
+            ));
         }
         let playback_request_id = self.next_playback_request_id();
         permit.send(AudioCommand::SchedulePreloadedTransition {
@@ -489,15 +469,17 @@ impl AudioHandle {
         Ok(playback_request_id)
     }
 
-    pub fn cancel_scheduled_transition(&self) -> Result<(), String> {
+    pub fn cancel_scheduled_transition(&self) -> PlaybackResult<()> {
         let owner = self.generation.active_context().ok_or_else(|| {
-            "scheduled transition cancellation requires active playback".to_string()
+            PlaybackError::SourceUnavailable(
+                "scheduled transition cancellation requires active playback".to_string(),
+            )
         })?;
         self.send_critical(|| AudioCommand::CancelScheduledTransition { owner })
     }
 
     /// Release a preloaded sink by request_id without playing it
-    pub fn release_preload(&self, identity: PreloadIdentity) -> Result<(), String> {
+    pub fn release_preload(&self, identity: PreloadIdentity) -> PlaybackResult<()> {
         self.send_critical(|| AudioCommand::ReleasePreload { identity })
     }
 
@@ -515,7 +497,7 @@ impl AudioHandle {
     /// Switch audio output device
     ///
     /// Listen for `AudioEvent::DeviceSwitched` or `AudioEvent::DeviceSwitchFailed`.
-    pub fn switch_device(&self, device_name: Option<String>) -> Result<(), String> {
+    pub fn switch_device(&self, device_name: Option<String>) -> PlaybackResult<()> {
         self.send_critical(|| AudioCommand::SwitchDevice { device_name })
     }
 
@@ -562,7 +544,10 @@ mod tests {
         while tx.try_send(AudioCommand::LatestMailboxWake).is_ok() {}
 
         let result = handle.play_with_fade(PathBuf::from("missing.mp3"), false, 1.0);
-        assert_eq!(result.unwrap_err(), "audio command queue is full");
+        assert!(matches!(
+            result.unwrap_err(),
+            PlaybackError::ControlUnavailable(_)
+        ));
         assert!(handle.current_context().is_none());
     }
 
@@ -604,7 +589,7 @@ mod tests {
             .play_with_fade_in_context(&stale, PathBuf::from("stale.flac"), false, 1.0)
             .unwrap_err();
 
-        assert_eq!(error, "playback context is stale or cancelled");
+        assert!(matches!(error, PlaybackError::Cancelled(_)));
         assert_eq!(handle.current_context(), Some(current));
         assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Stop { .. }));
         assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Stop { .. }));
@@ -619,10 +604,10 @@ mod tests {
         let active = handle.begin_playback_resolution().unwrap();
         while tx.try_send(AudioCommand::LatestMailboxWake).is_ok() {}
 
-        assert_eq!(
+        assert!(matches!(
             handle.begin_playback_resolution().unwrap_err(),
-            "audio command queue is full"
-        );
+            PlaybackError::ControlUnavailable(_)
+        ));
         assert_eq!(handle.current_context(), Some(active.clone()));
         assert!(!active.cancellation.is_cancelled());
     }
@@ -633,18 +618,18 @@ mod tests {
         let latest = LatestControlMailbox::new(tx.clone());
         let handle = AudioHandle::new(tx, latest, SharedPlaybackState::new());
 
-        assert_eq!(
+        assert!(matches!(
             handle.pause_with_fade(false).unwrap_err(),
-            "pause requires active playback generation"
-        );
-        assert_eq!(
+            PlaybackError::SourceUnavailable(_)
+        ));
+        assert!(matches!(
             handle.resume_with_fade(false).unwrap_err(),
-            "resume requires active playback generation"
-        );
-        assert_eq!(
+            PlaybackError::SourceUnavailable(_)
+        ));
+        assert!(matches!(
             handle.seek(Duration::ZERO).unwrap_err(),
-            "seek requires active playback generation"
-        );
+            PlaybackError::SourceUnavailable(_)
+        ));
     }
 
     #[test]
@@ -658,7 +643,7 @@ mod tests {
 
         let error = handle.play_preloaded(stale, false, None).unwrap_err();
 
-        assert_eq!(error, "preloaded audio identity is stale or cancelled");
+        assert!(matches!(error, PlaybackError::Cancelled(_)));
         assert_eq!(handle.current_context(), Some(current));
     }
 
@@ -694,10 +679,10 @@ mod tests {
         handle.generation.activate_generation();
         while tx.try_send(AudioCommand::LatestMailboxWake).is_ok() {}
 
-        assert_eq!(
+        assert!(matches!(
             handle.seek(Duration::from_secs(12)).unwrap_err(),
-            "audio command queue is full"
-        );
+            PlaybackError::ControlUnavailable(_)
+        ));
         assert_eq!(state.get_info().position, Duration::ZERO);
         rx.try_recv().unwrap();
         let (_, nonce) = handle.generation.seek_context().unwrap();

@@ -4,10 +4,12 @@
 //! implementation to `ncm-api-rs`.
 
 mod client;
+mod error;
 mod mapper;
 mod models;
 
 pub use client::NcmClient;
+pub use error::{NcmError, NcmResult};
 pub use models::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LoginInfo, NcmQualityLevel,
     PlaylistDetail, PlaylistSummary, RadioSummary, SearchType, SongQualityDetail,

@@ -5303,6 +5303,7 @@ dependencies = [
  "souvlaki",
  "spectrum-analyzer",
  "sqlx",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",

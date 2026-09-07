@@ -175,7 +175,7 @@ impl App {
                 }
                 Some(Task::batch([
                     self.download_schedule_next().unwrap_or(Task::none()),
-                    Self::toast_error(error.clone()),
+                    Self::toast_error(error.user_summary().to_owned()),
                 ]))
             }
             Message::SwitchDownloadTab(tab) => {
@@ -266,7 +266,13 @@ impl App {
             },
             move |url| {
                 if url.is_empty() {
-                    crate::app::Message::DownloadError(song_id, "无可用音源".into())
+                    crate::app::Message::DownloadError(
+                        song_id,
+                        crate::error::AppError::new(
+                            crate::error::ErrorCode::AudioSourceUnavailable,
+                            "No downloadable audio source is available",
+                        ),
+                    )
                 } else {
                     crate::app::Message::DownloadUrlResolved(song_id, ncm_id, url, meta)
                 }
@@ -354,7 +360,13 @@ impl App {
                     })
                     .collect();
                 if items.is_empty() {
-                    crate::app::Message::DownloadError(0, "无可用的下载链接".into())
+                    crate::app::Message::DownloadError(
+                        0,
+                        crate::error::AppError::new(
+                            crate::error::ErrorCode::AudioSourceUnavailable,
+                            "No downloadable audio sources are available",
+                        ),
+                    )
                 } else {
                     crate::app::Message::DownloadBatchEnqueue(items)
                 }
@@ -391,7 +403,7 @@ impl App {
                         song_id,
                         path.to_string_lossy().to_string(),
                     ),
-                    Err(e) => crate::app::Message::DownloadError(song_id, e),
+                    Err(e) => crate::app::Message::DownloadError(song_id, e.into()),
                 },
             )
             .abortable();

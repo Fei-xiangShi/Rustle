@@ -1,11 +1,10 @@
 //! Database repository - main entry point
 //! Delegates to ops modules for actual operations
 
-use anyhow::Result;
 use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use std::path::Path;
 
-use super::{models::*, ops, schema};
+use super::{StorageResult as Result, models::*, ops, schema};
 
 /// Database connection pool wrapper
 #[derive(Debug)]
@@ -91,16 +90,16 @@ impl Database {
         ops::refresh_song_metadata(&self.pool, song).await
     }
 
-    pub async fn insert_download(&self, download: NewDownload<'_>) -> anyhow::Result<()> {
+    pub async fn insert_download(&self, download: NewDownload<'_>) -> Result<()> {
         ops::insert_download(&self.pool, download).await?;
         Ok(())
     }
 
-    pub async fn get_all_downloads(&self) -> anyhow::Result<Vec<DownloadRow>> {
+    pub async fn get_all_downloads(&self) -> Result<Vec<DownloadRow>> {
         Ok(ops::get_all_downloads(&self.pool).await?)
     }
 
-    pub async fn delete_download(&self, song_id: i64) -> anyhow::Result<()> {
+    pub async fn delete_download(&self, song_id: i64) -> Result<()> {
         ops::delete_download(&self.pool, song_id).await?;
         Ok(())
     }

@@ -235,7 +235,12 @@ impl App {
                         ))
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "Global hotkeys are unavailable");
+                        let error = crate::error::AppError::from(error);
+                        tracing::warn!(
+                            code = %error.code(),
+                            recovery = ?error.recovery(),
+                            "Global hotkeys are unavailable"
+                        );
                         Some(Task::none())
                     }
                 }

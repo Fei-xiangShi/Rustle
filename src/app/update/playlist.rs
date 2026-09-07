@@ -59,7 +59,10 @@ impl App {
             let db = db.clone();
             Task::perform(load_playlist_view(db, playlist_id), |result| match result {
                 Some(payload) => Message::PlaylistViewLoaded(payload),
-                None => Message::DatabaseError("Playlist not found".into()),
+                None => Message::DatabaseError(crate::error::AppError::new(
+                    crate::error::ErrorCode::StorageNotFound,
+                    "The playlist was not found",
+                )),
             })
         } else {
             Task::none()
@@ -408,7 +411,10 @@ impl App {
                     return Some(Task::batch([
                         Task::perform(load_playlist_view(db1, id), |result| match result {
                             Some(payload) => Message::PlaylistViewLoaded(payload),
-                            None => Message::DatabaseError("Playlist not found".into()),
+                            None => Message::DatabaseError(crate::error::AppError::new(
+                                crate::error::ErrorCode::StorageNotFound,
+                                "The playlist was not found",
+                            )),
                         }),
                         Task::perform(
                             async move { db2.get_all_playlists().await.unwrap_or_default() },
