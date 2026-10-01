@@ -48,7 +48,10 @@ jobs:
         run: |
           mkdir -p target/ci-logs
           set -o pipefail
-          cargo xtask supply-chain 2>&1 | tee target/ci-logs/rust-supply-chain.log
+          cargo machete 2>&1 | tee target/ci-logs/rust-supply-chain.log
+          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo deny --locked --workspace --all-features --target "$target" check --allow license-not-encountered --allow unmatched-source --allow unmatched-skip --allow unnecessary-skip advisories licenses bans sources 2>&1 | tee -a target/ci-logs/rust-supply-chain.log
+          done
 
       - name: Upload failure log
         if: failure()
@@ -84,7 +87,12 @@ jobs:
         run: |
           mkdir -p target/ci-logs
           set -o pipefail
-          cargo xtask check 2>&1 | tee target/ci-logs/rust-quality.log
+          cargo fmt --all --check 2>&1 | tee -a target/ci-logs/rust-quality.log
+          cargo check --locked --workspace 2>&1 | tee -a target/ci-logs/rust-quality.log
+          cargo check --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-quality.log
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings 2>&1 | tee -a target/ci-logs/rust-quality.log
+          cargo test --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-quality.log
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps 2>&1 | tee -a target/ci-logs/rust-quality.log
 
       - name: Upload failure log
         if: failure()
@@ -120,7 +128,10 @@ jobs:
         run: |
           mkdir -p target/ci-logs
           set -o pipefail
-          cargo xtask check-native 2>&1 | tee target/ci-logs/rust-windows.log
+          cargo check --locked --workspace 2>&1 | tee -a target/ci-logs/rust-windows.log
+          cargo check --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-windows.log
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings 2>&1 | tee -a target/ci-logs/rust-windows.log
+          cargo test --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-windows.log
 
       - name: Upload failure log
         if: failure()
@@ -156,7 +167,10 @@ jobs:
         run: |
           mkdir -p target/ci-logs
           set -o pipefail
-          cargo xtask check-native 2>&1 | tee target/ci-logs/rust-linux.log
+          cargo check --locked --workspace 2>&1 | tee -a target/ci-logs/rust-linux.log
+          cargo check --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-linux.log
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings 2>&1 | tee -a target/ci-logs/rust-linux.log
+          cargo test --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-linux.log
 
       - name: Upload failure log
         if: failure()
@@ -192,7 +206,10 @@ jobs:
         run: |
           mkdir -p target/ci-logs
           set -o pipefail
-          cargo xtask check-native 2>&1 | tee target/ci-logs/rust-macos.log
+          cargo check --locked --workspace 2>&1 | tee -a target/ci-logs/rust-macos.log
+          cargo check --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-macos.log
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings 2>&1 | tee -a target/ci-logs/rust-macos.log
+          cargo test --locked --workspace --all-targets --all-features 2>&1 | tee -a target/ci-logs/rust-macos.log
 
       - name: Upload failure log
         if: failure()

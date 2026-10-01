@@ -42,11 +42,32 @@ jobs:
       - name: Validate release source
         shell: bash
         run: |
-          args=(--commit "$GITHUB_SHA" --output target/release-metadata.json)
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            args+=(--tag "$GITHUB_REF_NAME")
-          fi
-          cargo xtask release-preflight "${args[@]}"
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, tomllib
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          commit = os.environ['GITHUB_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', commit) or git('rev-parse', 'HEAD') != commit:
+              raise SystemExit('Release commit does not match checkout')
+          if git('status', '--porcelain', '--untracked-files=no'):
+              raise SystemExit('Release checkout has tracked changes')
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          tag = os.environ['GITHUB_REF_NAME'] if os.environ['GITHUB_REF'].startswith('refs/tags/') else None
+          if tag is not None and (tag != f'v{version}' or git('rev-parse', f'refs/tags/{tag}^{{commit}}') != commit):
+              raise SystemExit('Release tag must match the package version and commit')
+          metadata = {
+              'schema_version': 1, 'package': 'rustle', 'version': version, 'tag': tag,
+              'channel': 'preview' if '-' in version else 'stable', 'commit': commit,
+              'commit_timestamp': git('show', '-s', '--format=%cI', commit),
+              'toolchain': tomllib.loads(Path('rust-toolchain.toml').read_text())['toolchain']['channel'],
+              'cargo_lock_sha256': hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest(),
+          }
+          Path('target').mkdir(exist_ok=True)
+          Path('target/release-metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          PY
 
       - name: Export release metadata
         id: metadata
@@ -389,10 +410,41 @@ jobs:
       - name: Build verified release bundle
         shell: bash
         run: |
-          mkdir -p release-bundle
-          cargo xtask release-manifest --metadata release-input/release-metadata.json --artifacts-dir release-input/products --output release-bundle/release-manifest.json --checksums-output release-bundle/SHA256SUMS.txt
-          cp release-input/release-metadata.json release-bundle/
-          cp release-input/products/* release-bundle/
+          python3 - <<'PY'
+          import hashlib, json, shutil, subprocess, tomllib
+          from pathlib import Path
+
+          metadata_path = Path('release-input/release-metadata.json')
+          metadata = json.loads(metadata_path.read_text())
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if (metadata['schema_version'] != 1 or metadata['package'] != 'rustle'
+                  or metadata['version'] != version or metadata['commit'] != commit
+                  or metadata['cargo_lock_sha256'] != hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest()):
+              raise SystemExit('Release metadata does not match checkout')
+          expected = {
+              'rustle-linux-x86_64.AppImage', 'rustle-macos-arm64.dmg',
+              'rustle-macos-x86_64.dmg', 'rustle-windows-x86_64.exe',
+              f'rustle-{version}-windows-x86_64.msi',
+          }
+          files = list(Path('release-input/products').iterdir())
+          if any(p.is_symlink() or not p.is_file() for p in files) or {p.name for p in files} != expected:
+              raise SystemExit('Unexpected or missing release products')
+          bundle = Path('release-bundle')
+          bundle.mkdir()
+          artifacts = []
+          for p in sorted(files):
+              shutil.copyfile(p, bundle / p.name)
+              artifacts.append({'name': p.name, 'size': p.stat().st_size,
+                                'sha256': hashlib.sha256(p.read_bytes()).hexdigest()})
+          manifest = {key: metadata[key] for key in ('schema_version', 'package', 'version', 'tag', 'channel', 'commit')}
+          manifest['artifacts'] = artifacts
+          (bundle / 'release-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          shutil.copyfile(metadata_path, bundle / metadata_path.name)
+          checksums = ''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(bundle.iterdir()))
+          (bundle / 'SHA256SUMS.txt').write_text(checksums)
+          PY
+          (cd release-bundle && sha256sum --check SHA256SUMS.txt)
 
       - name: Upload verified release bundle
         uses: actions/upload-artifact@v6

@@ -110,8 +110,11 @@ sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libclang-dev pkg-conf
 # Arch
 sudo pacman -S --needed alsa-lib pipewire clang pkgconf
 
-cargo xtask metadata
-cargo xtask check
+cargo metadata --locked --no-deps --format-version 1
+cargo fmt --all --check
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
 cargo build --release --locked
 ./target/release/rustle
 ```

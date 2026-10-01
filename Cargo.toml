@@ -11,7 +11,6 @@ members = [
     "crates/rustle-platform",
     "crates/rustle-storage",
     "crates/rustle-ui",
-    "xtask",
 ]
 default-members = ["apps/rustle-desktop"]
 resolver = "3"
