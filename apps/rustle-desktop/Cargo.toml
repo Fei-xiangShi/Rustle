@@ -69,4 +69,5 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "c
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [target.'cfg(windows)'.build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 winresource = "0.1.31"
