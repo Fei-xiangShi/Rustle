@@ -625,28 +625,22 @@ fn playback_section(
 /// Audio engine entry row - clickable to navigate to audio engine page
 fn audio_engine_entry_row(locale: Locale, context: ResponsiveContext) -> Element<'static, Message> {
     let tokens = context.tokens;
-    let content = row![
-        // Title only
-        text(locale.get(Key::AudioEngineTitle).to_string())
-            .size(tokens.text(TextRole::BodyLarge))
-            .style(|theme| text::Style {
-                color: Some(theme::settings_label(theme))
-            }),
-        Space::new().width(Fill),
-        // Chevron right icon
+    let content = setting_row(
+        context,
+        locale.get(Key::AudioEngineTitle),
+        None,
         svg(svg::Handle::from_memory(
-            crate::ui::icons::CHEVRON_RIGHT.as_bytes()
+            crate::ui::icons::CHEVRON_RIGHT.as_bytes(),
         ))
         .width(tokens.icon(crate::ui::responsive::IconRole::Medium))
         .height(tokens.icon(crate::ui::responsive::IconRole::Medium))
         .style(|theme, _status| svg::Style {
             color: Some(theme::settings_desc(theme)),
-        }),
-    ]
-    .align_y(Alignment::Center)
-    .width(Fill);
+        })
+        .into(),
+    );
 
-    button(container(content).padding([tokens.space(16.0), 0.0]))
+    button(content)
         .width(Fill)
         .padding(0)
         .style(|theme, status| {
@@ -849,6 +843,7 @@ fn system_section(
                 },
             )
         ),
+        divider(context),
         setting_row(
             context,
             locale.get(Key::SettingsDiscordRichPresence),
@@ -899,30 +894,42 @@ fn network_section(
     let proxy_username = settings.network.proxy_username.clone().unwrap_or_default();
     let proxy_password = settings.network.proxy_password.clone().unwrap_or_default();
 
-    let mut items: Vec<Element<'static, Message>> = vec![setting_row(
-        context,
-        locale.get(Key::SettingsProxyType),
-        None,
-        styled_pick_list(
+    let mut items: Vec<Element<'static, Message>> = vec![
+        setting_row(
             context,
-            proxy_types,
-            Some(current_proxy_type),
-            move |value| {
-                let proxy_type = if value == proxy_none_label {
-                    ProxyType::None
-                } else if value == "HTTP" {
-                    ProxyType::Http
-                } else if value == "HTTPS" {
-                    ProxyType::Https
-                } else if value == "SOCKS5" {
-                    ProxyType::Socks5
-                } else {
-                    ProxyType::System
-                };
-                Message::UpdateProxyType(proxy_type)
-            },
+            locale.get(Key::SettingsOverseasCompatibility),
+            Some(locale.get(Key::SettingsOverseasCompatibilityDesc)),
+            toggler(settings.network.overseas_compatibility)
+                .on_toggle(Message::UpdateOverseasCompatibility)
+                .size(context.tokens.text(TextRole::Title))
+                .into(),
         ),
-    )];
+        divider(context),
+        setting_row(
+            context,
+            locale.get(Key::SettingsProxyType),
+            None,
+            styled_pick_list(
+                context,
+                proxy_types,
+                Some(current_proxy_type),
+                move |value| {
+                    let proxy_type = if value == proxy_none_label {
+                        ProxyType::None
+                    } else if value == "HTTP" {
+                        ProxyType::Http
+                    } else if value == "HTTPS" {
+                        ProxyType::Https
+                    } else if value == "SOCKS5" {
+                        ProxyType::Socks5
+                    } else {
+                        ProxyType::System
+                    };
+                    Message::UpdateProxyType(proxy_type)
+                },
+            ),
+        ),
+    ];
 
     if show_proxy_details {
         items.push(divider(context));

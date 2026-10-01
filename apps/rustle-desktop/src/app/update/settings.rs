@@ -516,6 +516,13 @@ impl App {
                 }
                 Some(Task::perform(async { Message::SaveSettings }, |m| m))
             }
+            Message::UpdateOverseasCompatibility(enabled) => {
+                self.core.settings.network.overseas_compatibility = *enabled;
+                if let Some(client) = &self.core.ncm_client {
+                    client.set_overseas_compatibility(*enabled);
+                }
+                Some(Task::done(Message::SaveSettings))
+            }
             Message::UpdateProxyType(proxy_type) => {
                 self.core.settings.network.proxy_type = *proxy_type;
                 tracing::info!("Proxy type changed to: {:?}", proxy_type);

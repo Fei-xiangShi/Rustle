@@ -143,6 +143,11 @@ static TRANSLATIONS: LazyLock<HashMap<Key, &'static str>> = LazyLock::new(|| {
     // Settings - Network Section
     m.insert(Key::SettingsNetworkTitle, "网络设置");
     m.insert(Key::SettingsTabNetwork, "网络");
+    m.insert(Key::SettingsOverseasCompatibility, "海外访问兼容");
+    m.insert(
+        Key::SettingsOverseasCompatibilityDesc,
+        "尝试解决网易云在海外或部分地区的访问限制，开启后对后续请求生效",
+    );
     m.insert(Key::SettingsProxyType, "代理类型");
     m.insert(Key::SettingsProxyHost, "代理地址");
     m.insert(Key::SettingsProxyPort, "代理端口");

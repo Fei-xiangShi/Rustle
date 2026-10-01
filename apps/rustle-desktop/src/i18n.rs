@@ -181,6 +181,8 @@ pub enum Key {
     // Settings - Network Section
     SettingsNetworkTitle,
     SettingsTabNetwork,
+    SettingsOverseasCompatibility,
+    SettingsOverseasCompatibilityDesc,
     SettingsProxyType,
     SettingsProxyHost,
     SettingsProxyPort,

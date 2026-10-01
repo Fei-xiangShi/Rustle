@@ -371,6 +371,9 @@ impl std::fmt::Display for ProxyType {
 /// Network settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSettings {
+    /// Attach a session-stable domestic IP to NetEase API requests.
+    #[serde(default)]
+    pub overseas_compatibility: bool,
     /// Proxy type
     pub proxy_type: ProxyType,
     /// Proxy host address
@@ -526,6 +529,7 @@ impl Default for SystemSettings {
 impl Default for NetworkSettings {
     fn default() -> Self {
         Self {
+            overseas_compatibility: false,
             proxy_type: ProxyType::None,
             proxy_host: String::new(),
             proxy_port: 0,
@@ -598,3 +602,23 @@ impl std::fmt::Display for SettingsError {
 }
 
 impl std::error::Error for SettingsError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overseas_compatibility_migrates_old_settings_and_round_trips() {
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old["network"]
+            .as_object_mut()
+            .unwrap()
+            .remove("overseas_compatibility");
+        let mut restored: Settings = serde_json::from_value(old).unwrap();
+        assert!(!restored.network.overseas_compatibility);
+        restored.network.overseas_compatibility = true;
+        let saved = serde_json::to_string(&restored).unwrap();
+        let loaded: Settings = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.network.overseas_compatibility);
+    }
+}

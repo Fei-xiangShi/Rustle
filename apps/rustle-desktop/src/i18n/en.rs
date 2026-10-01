@@ -170,6 +170,11 @@ static TRANSLATIONS: LazyLock<HashMap<Key, &'static str>> = LazyLock::new(|| {
     // Settings - Network Section
     m.insert(Key::SettingsNetworkTitle, "Network Settings");
     m.insert(Key::SettingsTabNetwork, "Network");
+    m.insert(
+        Key::SettingsOverseasCompatibility,
+        "Overseas access compatibility",
+    );
+    m.insert(Key::SettingsOverseasCompatibilityDesc, "Try to resolve regional restrictions on NetEase Cloud Music. Applies to subsequent requests.");
     m.insert(Key::SettingsProxyType, "Proxy Type");
     m.insert(Key::SettingsProxyHost, "Proxy Host");
     m.insert(Key::SettingsProxyPort, "Proxy Port");

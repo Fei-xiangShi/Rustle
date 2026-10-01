@@ -263,9 +263,10 @@ impl App {
         }
     }
 
-    /// Set the NCM client and sync quality settings
+    /// Set the NCM client and sync request settings before its first request.
     fn set_ncm_client(&mut self, client: NcmClient) {
         client.set_quality(self.core.settings.playback.music_quality.to_api_rate());
+        client.set_overseas_compatibility(self.core.settings.network.overseas_compatibility);
         self.core.ncm_client = Some(client);
     }
 

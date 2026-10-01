@@ -183,6 +183,7 @@ pub enum Message {
     /// Toggle Discord Rich Presence
     UpdateDiscordEnabled(bool),
     /// Update network settings
+    UpdateOverseasCompatibility(bool),
     UpdateProxyType(crate::features::ProxyType),
     UpdateProxyHost(String),
     UpdateProxyPort(String),
@@ -1038,6 +1039,9 @@ impl std::fmt::Debug for Message {
             Self::EnforceCacheLimit => simple!("EnforceCacheLimit"),
             Self::UpdateAudioOutputDevice(_) => simple!("UpdateAudioOutputDevice"),
             Self::UpdateDiscordEnabled(b) => simple!("UpdateDiscordEnabled", "{}", b),
+            Self::UpdateOverseasCompatibility(enabled) => {
+                simple!("UpdateOverseasCompatibility", "{}", enabled)
+            }
             Self::UpdateProxyType(t) => simple!("UpdateProxyType", "{:?}", t),
             Self::UpdateProxyHost(_) => simple!("UpdateProxyHost"),
             Self::UpdateProxyPort(_) => simple!("UpdateProxyPort"),

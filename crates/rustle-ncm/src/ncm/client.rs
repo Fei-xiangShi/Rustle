@@ -4,8 +4,8 @@ use md5::{Digest, Md5};
 use ncm_api_rs::{ApiClient, CryptoType, Query, RequestOption, create_client};
 use serde_json::json;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
@@ -22,6 +22,9 @@ const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAGE_DOWNLOAD_ATTEMPTS: usize = 2;
 const LOGIN_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const CLIENT_LOG_DOMAIN: &str = "https://clientlog.music.163.com";
+
+// Keep the forwarded address stable across clones, logins, and client rebuilds.
+static SESSION_REAL_IP: OnceLock<String> = OnceLock::new();
 
 fn is_ncm_image_host(url: &reqwest::Url) -> bool {
     url.host_str().is_some_and(|host| {
@@ -102,6 +105,7 @@ pub struct NcmClient {
     login_refresh: Arc<tokio::sync::Mutex<Option<Instant>>>,
     proxy: Option<String>,
     quality: Arc<AtomicU32>,
+    overseas_compatibility: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for NcmClient {
@@ -160,6 +164,7 @@ impl NcmClient {
             login_refresh: Arc::new(tokio::sync::Mutex::new(None)),
             proxy,
             quality: Arc::new(AtomicU32::new(DEFAULT_QUALITY)),
+            overseas_compatibility: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -216,6 +221,12 @@ impl NcmClient {
         self.proxy = None;
     }
 
+    /// Apply to subsequent API requests, including requests from existing clones.
+    pub fn set_overseas_compatibility(&self, enabled: bool) {
+        self.overseas_compatibility
+            .store(enabled, Ordering::Relaxed);
+    }
+
     pub fn set_quality(&self, quality: u32) {
         self.quality.store(quality, Ordering::Relaxed);
         tracing::info!(
@@ -264,6 +275,13 @@ impl NcmClient {
         }
         if let Some(proxy) = &self.proxy {
             query.proxy = Some(proxy.clone());
+        }
+        if self.overseas_compatibility.load(Ordering::Relaxed) {
+            query.real_ip = Some(
+                SESSION_REAL_IP
+                    .get_or_init(ncm_api_rs::util::ip::generate_random_chinese_ip)
+                    .clone(),
+            );
         }
         query
     }
@@ -1299,6 +1317,40 @@ mod tests {
     use super::*;
     use rustle_application::error::ErrorCode;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn overseas_compatibility_updates_clones_and_preserves_request_context() {
+        let client = NcmClient::from_cookie_with_proxy(
+            "MUSIC_U=test-cookie".to_string(),
+            Some("http://127.0.0.1:7890".to_string()),
+        );
+        let cloned = client.clone();
+        let original = cloned.query();
+        assert!(original.real_ip.is_none());
+        assert!(!original.random_cn_ip);
+
+        client.set_overseas_compatibility(true);
+        let enabled = cloned.query();
+        let ip = enabled.real_ip.as_ref().unwrap();
+        assert!(ip.parse::<std::net::Ipv4Addr>().is_ok());
+        assert_eq!(enabled.cookie, original.cookie);
+        assert_eq!(enabled.proxy, original.proxy);
+        assert_eq!(cloned.query_for_os("pc").real_ip.as_ref(), Some(ip));
+        assert_eq!(
+            NcmClient::request_options(&enabled).real_ip.as_ref(),
+            Some(ip)
+        );
+
+        cloned.set_overseas_compatibility(false);
+        assert!(client.query().real_ip.is_none());
+        client.set_overseas_compatibility(true);
+        assert_eq!(client.query().real_ip.as_ref(), Some(ip));
+
+        let rebuilt = NcmClient::new();
+        assert!(rebuilt.query().real_ip.is_none());
+        rebuilt.set_overseas_compatibility(true);
+        assert_eq!(rebuilt.query().real_ip.as_ref(), Some(ip));
+    }
 
     fn test_session_path(name: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
