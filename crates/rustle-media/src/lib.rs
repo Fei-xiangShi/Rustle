@@ -9,3 +9,6 @@ pub mod scan;
 pub mod watch;
 
 pub use error::{MediaError, MediaResult};
+
+#[cfg(test)]
+mod test_support;

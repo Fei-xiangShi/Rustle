@@ -3,7 +3,9 @@
 //! YRC is a word-level lyrics format used by NetEase Cloud Music.
 //! Format: [start_time,duration](word_start,word_duration,0)word(word_start,word_duration,0)word...
 
-use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned, process_lyrics};
+use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned};
+
+use super::timing::finish_timed_lines;
 
 /// Parse line timestamp: [start_time,duration]
 fn parse_line_time(src: &str) -> Option<(usize, u64, u64)> {
@@ -35,7 +37,11 @@ fn parse_word_time(src: &str) -> Option<(usize, u64, u64)> {
     let time_str = &src[1..end_paren];
     let parts: Vec<&str> = time_str.split(',').collect();
 
-    if parts.len() != 3 {
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    {
         return None;
     }
 
@@ -56,21 +62,26 @@ fn parse_words(src: &str) -> Vec<LyricWordOwned> {
         if let Some((consumed, start_time, duration)) = parse_word_time(&src[pos..]) {
             pos += consumed;
 
-            // Find the word text (until next '(' or end of string)
-            let word_end = src[pos..].find('(').map(|i| pos + i).unwrap_or(src.len());
+            // Only a complete timing marker terminates text. Parentheses in
+            // the lyric are ordinary text, including those containing Unicode.
+            let word_end = src[pos..]
+                .match_indices('(')
+                .find(|(index, _)| parse_word_time(&src[pos + index..]).is_some())
+                .map(|(index, _)| pos + index)
+                .unwrap_or(src.len());
             let word_text = &src[pos..word_end];
 
             words.push(LyricWordOwned {
                 start_time,
-                end_time: start_time + duration,
+                end_time: start_time.saturating_add(duration),
                 word: word_text.to_string(),
                 roman_word: String::new(),
             });
 
             pos = word_end;
         } else {
-            // Skip unknown character
-            pos += 1;
+            // Search on character boundaries even for malformed source text.
+            pos += src[pos..].chars().next().map_or(1, char::len_utf8);
         }
     }
 
@@ -85,7 +96,7 @@ fn parse_line(line: &str) -> Option<LyricLineOwned> {
     }
 
     // Parse line timestamp
-    let (consumed, _start_time, _duration) = parse_line_time(line)?;
+    let (consumed, start_time, duration) = parse_line_time(line)?;
 
     // Parse words
     let words = parse_words(&line[consumed..]);
@@ -96,6 +107,8 @@ fn parse_line(line: &str) -> Option<LyricLineOwned> {
 
     Some(LyricLineOwned {
         words,
+        start_time,
+        end_time: start_time.saturating_add(duration),
         ..Default::default()
     })
 }
@@ -111,7 +124,7 @@ pub fn parse_yrc(src: &str) -> Vec<LyricLineOwned> {
         }
     }
 
-    process_lyrics(&mut result);
+    finish_timed_lines(&mut result);
 
     result
 }
@@ -157,6 +170,23 @@ pub fn stringify_yrc(lines: &[LyricLineOwned]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parentheses_and_unicode_do_not_truncate_or_panic() {
+        let lines = parse_yrc("[1000,3000](1500,1000,0)你好(和声)(2500,1000,0)世界");
+        assert_eq!(lines[0].words[0].word, "你好(和声)");
+        assert_eq!(lines[0].words[1].word, "世界");
+        assert_eq!((lines[0].start_time, lines[0].end_time), (1000, 4000));
+        assert_eq!(lines[0].words[0].start_time, 1500);
+        assert!(parse_yrc("[0,1000](坏时间)中文😀").is_empty());
+    }
+
+    #[test]
+    fn overflowing_timestamps_never_panic() {
+        let lines = parse_yrc("[18446744073709551615,1000](18446744073709551615,1000,0)词");
+        assert_eq!(lines[0].end_time, rustle_domain::lyrics::MAX_LRC_TIMESTAMP);
+        assert!(parse_yrc("[0,1000](999999999999999999999,1000,0)词").is_empty());
+    }
 
     #[test]
     fn test_parse_line_time() {

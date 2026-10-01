@@ -5,18 +5,24 @@
 //! - LQE: Lyricify Quick Export container (LYS + LRC attributes)
 //! - YRC: NetEase Cloud Music word-level lyrics
 //! - QRC: QQ Music word-level lyrics
+//! - KRC: Kugou raw and decoded LX word-level lyrics
 //! - ESLrc: Foobar2000 ESLyric word-level format
 //! - LYS: Lyricify Syllable format
 //! - TTML: Apple Music lyrics format (XML)
-//! - ASS: Subtitle export format
+//! - ASS/SSA: Subtitle text, karaoke and vocal/translation styles
+//! - SRT: SubRip subtitle text and explicit cue intervals
 
 mod ass;
 mod eslrc;
+mod krc;
 mod lqe;
 mod lrc;
 mod lys;
 mod qrc;
+mod srt;
+mod timing;
 mod ttml;
+mod xml;
 mod yrc;
 
 pub use rustle_domain::lyrics::*;
@@ -54,7 +60,34 @@ fn is_lrc_timestamp_header(header: &str) -> bool {
 
 /// Detect lyrics format from content
 pub fn detect_format(content: &str) -> LyricsFormat {
-    let trimmed = content.trim();
+    let trimmed = content.trim_start_matches(['\u{feff}', '\0']).trim();
+
+    if trimmed
+        .lines()
+        .any(|line| line.trim_start().starts_with("Dialogue:"))
+    {
+        return LyricsFormat::Ass;
+    }
+    if trimmed
+        .lines()
+        .any(|line| srt::parse_range(line.trim()).is_some())
+    {
+        return LyricsFormat::Srt;
+    }
+    if trimmed.lines().any(|line| krc::is_krc_line(line.trim())) {
+        return LyricsFormat::Krc;
+    }
+
+    // QQ Music returns QRC inside an XML `LyricContent` attribute. Detect the
+    // container before the generic XML/TTML checks so callers can feed the
+    // decrypted response directly to the parser.
+    if trimmed.starts_with('<')
+        && (trimmed.contains("LyricContent")
+            || trimmed.contains("<QrcInfos")
+            || trimmed.contains("<Lyric_"))
+    {
+        return LyricsFormat::Qrc;
+    }
 
     if trimmed.starts_with("[Lyricify Quick Export]")
         || trimmed.contains("[lyrics: format@Lyricify Syllable]")
@@ -63,7 +96,9 @@ pub fn detect_format(content: &str) -> LyricsFormat {
     }
 
     // TTML format: XML with <tt> root element
-    if trimmed.starts_with("<?xml") || trimmed.starts_with("<tt") {
+    if trimmed.starts_with('<')
+        && xml::parse(trimmed.as_bytes()).is_ok_and(|root| root.name == "tt")
+    {
         return LyricsFormat::Ttml;
     }
 
@@ -80,16 +115,32 @@ pub fn detect_format(content: &str) -> LyricsFormat {
             if is_word_timed_line_header(header) {
                 // YRC uses a `[start,duration]` line header followed by word markers
                 // in the form `(start,duration,0)text`.
-                if after_bracket.starts_with('(') && after_bracket.contains(",0)") {
-                    return LyricsFormat::Yrc;
+                if let Some(marker) = after_bracket
+                    .strip_prefix('(')
+                    .and_then(|text| text.split_once(')').map(|(marker, _)| marker))
+                {
+                    let parts: Vec<_> = marker.split(',').collect();
+                    if parts.len() == 3
+                        && parts.iter().all(|part| {
+                            !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit())
+                        })
+                    {
+                        return LyricsFormat::Yrc;
+                    }
                 }
 
                 // QRC also uses `[start,duration]`, but the word timing marker trails
                 // the text as `word(start,duration)`.
-                if after_bracket.contains('(')
-                    && after_bracket.contains(')')
-                    && !after_bracket.contains(",0)")
-                {
+                if after_bracket.match_indices('(').any(|(index, _)| {
+                    let Some((marker, _)) = after_bracket[index + 1..].split_once(')') else {
+                        return false;
+                    };
+                    let parts: Vec<_> = marker.split(',').collect();
+                    parts.len() == 2
+                        && parts.iter().all(|part| {
+                            !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit())
+                        })
+                }) {
                     return LyricsFormat::Qrc;
                 }
             }
@@ -146,6 +197,11 @@ pub fn parse_lyrics(content: &str) -> Vec<LyricLineOwned> {
 
 /// Parse lyrics with specified format
 pub fn parse_lyrics_with_format(content: &str, format: LyricsFormat) -> Vec<LyricLineOwned> {
+    let normalized = content
+        .trim_matches(['\u{feff}', '\0'])
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let content = normalized.as_str();
     // Keep parser output faithful to the source. Display-time normalization
     // and timing optimization are applied to a clone in the application
     // projection, like AMLL's rawLines/processedLines pipeline.
@@ -154,6 +210,9 @@ pub fn parse_lyrics_with_format(content: &str, format: LyricsFormat) -> Vec<Lyri
         LyricsFormat::Lqe => lqe::parse_lqe(content),
         LyricsFormat::Yrc => yrc::parse_yrc(content),
         LyricsFormat::Qrc => qrc::parse_qrc(content),
+        LyricsFormat::Krc => krc::parse_krc(content),
+        LyricsFormat::Srt => srt::parse_srt(content),
+        LyricsFormat::Ass => ass::parse_ass(content),
         LyricsFormat::EsLrc => eslrc::parse_eslrc(content),
         LyricsFormat::Lys => lys::parse_lys(content),
         LyricsFormat::Ttml => match ttml::parse_ttml(content.as_bytes()) {
@@ -189,10 +248,7 @@ enum LyricAttr {
 }
 
 fn line_anchor_time(line: &LyricLineOwned) -> u64 {
-    line.words
-        .first()
-        .map(|word| word.start_time)
-        .unwrap_or(line.start_time)
+    line.start_time
 }
 
 /// Maximum start-time drift accepted when attaching line-level attributes.
@@ -203,6 +259,8 @@ fn line_anchor_time(line: &LyricLineOwned) -> u64 {
 const LYRIC_ATTR_ALIGN_TOLERANCE_MS: u64 = 300;
 
 fn merge_lrc_attr(main: &mut [LyricLineOwned], attr_lines: &[LyricLineOwned], attr: LyricAttr) {
+    let mut attr_lines: Vec<_> = attr_lines.iter().collect();
+    attr_lines.sort_by_key(|line| line.start_time);
     let mut main_index = 0usize;
     let mut attr_index = 0usize;
 
@@ -211,7 +269,7 @@ fn merge_lrc_attr(main: &mut [LyricLineOwned], attr_lines: &[LyricLineOwned], at
     // translation/romanization lines.
     while main_index < main.len() && attr_index < attr_lines.len() {
         let main_time = line_anchor_time(&main[main_index]);
-        let attr_time = line_anchor_time(&attr_lines[attr_index]);
+        let attr_time = line_anchor_time(attr_lines[attr_index]);
 
         if main_time.abs_diff(attr_time) <= LYRIC_ATTR_ALIGN_TOLERANCE_MS {
             let text = attr_lines[attr_index]
@@ -221,14 +279,15 @@ fn merge_lrc_attr(main: &mut [LyricLineOwned], attr_lines: &[LyricLineOwned], at
                 .collect::<Vec<_>>()
                 .join("");
 
-            if !text.is_empty() {
+            let text = text.trim();
+            if !text.is_empty() && text != "//" && !text.contains("作品的著作权") {
                 let main_line = &mut main[main_index];
                 match attr {
                     LyricAttr::Translation if main_line.translated_lyric.is_empty() => {
-                        main_line.translated_lyric = text
+                        main_line.translated_lyric = text.to_owned()
                     }
                     LyricAttr::Romanization if main_line.roman_lyric.is_empty() => {
-                        main_line.roman_lyric = text
+                        main_line.roman_lyric = text.to_owned()
                     }
                     _ => {}
                 }
@@ -247,6 +306,95 @@ fn merge_lrc_attr(main: &mut [LyricLineOwned], attr_lines: &[LyricLineOwned], at
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_supported_format_reaches_the_application_projection() {
+        let inputs = [
+            (LyricsFormat::Lrc, "[00:01]Hello world"),
+            (LyricsFormat::EsLrc, "[00:01]Hello[00:02] world[00:03]"),
+            (
+                LyricsFormat::Lqe,
+                "[Lyricify Quick Export]\n[lyrics: format@Lyricify Syllable]\n[0]Hello(1000,500) world(1500,500)",
+            ),
+            (LyricsFormat::Lys, "[0]Hello(1000,500) world(1500,500)"),
+            (
+                LyricsFormat::Yrc,
+                "[1000,2000](1000,500,0)Hello(1500,500,0) world",
+            ),
+            (
+                LyricsFormat::Qrc,
+                "[1000,2000]Hello(1000,500) world(1500,500)",
+            ),
+            (
+                LyricsFormat::Krc,
+                "[1000,2000]<0,500,0>Hello<500,500,0> world",
+            ),
+            (
+                LyricsFormat::Ttml,
+                "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p begin=\"1s\" end=\"3s\">Hello world</p></div></body></tt>",
+            ),
+            (
+                LyricsFormat::Srt,
+                "1\n00:00:01,000 --> 00:00:03,000\nHello world",
+            ),
+            (
+                LyricsFormat::Ass,
+                "[Events]\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello world",
+            ),
+        ];
+        for (format, content) in inputs {
+            let raw = parse_lyrics_with_format(content, format);
+            assert!(!raw.is_empty(), "{format:?}");
+            assert_eq!(parse_lyrics(content), raw, "auto detection: {format:?}");
+            let projected = rustle_application::lyrics::project_lyrics(raw);
+            assert_eq!(projected[0].text, "Hello world", "{format:?}");
+            assert!(projected[0].end_ms > projected[0].start_ms, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn translation_uses_source_line_start_not_first_sung_word() {
+        let mut main = parse_lyrics("[1000,3000](1700,1000,0)Main");
+        merge_translation(&mut main, &parse_lyrics("[00:01.00]翻译"));
+        assert_eq!(main[0].translated_lyric, "翻译");
+        assert_eq!(main[0].words[0].start_time, 1700);
+    }
+
+    #[test]
+    fn detects_nonzero_yrc_marker_and_qrc_cdata() {
+        assert_eq!(
+            detect_format("[1000,2000](1000,2000,1)Hi"),
+            LyricsFormat::Yrc
+        );
+        assert_eq!(
+            detect_format("[1000,2000]Hi(1000,0)there(1000,2000)"),
+            LyricsFormat::Qrc
+        );
+        let lines = parse_lyrics("<QrcInfos><![CDATA[[0,1000]Hi(0,1000)]]></QrcInfos>");
+        assert_eq!(lines[0].words[0].word, "Hi");
+        assert_eq!(
+            detect_format("<t:tt xmlns:t=\"http://www.w3.org/ns/ttml\"><t:body/></t:tt>"),
+            LyricsFormat::Ttml
+        );
+    }
+
+    #[test]
+    fn translation_alignment_sorts_sidecars_and_ignores_placeholders() {
+        let mut main = vec![
+            test_line(1000, "A"),
+            test_line(2000, "B"),
+            test_line(3000, "C"),
+        ];
+        let translation = vec![
+            test_line(3000, "Third"),
+            test_line(1000, " First "),
+            test_line(2000, "//"),
+        ];
+        merge_translation(&mut main, &translation);
+        assert_eq!(main[0].translated_lyric, "First");
+        assert!(main[1].translated_lyric.is_empty());
+        assert_eq!(main[2].translated_lyric, "Third");
+    }
 
     #[test]
     fn test_detect_lrc() {
@@ -272,6 +420,13 @@ mod tests {
     fn test_detect_yrc_after_bracket_metadata_lines() {
         let content = "[ti:Title]\n[ar:Artist]\n[0,1000](0,500,0)Hello(500,500,0)World";
         assert_eq!(detect_format(content), LyricsFormat::Yrc);
+    }
+
+    #[test]
+    fn test_detect_qrc_xml_container() {
+        let content = r#"<?xml version="1.0"?><QrcInfos><LyricInfo LyricContent="[0,1000]Hi(0,1000)"/></QrcInfos>"#;
+        assert_eq!(detect_format(content), LyricsFormat::Qrc);
+        assert_eq!(parse_lyrics(content)[0].words[0].word, "Hi");
     }
 
     #[test]

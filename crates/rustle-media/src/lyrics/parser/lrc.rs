@@ -2,9 +2,9 @@
 //!
 //! Supports the common [mm:ss.xx]text format with line-level synchronization.
 
-use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned, MAX_LRC_TIMESTAMP, process_lyrics};
+use rustle_domain::lyrics::{LyricLineOwned, LyricWordOwned, MAX_LRC_TIMESTAMP};
 
-fn parse_time_text(time_str: &str) -> Option<u64> {
+pub(super) fn parse_time_text(time_str: &str) -> Option<u64> {
     fn parse_component(part: &str) -> Option<f64> {
         if part.is_empty() {
             return None;
@@ -175,7 +175,7 @@ fn expand_trailing_background_lines(lines: Vec<LyricLineOwned>) -> Vec<LyricLine
     let mut expanded = Vec::with_capacity(lines.len());
 
     for line in lines {
-        if line.is_bg {
+        if line.is_bg || line.words.len() > 1 {
             expanded.push(line);
             continue;
         }
@@ -335,16 +335,41 @@ fn parse_line(line: &str) -> Vec<LyricLineOwned> {
 
     // Get the text after all timestamps
     let (text, is_bg) = strip_background_text(&line[pos..]);
+    let inline_words = parse_inline_words(&text, timestamps[0]);
+    let first_time = timestamps[0];
 
     // Create a LyricLine for each timestamp
     for start_time in timestamps {
         results.push(LyricLineOwned {
-            words: vec![LyricWordOwned {
-                start_time,
-                end_time: 0, // Will be calculated later
-                word: text.clone(),
-                roman_word: String::new(),
-            }],
+            words: inline_words
+                .as_ref()
+                .map(|words| {
+                    words
+                        .iter()
+                        .cloned()
+                        .map(|mut word| {
+                            word.start_time = word
+                                .start_time
+                                .saturating_add(start_time)
+                                .saturating_sub(first_time);
+                            if word.end_time > 0 {
+                                word.end_time = word
+                                    .end_time
+                                    .saturating_add(start_time)
+                                    .saturating_sub(first_time);
+                            }
+                            word
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![LyricWordOwned {
+                        start_time,
+                        end_time: 0, // Will be calculated later
+                        word: text.clone(),
+                        roman_word: String::new(),
+                    }]
+                }),
             start_time,
             end_time: 0,
             is_bg,
@@ -353,6 +378,66 @@ fn parse_line(line: &str) -> Vec<LyricLineOwned> {
     }
 
     results
+}
+
+/// Only complete numeric markers delimit words. Literal brackets must always
+/// advance the scanner, including metadata and malformed Unicode input.
+fn parse_inline_words(text: &str, line_start: u64) -> Option<Vec<LyricWordOwned>> {
+    let mut markers = Vec::new();
+    for (index, ch) in text.char_indices() {
+        let close = match ch {
+            '[' => ']',
+            '<' => '>',
+            _ => continue,
+        };
+        let tail = &text[index + 1..];
+        let length = tail
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit() || matches!(byte, b':' | b'.'))
+            .take(64)
+            .count();
+        if tail.as_bytes().get(length).copied() != Some(close as u8) {
+            continue;
+        }
+        let end = index + 1 + length;
+        let value = &text[index + 1..end];
+        if !value.contains(':') {
+            continue;
+        }
+        if let Some(time) = parse_time_text(value) {
+            markers.push((index, end + 1, time));
+        }
+    }
+    if markers.is_empty() {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut start = line_start;
+    let mut pos = 0;
+    for (index, end, time) in markers {
+        if index < pos {
+            continue;
+        }
+        if index > pos {
+            words.push(LyricWordOwned {
+                start_time: start,
+                end_time: time.max(start),
+                word: text[pos..index].to_owned(),
+                roman_word: String::new(),
+            });
+        }
+        start = time;
+        pos = end;
+    }
+    if pos < text.len() {
+        words.push(LyricWordOwned {
+            start_time: start,
+            end_time: 0,
+            word: text[pos..].to_owned(),
+            roman_word: String::new(),
+        });
+    }
+    (!words.is_empty()).then_some(words)
 }
 
 /// Parse LRC content into lyric lines
@@ -384,10 +469,15 @@ pub fn parse_lrc(src: &str) -> Vec<LyricLineOwned> {
     for idx in (0..result.len()).rev() {
         let end_time = next_distinct_start;
 
-        result[idx].end_time = end_time;
-        if let Some(first_word) = result[idx].words.first_mut() {
-            first_word.end_time = end_time;
+        for word in &mut result[idx].words {
+            if word.end_time == 0 {
+                word.end_time = end_time.max(word.start_time);
+            }
         }
+        result[idx].end_time = result[idx]
+            .words
+            .last()
+            .map_or(end_time, |word| word.end_time);
 
         let previous_has_same_timestamp =
             idx > 0 && result[idx - 1].start_time == result[idx].start_time;
@@ -396,7 +486,7 @@ pub fn parse_lrc(src: &str) -> Vec<LyricLineOwned> {
         }
     }
 
-    process_lyrics(&mut result);
+    super::timing::finish_timed_lines(&mut result);
     result.retain(|line| line.words.first().is_some_and(|word| !word.word.is_empty()));
 
     result

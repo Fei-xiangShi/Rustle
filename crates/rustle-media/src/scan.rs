@@ -127,7 +127,7 @@ pub fn compute_partial_hash(path: &Path) -> MediaResult<String> {
 pub fn scan_audio_file(
     path: &Path,
     config: &ScanConfig,
-    cover_cache: Option<&CoverCache>,
+    _cover_cache: Option<&CoverCache>,
 ) -> MediaResult<ScanResult> {
     if !is_audio_file(path) {
         return Err(MediaError::UnsupportedFormat);
@@ -160,18 +160,8 @@ pub fn scan_audio_file(
         .then(|| compute_partial_hash(path))
         .transpose()?;
     let normalization_gain = resolve_track_gain(path).map(f64::from);
-    let cover_path = if config.extract_covers {
-        if let (Some(data), Some(cache)) = (&metadata.cover_data, cover_cache) {
-            match cache.save_cover_with_mime(data, metadata.cover_mime.as_deref()) {
-                Ok((_, path)) => Some(path),
-                Err(error) => {
-                    tracing::warn!(error = %error, "embedded cover cache failed");
-                    find_cover_art(path)
-                }
-            }
-        } else {
-            find_cover_art(path)
-        }
+    let cover_path = if config.extract_covers && metadata.cover_data.is_none() {
+        find_cover_art(path)
     } else {
         None
     };

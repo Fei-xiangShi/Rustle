@@ -27,6 +27,12 @@ pub enum LyricsFormat {
     Yrc,
     /// QQ Music QRC format (word-level)
     Qrc,
+    /// Kugou KRC (raw or decoded LX form)
+    Krc,
+    /// SubRip subtitle lyrics
+    Srt,
+    /// ASS/SSA subtitle and karaoke lyrics
+    Ass,
     /// Foobar2000 ESLyric format (word-level)
     EsLrc,
     /// Lyricify Syllable format
@@ -142,7 +148,13 @@ fn normalize_spaces(lines: &mut [LyricLineOwned]) {
             let mut previous_was_whitespace = false;
 
             for ch in source.chars() {
-                if ch.is_whitespace() {
+                if ch == '\n' {
+                    while normalized.ends_with(' ') {
+                        normalized.pop();
+                    }
+                    normalized.push('\n');
+                    previous_was_whitespace = true;
+                } else if ch.is_whitespace() {
                     if !previous_was_whitespace {
                         normalized.push(' ');
                     }

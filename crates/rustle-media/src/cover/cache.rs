@@ -5,8 +5,11 @@
 
 use image::ImageFormat;
 use image::imageops::FilterType;
+use lofty::{config::ParseOptions, file::TaggedFileExt, probe::Probe};
+use rustle_application::ports::cache::CachePublisher;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{MediaError, MediaResult};
@@ -15,17 +18,58 @@ use crate::error::{MediaError, MediaResult};
 pub const THUMBNAIL_SIZE: u32 = 300;
 
 /// Cover cache manager
-#[derive(Debug)]
 pub struct CoverCache {
     cache_dir: PathBuf,
+    publisher: Arc<dyn CachePublisher>,
+}
+
+impl std::fmt::Debug for CoverCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoverCache")
+            .field("cache_dir", &self.cache_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CoverCache {
     /// Create a new cover cache with the specified cache directory
-    pub fn new(cache_dir: PathBuf) -> MediaResult<Self> {
+    pub fn new(cache_dir: PathBuf, publisher: Arc<dyn CachePublisher>) -> MediaResult<Self> {
         std::fs::create_dir_all(&cache_dir)
             .map_err(|error| MediaError::io("create cover cache directory", error))?;
-        Ok(Self { cache_dir })
+        Ok(Self {
+            cache_dir,
+            publisher,
+        })
+    }
+
+    /// Recover disposable artwork from the original audio, without decoding audio.
+    pub fn restore_cover(&self, audio_path: &Path) -> MediaResult<Option<PathBuf>> {
+        let tagged = Probe::open(audio_path).and_then(|probe| {
+            probe
+                .options(ParseOptions::new().read_properties(false))
+                .read()
+        });
+        match tagged {
+            Ok(tagged) => {
+                let pictures = || tagged.tags().iter().flat_map(|tag| tag.pictures());
+                if let Some(picture) = pictures()
+                    .find(|picture| picture.pic_type() == lofty::picture::PictureType::CoverFront)
+                    .or_else(|| pictures().next())
+                {
+                    return match self.save_cover(picture.data()) {
+                        Ok((_, path)) => Ok(Some(path)),
+                        Err(error) => super::find_cover_art(audio_path).map(Some).ok_or(error),
+                    };
+                }
+            }
+            Err(error) => {
+                if let Some(path) = super::find_cover_art(audio_path) {
+                    return Ok(Some(path));
+                }
+                return Err(MediaError::metadata("read cover tags", error));
+            }
+        }
+        Ok(super::find_cover_art(audio_path))
     }
 
     /// Generate a hash for cover art data
@@ -46,7 +90,7 @@ impl CoverCache {
         let path = self.cover_path(&hash);
 
         // Skip if already cached
-        if path.exists() {
+        if path.is_file() {
             return Ok((hash, path));
         }
 
@@ -62,14 +106,24 @@ impl CoverCache {
         // Save as JPEG
         let mut output = Vec::new();
         thumbnail
+            .to_rgb8()
             .write_to(&mut Cursor::new(&mut output), ImageFormat::Jpeg)
             .map_err(|source| MediaError::Image {
                 operation: "encode cover thumbnail",
                 source,
             })?;
 
-        std::fs::write(&path, &output)
-            .map_err(|error| MediaError::io("write cover cache", error))?;
+        std::fs::create_dir_all(&self.cache_dir)
+            .map_err(|error| MediaError::io("create cover cache directory", error))?;
+        let temp = self.publisher.unique_temp_path(&path);
+        let result = std::fs::write(&temp, &output).and_then(|()| {
+            self.publisher
+                .publish_or_reuse(&temp, &path, Some(output.len() as u64))
+        });
+        if let Err(error) = result {
+            self.publisher.cleanup_temp_file(&temp);
+            return Err(MediaError::io("publish cover cache", error));
+        }
 
         Ok((hash, path))
     }

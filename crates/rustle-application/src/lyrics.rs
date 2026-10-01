@@ -31,6 +31,16 @@ pub fn project_lyrics(mut lines: Vec<LyricLineOwned>) -> Vec<LyricLine> {
     lines
         .into_iter()
         .map(|line| {
+            let romanized = if line.roman_lyric.is_empty() {
+                line.words
+                    .iter()
+                    .filter(|word| !word.roman_word.is_empty())
+                    .map(|word| word.roman_word.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                line.roman_lyric.clone()
+            };
             let words: Vec<LyricWord> = line
                 .words
                 .into_iter()
@@ -49,8 +59,7 @@ pub fn project_lyrics(mut lines: Vec<LyricLineOwned>) -> Vec<LyricLine> {
                 words,
                 translated: (!line.translated_lyric.is_empty())
                     .then(|| normalize_lyric_text(&line.translated_lyric)),
-                romanized: (!line.roman_lyric.is_empty())
-                    .then(|| normalize_lyric_text(&line.roman_lyric)),
+                romanized: (!romanized.is_empty()).then(|| normalize_lyric_text(&romanized)),
                 is_background: line.is_bg,
                 is_duet: line.is_duet,
             }
@@ -62,6 +71,24 @@ pub fn project_lyrics(mut lines: Vec<LyricLineOwned>) -> Vec<LyricLine> {
 mod tests {
     use super::*;
     use rustle_domain::lyrics::LyricWordOwned;
+
+    #[test]
+    fn projection_keeps_subtitle_breaks_and_word_only_romanization_visible() {
+        let raw = LyricLineOwned {
+            words: vec![LyricWordOwned {
+                start_time: 1000,
+                end_time: 2000,
+                word: "你\n  好".into(),
+                roman_word: "ni hao".into(),
+            }],
+            start_time: 1000,
+            end_time: 2000,
+            ..Default::default()
+        };
+        let projected = project_lyrics(vec![raw]);
+        assert_eq!(projected[0].text, "你\n好");
+        assert_eq!(projected[0].romanized.as_deref(), Some("ni hao"));
+    }
 
     #[test]
     fn projection_normalizes_a_clone_and_preserves_presentation_metadata() {

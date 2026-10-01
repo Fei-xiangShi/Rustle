@@ -62,7 +62,9 @@ fn parse_word_time(src: &str) -> Option<(usize, u64, u64)> {
 
 /// Parse a single word with its following timestamp (same as QRC)
 fn parse_word(src: &str) -> Option<(usize, LyricWordOwned)> {
-    let paren_pos = src.find('(')?;
+    let paren_pos = src
+        .match_indices('(')
+        .find_map(|(index, _)| parse_word_time(&src[index..]).map(|_| index))?;
     let word_text = &src[..paren_pos];
     let (time_consumed, start_time, duration) = parse_word_time(&src[paren_pos..])?;
 
@@ -70,7 +72,7 @@ fn parse_word(src: &str) -> Option<(usize, LyricWordOwned)> {
         paren_pos + time_consumed,
         LyricWordOwned {
             start_time,
-            end_time: start_time + duration,
+            end_time: start_time.saturating_add(duration),
             word: word_text.to_string(),
             roman_word: String::new(),
         },
@@ -87,6 +89,9 @@ fn parse_words(src: &str) -> Vec<LyricWordOwned> {
             words.push(word);
             pos += consumed;
         } else {
+            if let Some(last) = words.last_mut() {
+                last.word.push_str(&src[pos..]);
+            }
             break;
         }
     }

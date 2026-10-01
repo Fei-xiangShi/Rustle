@@ -13,6 +13,9 @@ publish = false
 workspace = true
 
 [dependencies]
+base64 = "0.22"
+flate2 = "1"
+serde_json.workspace = true
 encoding_rs = "0.8.35"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 lofty = "0.25.1"
