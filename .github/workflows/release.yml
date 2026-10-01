@@ -34,11 +34,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install pinned Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          install-native-dependencies: 'false'
-
       - name: Validate release source
         shell: bash
         run: |
@@ -96,13 +91,13 @@ jobs:
         with:
           ref: ${{ needs.release-preflight.outputs.commit }}
 
-      - name: Install pinned Rust and native dependencies
-        uses: ./.github/actions/setup-rust
+      - name: Set up Rust
+        run: rustup show
 
-      - name: Install packaging dependencies
+      - name: Install build and packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y fuse imagemagick libfuse2
+          sudo apt-get install --no-install-recommends -y fuse imagemagick libfuse2 libasound2-dev libpipewire-0.3-dev libclang-dev libudev-dev libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -189,11 +184,10 @@ jobs:
         with:
           ref: ${{ needs.release-preflight.outputs.commit }}
 
-      - name: Install pinned Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          install-native-dependencies: 'false'
-          targets: ${{ matrix.target }}
+      - name: Set up Rust
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -325,10 +319,8 @@ jobs:
         with:
           ref: ${{ needs.release-preflight.outputs.commit }}
 
-      - name: Install pinned Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          install-native-dependencies: 'false'
+      - name: Set up Rust
+        run: rustup show
 
       - name: Install packaging tools
         shell: pwsh
@@ -379,20 +371,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  verify-artifacts:
-    name: Verify release artifacts
+  release:
+    name: Verify and publish release
     needs: [release-preflight, linux-appimage, macos, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.release-preflight.outputs.commit }}
-
-      - name: Install pinned Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          install-native-dependencies: 'false'
 
       - name: Download release metadata
         uses: actions/download-artifact@v8
@@ -454,22 +443,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish GitHub Release
-    needs: [release-preflight, verify-artifacts]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-    steps:
-      - name: Download verified release bundle
-        uses: actions/download-artifact@v8
-        with:
-          name: release-bundle
-          path: release-bundle
-
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           files: release-bundle/*
