@@ -208,6 +208,23 @@ pub async fn update_song_path(pool: &Pool<Sqlite>, old_path: &str, new_path: &st
 }
 
 /// Update cover_path for a song by ID
+pub async fn restore_song_cover(
+    pool: &Pool<Sqlite>,
+    song: &DbSong,
+    cover_path: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE songs SET cover_path = ? WHERE id = ? AND file_path = ? AND cover_path IS ?",
+    )
+    .bind(cover_path)
+    .bind(song.id)
+    .bind(&song.file_path)
+    .bind(song.cover_path.as_deref())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn update_song_cover(pool: &Pool<Sqlite>, song_id: i64, cover_path: &str) -> Result<()> {
     let now = super::current_timestamp();
     sqlx::query("UPDATE songs SET cover_path = ?, last_modified = ? WHERE id = ?")

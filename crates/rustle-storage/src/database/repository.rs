@@ -69,6 +69,11 @@ impl Database {
         ops::update_song_cover(&self.pool, song_id, cover_path).await
     }
 
+    /// Publish a recovered cover only while the source and old cover still match.
+    pub async fn restore_song_cover(&self, song: &DbSong, cover_path: &str) -> Result<bool> {
+        ops::restore_song_cover(&self.pool, song, cover_path).await
+    }
+
     pub async fn refresh_song_metadata(&self, song: &DbSong) -> Result<()> {
         ops::refresh_song_metadata(&self.pool, song).await
     }

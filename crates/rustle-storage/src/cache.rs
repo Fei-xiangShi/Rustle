@@ -209,6 +209,9 @@ pub struct AudioCacheManifest {
     pub song_id: u64,
     pub actual_quality: NcmQualityLevel,
     pub size: u64,
+    /// Remote byte count before tags were embedded; absent in legacy caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_size: Option<u64>,
     pub format: String,
 }
 
@@ -240,19 +243,21 @@ pub fn is_audio_cache_complete(
     if !metadata.is_file() || metadata.len() == 0 {
         return false;
     }
-    if let Some(size) = expected_size {
-        return metadata.len() == size;
-    }
-    read_audio_manifest(path).is_some_and(|manifest| {
+    if let Some(manifest) = read_audio_manifest(path) {
         let cached_format = path
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
-        manifest.song_id == song_id
+        return manifest.song_id == song_id
+            && expected_size
+                .is_none_or(|size| size == manifest.source_size.unwrap_or(manifest.size))
             && manifest.actual_quality == actual_quality
             && manifest.size == metadata.len()
-            && manifest.format.eq_ignore_ascii_case(cached_format)
-    })
+            && manifest.format.eq_ignore_ascii_case(cached_format);
+    }
+    // Legacy entries can be verified by authoritative size, but a malformed
+    // manifest must not be bypassed just because an unrelated file has it.
+    expected_size == Some(metadata.len()) && !audio_manifest_path(path).exists()
 }
 
 pub fn write_audio_manifest(
@@ -262,11 +267,40 @@ pub fn write_audio_manifest(
     size: u64,
     format: &str,
 ) -> std::io::Result<()> {
+    write_manifest(path, song_id, actual_quality, size, format, None)
+}
+
+pub fn write_tagged_audio_manifest(
+    path: &Path,
+    song_id: u64,
+    actual_quality: NcmQualityLevel,
+    source_size: u64,
+    format: &str,
+) -> std::io::Result<()> {
+    write_manifest(
+        path,
+        song_id,
+        actual_quality,
+        fs::metadata(path)?.len(),
+        format,
+        Some(source_size),
+    )
+}
+
+fn write_manifest(
+    path: &Path,
+    song_id: u64,
+    actual_quality: NcmQualityLevel,
+    size: u64,
+    format: &str,
+    source_size: Option<u64>,
+) -> std::io::Result<()> {
     let manifest = AudioCacheManifest {
         version: AUDIO_MANIFEST_VERSION,
         song_id,
         actual_quality,
         size,
+        source_size,
         format: format.to_string(),
     };
     let bytes = serde_json::to_vec(&manifest)
@@ -795,6 +829,35 @@ mod tests {
             7,
             NcmQualityLevel::Lossless,
             Some(4)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matching_size_does_not_override_a_wrong_or_corrupt_audio_manifest() {
+        let root = test_root("manifest-identity");
+        let path = root.join("7_lossless.flac");
+        fs::write(&path, b"audio").unwrap();
+        write_audio_manifest(&path, 8, NcmQualityLevel::Lossless, 5, "flac").unwrap();
+        assert!(!is_audio_cache_complete(
+            &path,
+            7,
+            NcmQualityLevel::Lossless,
+            Some(5)
+        ));
+        fs::write(audio_manifest_path(&path), b"broken").unwrap();
+        assert!(!is_audio_cache_complete(
+            &path,
+            7,
+            NcmQualityLevel::Lossless,
+            Some(5)
+        ));
+        fs::remove_file(audio_manifest_path(&path)).unwrap();
+        assert!(is_audio_cache_complete(
+            &path,
+            7,
+            NcmQualityLevel::Lossless,
+            Some(5)
         ));
         let _ = fs::remove_dir_all(root);
     }

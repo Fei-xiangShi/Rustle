@@ -25,6 +25,18 @@ pub trait CachePublisher: Send + Sync {
 
 /// Audio-cache operations needed by strict Range streaming.
 pub trait AudioCacheStore: CachePublisher {
+    /// Optionally produce a tagged copy. The original bytes remain the backing
+    /// for active streaming readers, whose offsets must never change.
+    /// On failure, clean up any partial copy and leave the original untouched:
+    /// streaming retains it for playback without publishing a successful cache.
+    fn prepare_audio_cache(
+        &self,
+        _path: PathBuf,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Option<PathBuf>>> + Send + '_>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+
     fn write_audio_manifest(
         &self,
         path: &Path,
