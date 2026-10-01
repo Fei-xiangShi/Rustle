@@ -22,6 +22,7 @@ pub struct PreloadIdentity {
 #[derive(Debug)]
 struct CancellationState {
     cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -39,14 +40,29 @@ impl GenerationCancellation {
     fn new() -> Self {
         Self(Arc::new(CancellationState {
             cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
         }))
     }
 
     pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Wait without retaining the HTTP/source-resolution future after Stop.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -222,6 +238,29 @@ impl PlaybackGenerationController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_wakes_every_waiter_and_late_subscribers() {
+        let controller = PlaybackGenerationController::new();
+        let context = controller.activate_generation();
+        let first = context.cancellation.clone();
+        let second = context.cancellation.clone();
+        let waiters = tokio::spawn(async move {
+            tokio::join!(first.cancelled(), second.cancelled());
+        });
+        tokio::task::yield_now().await;
+        controller.activate_generation();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiters)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            context.cancellation.cancelled(),
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn activation_invalidates_previous_generation() {

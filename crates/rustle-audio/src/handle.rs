@@ -496,9 +496,14 @@ impl AudioHandle {
 
     /// Switch audio output device
     ///
-    /// Listen for `AudioEvent::DeviceSwitched` or `AudioEvent::DeviceSwitchFailed`.
+    /// Listen for the typed output-recovery lifecycle events.
     pub fn switch_device(&self, device_name: Option<String>) -> PlaybackResult<()> {
         self.send_critical(|| AudioCommand::SwitchDevice { device_name })
+    }
+
+    /// Retry the most recently failed output reconstruction.
+    pub fn retry_output(&self) -> PlaybackResult<()> {
+        self.send_critical(|| AudioCommand::RetryOutput)
     }
 
     // ============ State Queries (non-blocking reads) ============

@@ -9,17 +9,14 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rodio::cpal::traits::{DeviceTrait, HostTrait};
-use rodio::{
-    Decoder, DeviceSinkBuilder as OutputStreamBuilder, MixerDeviceSink as OutputStream,
-    Player as Sink, Source,
-};
+use rodio::{Decoder, MixerDeviceSink as OutputStream, Player as Sink, Source};
 
 use super::automix::{TransitionDirective, TransitionKind};
 use super::chain::{AudioProcessingChain, PlaybackProcessingRuntime};
+use super::device::{AudioDevice, OutputFailureCallback, open_output};
 use super::streaming::{SharedBuffer, StreamingBuffer, StreamingReaderCancellation};
 
 pub(crate) type PreparedStreamingSource = Decoder<StreamingBuffer>;
@@ -57,9 +54,6 @@ pub(crate) fn prepare_streaming_source(
         .build()
         .map_err(|error| PlaybackError::DecodeError(error.to_string()))
 }
-
-/// Cached audio devices to avoid repeated enumeration (which triggers Jack/ALSA warnings)
-static AUDIO_DEVICES_CACHE: OnceLock<Vec<AudioDevice>> = OnceLock::new();
 
 /// Playback status
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +95,7 @@ struct PlayerState {
     volume: f32,
     paused_position: Option<Duration>,
     current_track_gain: f32,
-    device_name: Option<String>,
+    selected_device_id: Option<String>,
 }
 
 impl Default for PlayerState {
@@ -112,7 +106,7 @@ impl Default for PlayerState {
             volume: 1.0,
             paused_position: None,
             current_track_gain: 1.0,
-            device_name: None,
+            selected_device_id: None,
         }
     }
 }
@@ -162,6 +156,7 @@ where
 /// Preloading is managed externally by PreloadManager
 pub struct AudioPlayer {
     _stream: OutputStream,
+    active_device: AudioDevice,
     current_sink: Option<Sink>,
     current_path: Option<PathBuf>,
     state: Arc<Mutex<PlayerState>>,
@@ -179,30 +174,21 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     const FADE_DURATION: Duration = Duration::from_millis(300);
 
-    /// Create a new audio player with default output device
-    pub fn new(chain: AudioProcessingChain) -> PlaybackResult<Self> {
-        Self::with_device(None, chain)
-    }
-
-    /// Create a new audio player with specified output device
-    pub fn with_device(
+    pub(crate) fn with_device_observer(
         device_name: Option<&str>,
         chain: AudioProcessingChain,
+        output_failure_callback: OutputFailureCallback,
     ) -> PlaybackResult<Self> {
-        let stream = if let Some(name) = device_name {
-            Self::create_stream_for_device(name)?
-        } else {
-            OutputStreamBuilder::open_default_sink()
-                .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
-        };
+        let opened = open_output(device_name, Arc::clone(&output_failure_callback))?;
 
         let state = PlayerState {
-            device_name: device_name.map(str::to_string),
+            selected_device_id: opened.resolved_selection,
             ..PlayerState::default()
         };
 
         Ok(Self {
-            _stream: stream,
+            _stream: opened.stream,
+            active_device: opened.active_device,
             current_sink: None,
             current_path: None,
             state: Arc::new(Mutex::new(state)),
@@ -218,67 +204,35 @@ impl AudioPlayer {
         })
     }
 
-    /// Create output stream for a specific device by name
-    fn create_stream_for_device(device_name: &str) -> PlaybackResult<OutputStream> {
-        let host = rodio::cpal::default_host();
-
-        let device = host
-            .output_devices()
-            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
-            .find(|device| {
-                device
-                    .description()
-                    .map(|description| description.name() == device_name)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| PlaybackError::DeviceUnavailable(device_name.to_string()))?;
-
-        let config = device
-            .default_output_config()
-            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?;
-        let sample_rate = rodio::SampleRate::new(config.sample_rate()).ok_or_else(|| {
-            PlaybackError::DeviceUnavailable(
-                "output device reported a zero sample rate".to_string(),
-            )
-        })?;
-
-        OutputStreamBuilder::from_device(device)
-            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
-            .with_sample_rate(sample_rate)
-            .open_stream()
-            .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))
+    pub(crate) fn selected_device_id(&self) -> Option<String> {
+        self.state.lock().unwrap().selected_device_id.clone()
     }
 
-    /// Switch to a different audio output device
-    pub fn switch_device(
-        &mut self,
-        device_name: Option<&str>,
-    ) -> PlaybackResult<Option<(PathBuf, Duration, bool)>> {
-        let playback_state = self.current_path.clone().map(|path| {
-            let info = self.get_info();
-            let was_playing = info.status == PlaybackStatus::Playing;
-            let position = info.position;
-            (path, position, was_playing)
-        });
+    pub(crate) fn active_device(&self) -> &AudioDevice {
+        &self.active_device
+    }
 
-        self.stop();
+    pub(crate) fn processing_chain(&self) -> AudioProcessingChain {
+        self.chain.clone()
+    }
 
-        let stream = if let Some(name) = device_name {
-            Self::create_stream_for_device(name)?
-        } else {
-            OutputStreamBuilder::open_default_sink()
-                .map_err(|error| PlaybackError::DeviceUnavailable(error.to_string()))?
-        };
+    pub(crate) fn current_path(&self) -> Option<PathBuf> {
+        self.current_path.clone()
+    }
 
-        {
-            let mut state = self.state.lock().unwrap();
-            state.device_name = device_name.map(|s| s.to_string());
-        }
+    pub(crate) fn current_track_gain(&self) -> f32 {
+        self.state
+            .lock()
+            .map(|state| state.current_track_gain)
+            .unwrap_or(1.0)
+    }
 
-        self._stream = stream;
+    pub(crate) fn is_streaming(&self) -> bool {
+        self.is_streaming
+    }
 
-        tracing::info!("Switched audio device to: {:?}", device_name);
-        Ok(playback_state)
+    pub(crate) fn has_current_sink(&self) -> bool {
+        self.current_sink.is_some()
     }
 
     /// Get current sink volume controlled by the user setting.
@@ -311,17 +265,16 @@ impl AudioPlayer {
         runtime
     }
 
-    fn try_seek_on_start(sink: &Sink, position: Duration, path: &Path) -> Option<PlaybackError> {
+    fn try_seek_on_start(sink: &Sink, position: Duration) -> Option<PlaybackError> {
         if position.is_zero() {
             return None;
         }
 
         if let Err(err) = sink.try_seek(position) {
             tracing::warn!(
-                "Failed to seek to {:?} while starting {:?}: {}",
-                position,
-                path,
-                err
+                position_ms = position.as_millis(),
+                error = %err,
+                "Failed to seek while starting an audio source"
             );
             return Some(PlaybackError::SeekUnsupported(
                 "seek is not supported for this format".to_string(),
@@ -404,10 +357,32 @@ impl AudioPlayer {
         position: Duration,
         track_gain: f32,
     ) -> PlaybackResult<()> {
-        self.stop();
+        self.load_paused_internal(path, position, track_gain, false, true)
+    }
+
+    pub(crate) fn prepare_local_recovery_paused(
+        &mut self,
+        path: PathBuf,
+        position: Duration,
+        track_gain: f32,
+    ) -> PlaybackResult<()> {
+        self.load_paused_internal(path, position, track_gain, true, false)
+    }
+
+    fn load_paused_internal(
+        &mut self,
+        path: PathBuf,
+        position: Duration,
+        track_gain: f32,
+        strict_seek: bool,
+        activate_chain: bool,
+    ) -> PlaybackResult<()> {
+        self.stop_internal(activate_chain);
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(false);
-        self.chain.activate_runtime(Some(&runtime));
+        if activate_chain {
+            self.chain.activate_runtime(Some(&runtime));
+        }
 
         let source = Self::decode_local_file(&path)?;
         let duration = source.total_duration().unwrap_or(Duration::ZERO);
@@ -418,7 +393,12 @@ impl AudioPlayer {
         sink.set_volume(self.get_sink_volume());
         sink.pause();
 
-        let _ = Self::try_seek_on_start(&sink, position, &path);
+        if let Some(error) = Self::try_seek_on_start(&sink, position)
+            && strict_seek
+        {
+            sink.stop();
+            return Err(error);
+        }
 
         let paused_position = sink.get_pos();
 
@@ -454,7 +434,53 @@ impl AudioPlayer {
         position: Duration,
         track_gain: f32,
     ) -> PlaybackResult<Option<PlaybackError>> {
-        self.stop();
+        self.load_prepared_streaming_paused_internal(
+            source,
+            reader_cancellation,
+            duration,
+            cache_path,
+            position,
+            track_gain,
+            true,
+        )
+    }
+
+    pub(crate) fn prepare_streaming_recovery_paused(
+        &mut self,
+        source: PreparedStreamingSource,
+        reader_cancellation: StreamingReaderCancellation,
+        duration: Duration,
+        cache_path: Option<PathBuf>,
+        position: Duration,
+        track_gain: f32,
+    ) -> PlaybackResult<()> {
+        self.load_prepared_streaming_paused_internal(
+            source,
+            reader_cancellation,
+            duration,
+            cache_path,
+            position,
+            track_gain,
+            false,
+        )?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "recovery preparation shares the paused streaming install contract"
+    )]
+    fn load_prepared_streaming_paused_internal(
+        &mut self,
+        source: PreparedStreamingSource,
+        reader_cancellation: StreamingReaderCancellation,
+        duration: Duration,
+        cache_path: Option<PathBuf>,
+        position: Duration,
+        track_gain: f32,
+        activate_chain: bool,
+    ) -> PlaybackResult<Option<PlaybackError>> {
+        self.stop_internal(activate_chain);
         if !reader_cancellation.activate() {
             return Err(PlaybackError::InvariantViolation(
                 "streaming reader demand lease is owned by another decoder".to_string(),
@@ -462,11 +488,13 @@ impl AudioPlayer {
         }
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(false);
-        self.chain.activate_runtime(Some(&runtime));
+        if activate_chain {
+            self.chain.activate_runtime(Some(&runtime));
+        }
 
         tracing::info!(
-            "load_prepared_streaming_paused: cache_path={:?}",
-            cache_path
+            has_cache_path = cache_path.is_some(),
+            "Prepared a paused streaming source"
         );
 
         let processed = self.chain.apply(source, track_gain, runtime.clone());
@@ -528,7 +556,7 @@ impl AudioPlayer {
 
         let volume = self.get_sink_volume();
         sink.set_volume(volume);
-        let seek_error = Self::try_seek_on_start(&sink, position, &path);
+        let seek_error = Self::try_seek_on_start(&sink, position);
 
         if fade_in {
             runtime.fade_to(1.0, Self::FADE_DURATION);
@@ -763,7 +791,10 @@ impl AudioPlayer {
         let runtime = self.prepare_runtime(fade_in);
         self.chain.activate_runtime(Some(&runtime));
 
-        tracing::info!("play_prepared_streaming: cache_path={:?}", cache_path);
+        tracing::info!(
+            has_cache_path = cache_path.is_some(),
+            "Prepared a streaming source for playback"
+        );
 
         let processed = self.chain.apply(source, track_gain, runtime.clone());
 
@@ -933,6 +964,10 @@ impl AudioPlayer {
 
     /// Stop playback
     pub fn stop(&mut self) {
+        self.stop_internal(true);
+    }
+
+    fn stop_internal(&mut self, activate_idle_runtime: bool) {
         self.pending_pause_fade = false;
         self.last_transition_group = None;
         if let Some(transition) = self.outgoing_transition.take() {
@@ -956,10 +991,22 @@ impl AudioPlayer {
         self.is_streaming = false;
         self.detached_seek_position = None;
         self.position_offset = Duration::ZERO;
-        self.chain.activate_runtime(None);
+        if activate_idle_runtime {
+            self.chain.activate_runtime(None);
+        }
         let mut state = self.state.lock().unwrap();
         state.status = PlaybackStatus::Stopped;
         state.current_track_gain = 1.0;
+    }
+
+    /// Dispose a stale candidate without changing the process-wide active
+    /// analyzer projection owned by another committed player.
+    pub(crate) fn discard(mut self) {
+        self.stop_internal(false);
+    }
+
+    pub(crate) fn activate_current_runtime(&self) {
+        self.chain.activate_runtime(self.current_runtime.as_ref());
     }
 
     /// Set volume (0.0 to 1.0)
@@ -1355,143 +1402,6 @@ mod tests {
 
         assert_eq!(resolved, TransitionDirective::baseline_natural(group));
     }
-}
-
-// ============ Audio Device Discovery ============
-
-/// Audio device info with internal name and display name
-#[derive(Debug, Clone)]
-pub struct AudioDevice {
-    pub name: String,
-    pub description: String,
-}
-
-/// Get list of available audio output devices
-pub fn get_audio_devices() -> Vec<AudioDevice> {
-    AUDIO_DEVICES_CACHE
-        .get_or_init(|| {
-            let devices = get_cpal_devices();
-            if !devices.is_empty() {
-                return devices;
-            }
-
-            let pa_devices = get_pulseaudio_devices();
-            if !pa_devices.is_empty() {
-                return pa_devices;
-            }
-
-            get_alsa_devices()
-        })
-        .clone()
-}
-
-fn get_pulseaudio_devices() -> Vec<AudioDevice> {
-    let mut devices = Vec::new();
-
-    if let Ok(output) = std::process::Command::new("pactl")
-        .args(["list", "sinks"])
-        .output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut current_name = String::new();
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.starts_with("Name:") {
-                current_name = line.trim_start_matches("Name:").trim().to_string();
-            } else if line.starts_with("Description:") && !current_name.is_empty() {
-                let description = line.trim_start_matches("Description:").trim().to_string();
-                devices.push(AudioDevice {
-                    name: current_name.clone(),
-                    description,
-                });
-                current_name.clear();
-            }
-        }
-    }
-
-    devices
-}
-
-fn get_alsa_devices() -> Vec<AudioDevice> {
-    let mut devices = Vec::new();
-
-    if let Ok(output) = std::process::Command::new("aplay").args(["-l"]).output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        for line in stdout.lines() {
-            if line.starts_with("card ")
-                && let Some((card_info, device_info)) = line.split_once(", device ")
-            {
-                let card_num = card_info
-                    .trim_start_matches("card ")
-                    .split(':')
-                    .next()
-                    .unwrap_or("0")
-                    .trim();
-
-                let device_num = device_info.split(':').next().unwrap_or("0").trim();
-
-                let description = if let Some(start) = line.find('[') {
-                    if let Some(end) = line.rfind(']') {
-                        line[start + 1..end].to_string()
-                    } else {
-                        line.to_string()
-                    }
-                } else {
-                    line.to_string()
-                };
-
-                let name = format!("hw:{},{}", card_num, device_num);
-
-                devices.push(AudioDevice { name, description });
-            }
-        }
-    }
-
-    if devices.is_empty() {
-        devices = get_cpal_devices();
-    }
-
-    devices
-}
-
-fn get_cpal_devices() -> Vec<AudioDevice> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait};
-
-    let host = rodio::cpal::default_host();
-    let mut devices = Vec::new();
-
-    if let Ok(output_devices) = host.output_devices() {
-        for device in output_devices {
-            if let Ok(description) = device.description() {
-                let name = description.name().to_string();
-                let name_lower = name.to_lowercase();
-
-                if name_lower.contains("jack")
-                    || name_lower.contains("oss")
-                    || name_lower.contains("/dev/dsp")
-                    || name == "default"
-                    || name == "pipewire"
-                    || name == "pulse"
-                {
-                    continue;
-                }
-
-                if device.default_output_config().is_ok() {
-                    devices.push(AudioDevice {
-                        name: name.clone(),
-                        description: name,
-                    });
-                }
-            }
-        }
-    }
-
-    devices
 }
 
 /// Classified playback error types for UI display

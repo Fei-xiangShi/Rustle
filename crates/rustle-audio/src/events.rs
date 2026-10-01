@@ -22,7 +22,9 @@ use std::time::Duration;
 use parking_lot::{Mutex, RwLock};
 
 use super::PlaybackStatus;
+use super::device::{AudioDevice, OutputRecoveryReason};
 use super::identity::{PlaybackContext, PreloadIdentity, SeekNonce};
+use super::output_recovery::{OutputGeneration, OutputRecoveryId, OutputRecoveryIntent};
 use super::player::PlaybackError;
 use super::streaming::StreamingBuffer;
 
@@ -134,11 +136,15 @@ pub enum AudioCommand {
     ReleasePreload { identity: PreloadIdentity },
     /// Switch audio output device
     SwitchDevice { device_name: Option<String> },
+    /// Retry the last failed output reconstruction without changing selection.
+    RetryOutput,
     /// Wake the audio thread to drain latest-value control mailboxes.
     LatestMailboxWake,
     /// Buffer data available wake-up marker. The latest payload is held in
     /// `BufferDataMailbox`, keeping high-frequency progress out of payload FIFO.
     BufferDataAvailable,
+    /// Wake the actor to drain coalesced native device/output signals.
+    DeviceSignalWake,
 }
 
 impl std::fmt::Debug for AudioCommand {
@@ -245,8 +251,10 @@ impl std::fmt::Debug for AudioCommand {
                 .debug_struct("SwitchDevice")
                 .field("device_name", device_name)
                 .finish(),
+            Self::RetryOutput => write!(f, "RetryOutput"),
             Self::LatestMailboxWake => write!(f, "LatestMailboxWake"),
             Self::BufferDataAvailable => f.debug_struct("BufferDataAvailable").finish(),
+            Self::DeviceSignalWake => write!(f, "DeviceSignalWake"),
         }
     }
 }
@@ -259,6 +267,18 @@ impl std::fmt::Debug for AudioCommand {
 /// The UI should handle these in its message loop.
 #[derive(Debug, Clone)]
 pub enum AudioEvent {
+    /// Initial output successfully opened, including a possible legacy-name migration.
+    OutputReady {
+        requested_selection: Option<String>,
+        resolved_selection: Option<String>,
+        active_device: AudioDevice,
+        output_generation: OutputGeneration,
+    },
+    /// Live output-device projection after startup or topology change.
+    DevicesChanged {
+        devices: Vec<AudioDevice>,
+        default_device_id: Option<String>,
+    },
     /// Playback started for a track
     Started {
         context: PlaybackContext,
@@ -330,13 +350,41 @@ pub enum AudioEvent {
         identity: PreloadIdentity,
         error: PlaybackError,
     },
-    /// Device switched successfully
-    DeviceSwitched {
-        /// State to restore: (path, position, was_playing)
-        restore_state: Option<(PathBuf, Duration, bool)>,
+    /// Existing runtime was detached and a serialized output reconstruction began.
+    OutputRecoveryStarted {
+        recovery_id: OutputRecoveryId,
+        reason: OutputRecoveryReason,
+        requested_selection: Option<String>,
+        context: Option<PlaybackContext>,
+        position: Duration,
+        intent: OutputRecoveryIntent,
     },
-    /// Device switch failed
-    DeviceSwitchFailed {
+    /// One bounded transient retry was scheduled.
+    OutputRecoveryRetryScheduled {
+        recovery_id: OutputRecoveryId,
+        reason: OutputRecoveryReason,
+        requested_selection: Option<String>,
+        error: PlaybackError,
+    },
+    /// A prepared output passed identity validation and became authoritative.
+    OutputRecovered {
+        recovery_id: OutputRecoveryId,
+        output_generation: OutputGeneration,
+        reason: OutputRecoveryReason,
+        requested_selection: Option<String>,
+        resolved_selection: Option<String>,
+        active_device: AudioDevice,
+        context: Option<PlaybackContext>,
+        position: Duration,
+        intent: OutputRecoveryIntent,
+    },
+    /// Output reconstruction exhausted its one bounded retry.
+    OutputRecoveryFailed {
+        recovery_id: OutputRecoveryId,
+        reason: OutputRecoveryReason,
+        requested_selection: Option<String>,
+        context: Option<PlaybackContext>,
+        position: Duration,
         error: PlaybackError,
     },
     Finished {
@@ -474,6 +522,26 @@ impl SharedPlaybackState {
     /// Update current path
     pub fn set_current_path(&self, path: Option<PathBuf>) {
         self.inner.write().current_path = path;
+    }
+
+    pub(crate) fn set_output_recovery_state(
+        &self,
+        position: Duration,
+        duration: Duration,
+        volume: f32,
+        current_path: Option<PathBuf>,
+        has_playback: bool,
+    ) {
+        let mut inner = self.inner.write();
+        inner.status = if has_playback {
+            PlaybackStatus::Paused
+        } else {
+            PlaybackStatus::Stopped
+        };
+        inner.position = position;
+        inner.duration = duration;
+        inner.volume = volume;
+        inner.current_path = current_path;
     }
 
     pub fn set_cache_bytes(&self, cached: u64, total: u64) {
@@ -631,6 +699,105 @@ impl BufferDataMailbox {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OutputFailureSignal {
+    pub generation: u64,
+    pub error: PlaybackError,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceSignalBatch {
+    pub devices: Option<Vec<AudioDevice>>,
+    pub default_device_id: Option<String>,
+    pub default_changed: bool,
+    pub output_failure: Option<OutputFailureSignal>,
+}
+
+#[derive(Debug, Default)]
+struct DeviceSignalState {
+    devices: Option<Vec<AudioDevice>>,
+    default_device_id: Option<String>,
+    default_changed: bool,
+    output_failure: Option<OutputFailureSignal>,
+}
+
+#[derive(Debug)]
+struct DeviceSignalMailboxInner {
+    state: Mutex<DeviceSignalState>,
+    wake_enqueued: AtomicBool,
+    wake_tx: AudioCommandSender,
+}
+
+/// Race-safe coalescing mailbox for native topology and stream-error signals.
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceSignalMailbox {
+    inner: Arc<DeviceSignalMailboxInner>,
+}
+
+impl DeviceSignalMailbox {
+    pub(crate) fn new(wake_tx: AudioCommandSender) -> Self {
+        Self {
+            inner: Arc::new(DeviceSignalMailboxInner {
+                state: Mutex::new(DeviceSignalState::default()),
+                wake_enqueued: AtomicBool::new(false),
+                wake_tx,
+            }),
+        }
+    }
+
+    fn wake(&self) {
+        if !self.inner.wake_enqueued.swap(true, Ordering::AcqRel)
+            && self
+                .inner
+                .wake_tx
+                .try_send(AudioCommand::DeviceSignalWake)
+                .is_err()
+        {
+            self.inner.wake_enqueued.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn publish_topology(&self, devices: Vec<AudioDevice>, default_changed: bool) {
+        let default_device_id = devices
+            .iter()
+            .find(|device| device.is_default)
+            .map(|device| device.id.clone());
+        {
+            let mut state = self.inner.state.lock();
+            state.devices = Some(devices);
+            state.default_device_id = default_device_id;
+            state.default_changed |= default_changed;
+        }
+        self.wake();
+    }
+
+    pub(crate) fn publish_output_failure(&self, generation: u64, error: PlaybackError) {
+        {
+            let mut state = self.inner.state.lock();
+            let replace = state
+                .output_failure
+                .as_ref()
+                .is_none_or(|current| generation >= current.generation);
+            if replace {
+                state.output_failure = Some(OutputFailureSignal { generation, error });
+            }
+        }
+        self.wake();
+    }
+
+    pub(crate) fn take(&self) -> DeviceSignalBatch {
+        let mut state = self.inner.state.lock();
+        let batch = DeviceSignalBatch {
+            devices: state.devices.take(),
+            default_device_id: state.default_device_id.take(),
+            default_changed: std::mem::take(&mut state.default_changed),
+            output_failure: state.output_failure.take(),
+        };
+        self.inner.wake_enqueued.store(false, Ordering::Release);
+        batch
+    }
+}
+
 /// Sender for audio commands (held by AudioHandle)
 pub type AudioCommandSender = tokio::sync::mpsc::Sender<AudioCommand>;
 
@@ -736,5 +903,23 @@ mod tests {
             error.code(),
             rustle_application::error::ErrorCode::OperationCancelled
         );
+    }
+
+    #[test]
+    fn device_signal_mailbox_keeps_the_newest_typed_output_failure() {
+        let (tx, _rx) = audio_command_channel();
+        let mailbox = DeviceSignalMailbox::new(tx);
+        mailbox.publish_output_failure(
+            2,
+            PlaybackError::DeviceUnavailable("new output failed".to_string()),
+        );
+        mailbox.publish_output_failure(
+            1,
+            PlaybackError::DeviceUnavailable("stale output failed".to_string()),
+        );
+
+        let failure = mailbox.take().output_failure.expect("failure is retained");
+        assert_eq!(failure.generation, 2);
+        assert!(matches!(failure.error, PlaybackError::DeviceUnavailable(_)));
     }
 }

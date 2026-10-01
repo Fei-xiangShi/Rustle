@@ -289,7 +289,7 @@ pub enum StreamingEventKind {
     Complete,
     /// Final cache path after atomic rename.
     CacheFinalized(PathBuf),
-    /// Cache persistence failed; ring playback may still continue.
+    /// Cache persistence failed; retained audio may still be playable.
     CacheFinalizationFailed(String),
     /// Download error.
     Error(PlaybackError),
@@ -308,6 +308,13 @@ impl StreamingEvent {
 }
 
 impl StreamingIdentity {
+    pub async fn cancelled(&self) {
+        match self {
+            Self::Playback(context) => context.cancellation.cancelled().await,
+            Self::Preload(identity) => identity.cancellation.cancelled().await,
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         match self {
             Self::Playback(context) => context.cancellation.is_cancelled(),
@@ -385,16 +392,19 @@ struct SharedBufferInner {
     active_reader_position: AtomicU64,
     /// Latest decoder-requested Range window generation and start offset.
     window_epoch: AtomicU64,
+    window_request_lock: Mutex<()>,
     requested_offset: AtomicU64,
     request_pending: AtomicBool,
     coordinator_active: AtomicBool,
+    request_changed: tokio::sync::Notify,
     /// Contiguous prefix persisted from byte zero; used to decide whether the
     /// cache file is complete after out-of-order Range windows.
     cached_prefix: AtomicU64,
     finalized_cache_path: RwLock<Option<PathBuf>>,
-    finalized_cache_reader: Mutex<Option<std::fs::File>>,
+    cache_file: Mutex<Option<CacheFileReader>>,
     download_complete: AtomicBool,
     cache_finalized: AtomicBool,
+    cache_finalization_error: RwLock<Option<String>>,
     cancelled: AtomicBool,
     error: RwLock<Option<PlaybackError>>,
     demand_stall_timeout: Duration,
@@ -402,6 +412,23 @@ struct SharedBufferInner {
     wait_mutex: Mutex<()>,
     next_callback_subscription: AtomicU64,
     buffer_callback: RwLock<Option<BufferCallbackEntry>>,
+}
+
+/// The reader is locked through publication, so no decoder can reopen a
+/// temporary path while it is being renamed (including on Windows).
+struct CacheFileReader {
+    path: PathBuf,
+    reader: Option<std::fs::File>,
+    cleanup: Option<Arc<dyn AudioCacheStore>>,
+}
+
+impl Drop for CacheFileReader {
+    fn drop(&mut self) {
+        self.reader.take();
+        if let Some(store) = &self.cleanup {
+            store.cleanup_temp_file(&self.path);
+        }
+    }
 }
 
 static AUDIO_IN_FLIGHT: OnceLock<Mutex<HashMap<AudioCacheKey, Weak<SharedBufferInner>>>> =
@@ -414,10 +441,18 @@ fn audio_in_flight() -> &'static Mutex<HashMap<AudioCacheKey, Weak<SharedBufferI
 struct CoordinatorGuard {
     buffer: SharedBuffer,
     key: AudioCacheKey,
+    temporary_file: Option<(PathBuf, Arc<dyn AudioCacheStore>)>,
 }
 
 impl Drop for CoordinatorGuard {
     fn drop(&mut self) {
+        if let Some((path, store)) = self.temporary_file.take() {
+            let mut cache_file = self.buffer.inner.cache_file.lock();
+            if cache_file.as_ref().is_some_and(|cache| cache.path == path) {
+                cache_file.take();
+            }
+            store.cleanup_temp_file(&path);
+        }
         self.buffer
             .inner
             .coordinator_active
@@ -618,14 +653,17 @@ impl SharedBuffer {
                 active_reader_id: AtomicU64::new(0),
                 active_reader_position: AtomicU64::new(0),
                 window_epoch: AtomicU64::new(0),
+                window_request_lock: Mutex::new(()),
                 requested_offset: AtomicU64::new(0),
                 request_pending: AtomicBool::new(false),
                 coordinator_active: AtomicBool::new(false),
+                request_changed: tokio::sync::Notify::new(),
                 cached_prefix: AtomicU64::new(0),
                 finalized_cache_path: RwLock::new(None),
-                finalized_cache_reader: Mutex::new(None),
+                cache_file: Mutex::new(None),
                 download_complete: AtomicBool::new(false),
                 cache_finalized: AtomicBool::new(false),
+                cache_finalization_error: RwLock::new(None),
                 cancelled: AtomicBool::new(false),
                 error: RwLock::new(None),
                 demand_stall_timeout,
@@ -778,6 +816,7 @@ impl SharedBuffer {
     }
 
     fn append_window(&self, start: u64, chunk: &[u8], epoch: u64) -> bool {
+        let _request = self.inner.window_request_lock.lock();
         if chunk.is_empty() || self.window_epoch() != epoch {
             return false;
         }
@@ -813,6 +852,7 @@ impl SharedBuffer {
         self.inner.downloaded.store(end, Ordering::Release);
         self.inner.request_pending.store(false, Ordering::Release);
         drop(data);
+        drop(_request);
         self.inner.data_available.notify_all();
         self.notify_callback(BufferEvent::CacheAdvanced {
             cached: self.cached_prefix(),
@@ -826,6 +866,7 @@ impl SharedBuffer {
     }
 
     fn requested_window(&self) -> Option<(u64, u64)> {
+        let _request = self.inner.window_request_lock.lock();
         self.inner.request_pending.load(Ordering::Acquire).then(|| {
             (
                 self.window_epoch(),
@@ -835,6 +876,7 @@ impl SharedBuffer {
     }
 
     fn request_window(&self, offset: u64) -> u64 {
+        let _request = self.inner.window_request_lock.lock();
         if self.inner.request_pending.load(Ordering::Acquire)
             && self.inner.requested_offset.load(Ordering::Acquire) == offset
         {
@@ -849,6 +891,7 @@ impl SharedBuffer {
             .wrapping_add(1)
             .max(1);
         self.inner.data_available.notify_all();
+        self.inner.request_changed.notify_waiters();
         epoch
     }
 
@@ -860,26 +903,61 @@ impl SharedBuffer {
         self.inner.cached_prefix.load(Ordering::Acquire)
     }
 
-    fn set_finalized_cache_path(&self, path: PathBuf) {
-        *self.inner.finalized_cache_path.write() = Some(path);
-        self.inner.finalized_cache_reader.lock().take();
+    fn set_cache_file_path(&self, path: PathBuf) {
+        *self.inner.cache_file.lock() = Some(CacheFileReader {
+            path,
+            reader: None,
+            cleanup: None,
+        });
     }
 
     pub fn finalized_cache_path(&self) -> Option<PathBuf> {
         self.inner.finalized_cache_path.read().clone()
     }
 
-    fn read_finalized_cache(&self, position: u64, buf: &mut [u8]) -> Option<io::Result<usize>> {
-        let path = self.inner.finalized_cache_path.read().clone()?;
+    fn read_cached_prefix(&self, position: u64, buf: &mut [u8]) -> Option<io::Result<usize>> {
+        let prefix = self.cached_prefix();
+        if position >= prefix {
+            return None;
+        }
+        let mut cache = self.inner.cache_file.lock();
+        let cache = cache.as_mut()?;
         Some((|| {
-            let mut reader = self.inner.finalized_cache_reader.lock();
-            if reader.is_none() {
-                *reader = Some(std::fs::File::open(path)?);
+            if cache.reader.is_none() {
+                cache.reader = Some(std::fs::File::open(&cache.path)?);
             }
-            let file = reader.as_mut().expect("finalized cache reader initialized");
+            let file = cache.reader.as_mut().expect("cache reader initialized");
             file.seek(SeekFrom::Start(position))?;
-            file.read(buf)
+            let len = (prefix - position).min(buf.len() as u64) as usize;
+            let count = file.read(&mut buf[..len])?;
+            if count == 0 && len > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "audio cache was truncated",
+                ));
+            }
+            Ok(count)
         })())
+    }
+
+    fn has_cached_position(&self, position: u64) -> bool {
+        position < self.cached_prefix() && self.inner.cache_file.lock().is_some()
+    }
+
+    /// Startup always means byte zero for a NEW decoder, independent of the
+    /// outgoing decoder's position or EOF window.
+    fn startup_ready(&self) -> bool {
+        let available = if self.inner.cache_file.lock().is_some() {
+            self.cached_prefix()
+        } else if self.base_offset() == 0 {
+            self.downloaded()
+        } else {
+            0
+        };
+        self.policy().can_start_or_resume(
+            available,
+            self.total_size() > 0 && available >= self.total_size(),
+        )
     }
 
     /// Read data at position, blocking if not available
@@ -897,6 +975,9 @@ impl SharedBuffer {
         buf: &mut [u8],
         reader_cancellation: Option<&StreamingReaderCancellation>,
     ) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // Check for cancellation/error first
         if self.inner.cancelled.load(Ordering::Acquire)
             || reader_cancellation.is_some_and(StreamingReaderCancellation::is_cancelled)
@@ -935,14 +1016,31 @@ impl SharedBuffer {
             }
 
             if (position < base || position >= downloaded)
-                && let Some(result) = self.read_finalized_cache(position, buf)
+                && let Some(result) = self.read_cached_prefix(position, buf)
             {
+                if self.inner.coordinator_active.load(Ordering::Acquire)
+                    && !is_complete
+                    && reader_cancellation.is_some_and(StreamingReaderCancellation::owns_demand)
+                {
+                    self.request_window(position);
+                }
                 return result;
+            }
+
+            if (position < base || position >= downloaded)
+                && reader_cancellation.is_some_and(|reader| !reader.owns_demand())
+            {
+                // A speculative decoder cannot turn its own cache miss into
+                // a shared timeout that kills the active playback.
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "streaming reader does not own retained-window demand",
+                ));
             }
 
             if position < downloaded {
                 if position < base {
-                    if let Some(result) = self.read_finalized_cache(position, buf) {
+                    if let Some(result) = self.read_cached_prefix(position, buf) {
                         return result;
                     }
                     if !self.inner.coordinator_active.load(Ordering::Acquire) {
@@ -966,6 +1064,12 @@ impl SharedBuffer {
                     }
                 } else {
                     let data = self.inner.data.read();
+                    // The writer publishes offsets under this same lock.
+                    // An epoch replacement between the snapshot and lock is
+                    // a retry, never corrupt bytes or a spurious EOF.
+                    if base != self.base_offset() || downloaded != self.downloaded() {
+                        continue;
+                    }
                     let available = downloaded.saturating_sub(position) as usize;
                     let to_read = buf.len().min(available).min(data.len());
                     if to_read > 0 {
@@ -1138,7 +1242,20 @@ impl SharedBuffer {
         if self.is_cancelled() {
             return SharedBufferHealth::Cancelled;
         }
-        if self.is_download_complete() || self.remote_eof_reached() {
+        if self.is_cache_finalized()
+            || (self.is_download_complete()
+                && self.cached_prefix() == self.total_size()
+                && self
+                    .inner
+                    .cache_file
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|file| file.cleanup.is_some()))
+            || (self.is_download_complete()
+                && self.base_offset() == 0
+                && self.downloaded() == self.total_size())
+            || (self.inner.coordinator_active.load(Ordering::Acquire) && self.remote_eof_reached())
+        {
             return SharedBufferHealth::Complete;
         }
         if self.inner.coordinator_active.load(Ordering::Acquire) {
@@ -1156,12 +1273,14 @@ impl SharedBuffer {
     pub(crate) fn cancel_coordinator(&self) {
         self.inner.cancelled.store(true, Ordering::Release);
         self.inner.data_available.notify_all();
+        self.inner.request_changed.notify_waiters();
     }
 
     /// Set error state
     pub fn set_error(&self, error: PlaybackError) {
         *self.inner.error.write() = Some(error);
         self.inner.data_available.notify_all();
+        self.inner.request_changed.notify_waiters();
     }
 
     fn set_error_if_absent(&self, error: PlaybackError) -> bool {
@@ -1172,6 +1291,7 @@ impl SharedBuffer {
         *stored = Some(error);
         drop(stored);
         self.inner.data_available.notify_all();
+        self.inner.request_changed.notify_waiters();
         true
     }
 
@@ -1300,7 +1420,13 @@ impl Seek for StreamingBuffer {
         self.reader_cancellation.update_position(new_pos);
         let base = self.shared.base_offset();
         let end = self.shared.downloaded();
-        if new_pos < base || (new_pos >= end && new_pos < total) {
+        if (self.shared.has_cached_position(new_pos)
+            && (!self.reader_cancellation.owns_demand() || self.shared.is_complete()))
+            || (total > 0 && new_pos >= total)
+        {
+            // Cached seeks are local and do not require or replace the one
+            // network demand lease retained by the outgoing decoder.
+        } else if new_pos < base || (new_pos >= end && new_pos < total) {
             if !self.reader_cancellation.owns_demand() {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -1343,6 +1469,41 @@ enum RangeFetchResult {
 }
 
 async fn fetch_range_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    buffer: &SharedBuffer,
+    epoch: u64,
+) -> RangeFetchResult {
+    // Dropping the obsolete request/body future interrupts transport promptly;
+    // checking epochs only after `.await` leaves a new seek behind a 20s stall.
+    tokio::select! {
+        biased;
+        result = wait_for_range_invalidation(buffer, epoch) => result,
+        result = fetch_current_range_chunk(client, url, start, end, buffer, epoch) => result,
+    }
+}
+
+async fn wait_for_range_invalidation(buffer: &SharedBuffer, epoch: u64) -> RangeFetchResult {
+    loop {
+        let notified = buffer.inner.request_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if buffer.is_cancelled() {
+            return RangeFetchResult::Cancelled;
+        }
+        if let Some(error) = buffer.error_message() {
+            return RangeFetchResult::Fatal(error);
+        }
+        if buffer.window_epoch() != epoch {
+            return RangeFetchResult::Superseded;
+        }
+        notified.await;
+    }
+}
+
+async fn fetch_current_range_chunk(
     client: &reqwest::Client,
     url: &str,
     start: u64,
@@ -1409,8 +1570,14 @@ async fn fetch_range_chunk(
             return RangeFetchResult::Superseded;
         }
 
-        if let Err(message) = validate_range_response(&response, start, end) {
-            return RangeFetchResult::Fatal(message);
+        match validate_range_response(&response, start, end) {
+            Ok(range) if range.total == buffer.total_size() => {}
+            Ok(_) => {
+                return RangeFetchResult::Fatal(PlaybackError::UnsupportedStreaming(
+                    "remote audio size changed during Range download".to_string(),
+                ));
+            }
+            Err(error) => return RangeFetchResult::Fatal(error),
         }
 
         match response.bytes().await {
@@ -1474,89 +1641,109 @@ fn follow_existing_download(
     event_tx: tokio::sync::mpsc::Sender<StreamingEvent>,
 ) {
     tokio::spawn(async move {
-        let mut playable_sent = false;
-        let mut download_complete_sent = false;
-        let mut last_progress = None;
-
-        loop {
-            if identity.is_cancelled() {
-                return;
-            }
-            if let Some(message) = buffer.error_message() {
-                let _ = event_tx
-                    .send(StreamingEvent::new(
-                        identity,
-                        StreamingEventKind::Error(message),
-                    ))
-                    .await;
-                return;
-            }
-
-            let progress = (buffer.cached_prefix(), buffer.total_size());
-            if last_progress != Some(progress) {
-                last_progress = Some(progress);
-                let _ = event_tx.try_send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::CacheProgress(progress.0, progress.1),
-                ));
-            }
-            if !playable_sent
-                && buffer.policy().can_start_or_resume(
-                    buffer.buffered_ahead(),
-                    buffer.remote_eof_reached() || buffer.is_download_complete(),
-                )
-            {
-                let _ = event_tx
-                    .send(StreamingEvent::new(
-                        identity.clone(),
-                        StreamingEventKind::Playable,
-                    ))
-                    .await;
-                playable_sent = true;
-            }
-            if !download_complete_sent && buffer.is_download_complete() {
-                let _ = event_tx
-                    .send(StreamingEvent::new(
-                        identity.clone(),
-                        StreamingEventKind::DownloadComplete,
-                    ))
-                    .await;
-                download_complete_sent = true;
-            }
-            if buffer.is_cache_finalized() {
-                if let Some(path) = buffer.finalized_cache_path() {
-                    let _ = event_tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::CacheFinalized(path),
-                        ))
-                        .await;
-                }
-                let _ = event_tx
-                    .send(StreamingEvent::new(identity, StreamingEventKind::Complete))
-                    .await;
-                return;
-            }
-            if !buffer.inner.coordinator_active.load(Ordering::Acquire) {
-                let kind = if buffer.is_download_complete() {
-                    StreamingEventKind::CacheFinalizationFailed(
-                        "shared download finished without a published cache file".to_string(),
-                    )
-                } else if buffer.is_cancelled() {
-                    StreamingEventKind::Error(PlaybackError::Cancelled(
-                        "shared download was cancelled".to_string(),
-                    ))
-                } else {
-                    StreamingEventKind::Error(PlaybackError::StreamingFailed(
-                        "shared download coordinator stopped".to_string(),
-                    ))
-                };
-                let _ = event_tx.send(StreamingEvent::new(identity, kind)).await;
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let cancellation = identity.clone();
+        let sender = event_tx.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {},
+            _ = sender.closed() => {},
+            _ = follow_download_events(buffer, identity, event_tx) => {},
         }
     });
+}
+
+async fn follow_download_events(
+    buffer: SharedBuffer,
+    identity: StreamingIdentity,
+    event_tx: tokio::sync::mpsc::Sender<StreamingEvent>,
+) {
+    let mut playable_sent = false;
+    let mut download_complete_sent = false;
+    let mut last_progress = None;
+
+    loop {
+        if identity.is_cancelled() {
+            return;
+        }
+        if let Some(message) = buffer.error_message() {
+            let _ = event_tx
+                .send(StreamingEvent::new(
+                    identity,
+                    StreamingEventKind::Error(message),
+                ))
+                .await;
+            return;
+        }
+
+        let progress = (buffer.cached_prefix(), buffer.total_size());
+        if last_progress != Some(progress) {
+            last_progress = Some(progress);
+            let _ = event_tx.try_send(StreamingEvent::new(
+                identity.clone(),
+                StreamingEventKind::CacheProgress(progress.0, progress.1),
+            ));
+        }
+        if !playable_sent && buffer.health().promotion_error().is_none() && buffer.startup_ready() {
+            let _ = event_tx
+                .send(StreamingEvent::new(
+                    identity.clone(),
+                    StreamingEventKind::Playable,
+                ))
+                .await;
+            playable_sent = true;
+        }
+        if !download_complete_sent && buffer.is_download_complete() {
+            let _ = event_tx
+                .send(StreamingEvent::new(
+                    identity.clone(),
+                    StreamingEventKind::DownloadComplete,
+                ))
+                .await;
+            download_complete_sent = true;
+        }
+        if buffer.is_cache_finalized() {
+            if let Some(path) = buffer.finalized_cache_path() {
+                let _ = event_tx
+                    .send(StreamingEvent::new(
+                        identity.clone(),
+                        StreamingEventKind::CacheFinalized(path),
+                    ))
+                    .await;
+            }
+            let _ = event_tx
+                .send(StreamingEvent::new(identity, StreamingEventKind::Complete))
+                .await;
+            return;
+        }
+        if !buffer.inner.coordinator_active.load(Ordering::Acquire) {
+            if buffer.is_cache_finalized() || buffer.has_error() {
+                continue;
+            }
+            let kind = if buffer.is_download_complete() {
+                StreamingEventKind::CacheFinalizationFailed(
+                    buffer
+                        .inner
+                        .cache_finalization_error
+                        .read()
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "shared download finished without a published cache file".to_string()
+                        }),
+                )
+            } else if buffer.is_cancelled() {
+                StreamingEventKind::Error(PlaybackError::Cancelled(
+                    "shared download was cancelled".to_string(),
+                ))
+            } else {
+                StreamingEventKind::Error(PlaybackError::StreamingFailed(
+                    "shared download coordinator stopped".to_string(),
+                ))
+            };
+            let _ = event_tx.send(StreamingEvent::new(identity, kind)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Start downloading audio to a SharedBuffer using strict byte ranges.
@@ -1572,6 +1759,11 @@ pub fn start_buffer_download(
     identity: StreamingIdentity,
     event_tx: Option<tokio::sync::mpsc::Sender<StreamingEvent>>,
 ) -> SharedBuffer {
+    if identity.is_cancelled() {
+        let buffer = SharedBuffer::new(0);
+        buffer.cancel_coordinator();
+        return buffer;
+    }
     let (shared_buffer, is_new) = {
         let mut in_flight = audio_in_flight().lock();
         if let Some(existing) = in_flight.get(&cache_key).and_then(Weak::upgrade) {
@@ -1605,19 +1797,20 @@ pub fn start_buffer_download(
             (shared_buffer, true)
         }
     };
+    if let Some(event_tx) = event_tx {
+        follow_existing_download(shared_buffer.clone(), identity, event_tx);
+    }
     if !is_new {
-        if let Some(event_tx) = event_tx {
-            follow_existing_download(shared_buffer.clone(), identity, event_tx);
-        }
         return shared_buffer;
     }
     let buffer_clone = shared_buffer.clone();
-
+    let coordinator_guard = CoordinatorGuard {
+        buffer: buffer_clone.clone(),
+        key: cache_key,
+        temporary_file: None,
+    };
     tokio::spawn(async move {
-        let _coordinator_guard = CoordinatorGuard {
-            buffer: buffer_clone.clone(),
-            key: cache_key,
-        };
+        let mut coordinator_guard = coordinator_guard;
         let client = match reqwest::Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
@@ -1628,14 +1821,6 @@ pub fn start_buffer_download(
                 let error =
                     PlaybackError::NetworkError(format!("HTTP client setup failed: {error}"));
                 buffer_clone.set_error(error.clone());
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
         };
@@ -1651,14 +1836,6 @@ pub fn start_buffer_download(
                     response.status()
                 ));
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
             Err(error) => {
@@ -1667,14 +1844,6 @@ pub fn start_buffer_download(
                     error.without_url()
                 ));
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
         };
@@ -1691,14 +1860,6 @@ pub fn start_buffer_download(
                     error.without_url()
                 ));
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
         };
@@ -1706,14 +1867,6 @@ pub fn start_buffer_download(
             Ok(range) => range,
             Err(error) => {
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
         };
@@ -1725,14 +1878,6 @@ pub fn start_buffer_download(
                     body.len()
                 ));
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
             Err(error) => {
@@ -1741,14 +1886,6 @@ pub fn start_buffer_download(
                     error.without_url()
                 ));
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
         };
@@ -1757,8 +1894,7 @@ pub fn start_buffer_download(
 
         let temp_path = cache_store.unique_temp_path(&cache_path);
         let mut file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .open(&temp_path)
@@ -1767,65 +1903,30 @@ pub fn start_buffer_download(
             Err(error) => {
                 let error = PlaybackError::IoError(format!("could not create cache file: {error}"));
                 fail(error.clone(), &buffer_clone);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error),
-                        ))
-                        .await;
-                }
                 return;
             }
         };
 
-        let mut playable_sent = false;
+        coordinator_guard.temporary_file = Some((temp_path.clone(), cache_store.clone()));
+        buffer_clone.set_cache_file_path(temp_path.clone());
         if let Err(error) = file.write_all(&probe_body) {
             let error = PlaybackError::IoError(format!("cache write failed: {error}"));
             fail(error.clone(), &buffer_clone);
             drop(file);
-            cache_store.cleanup_temp_file(&temp_path);
-            if let Some(tx) = &event_tx {
-                let _ = tx
-                    .send(StreamingEvent::new(
-                        identity.clone(),
-                        StreamingEventKind::Error(error),
-                    ))
-                    .await;
-            }
             return;
         }
         buffer_clone.append(&probe_body);
         buffer_clone.set_cached_prefix(1);
         let mut downloaded = buffer_clone.downloaded();
-        if total_size == 1
-            && let Some(tx) = &event_tx
-        {
-            let _ = tx
-                .send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::Playable,
-                ))
-                .await;
-            playable_sent = true;
-            let _ = tx
-                .send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::CacheProgress(downloaded, total_size),
-                ))
-                .await;
-        }
         let mut active_epoch = buffer_clone.window_epoch();
 
         'download: loop {
             if buffer_clone.is_cancelled() {
                 drop(file);
-                cache_store.cleanup_temp_file(&temp_path);
                 return;
             }
             if buffer_clone.has_error() {
                 drop(file);
-                cache_store.cleanup_temp_file(&temp_path);
                 return;
             }
 
@@ -1835,22 +1936,6 @@ pub fn start_buffer_download(
             }
 
             let buffered_ahead = buffer_clone.buffered_ahead();
-            if !playable_sent
-                && buffer_clone.policy().can_start_or_resume(
-                    buffered_ahead,
-                    buffer_clone.remote_eof_reached() || buffer_clone.is_download_complete(),
-                )
-            {
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Playable,
-                        ))
-                        .await;
-                }
-                playable_sent = true;
-            }
 
             let ring_needs_refill = buffer_clone.policy().should_refill(buffered_ahead)
                 && buffer_clone.downloaded() < total_size;
@@ -1893,15 +1978,6 @@ pub fn start_buffer_download(
                     let error = PlaybackError::IoError(format!("cache read failed: {error}"));
                     fail(error.clone(), &buffer_clone);
                     drop(file);
-                    cache_store.cleanup_temp_file(&temp_path);
-                    if let Some(tx) = &event_tx {
-                        let _ = tx
-                            .send(StreamingEvent::new(
-                                identity.clone(),
-                                StreamingEventKind::Error(error),
-                            ))
-                            .await;
-                    }
                     return;
                 }
                 if buffer_clone.window_epoch() != active_epoch {
@@ -1909,29 +1985,22 @@ pub fn start_buffer_download(
                 }
                 body
             } else {
-                match fetch_range_chunk(&client, &url, start, end, &buffer_clone, active_epoch)
-                    .await
-                {
+                let fetched =
+                    fetch_range_chunk(&client, &url, start, end, &buffer_clone, active_epoch).await;
+                if buffer_clone.window_epoch() != active_epoch {
+                    continue 'download;
+                }
+                match fetched {
                     RangeFetchResult::Data(body) => body,
                     RangeFetchResult::Superseded => continue 'download,
                     RangeFetchResult::Cancelled => {
                         buffer_clone.cancel_coordinator();
                         drop(file);
-                        cache_store.cleanup_temp_file(&temp_path);
                         return;
                     }
                     RangeFetchResult::Fatal(error) => {
                         fail(error.clone(), &buffer_clone);
                         drop(file);
-                        cache_store.cleanup_temp_file(&temp_path);
-                        if let Some(tx) = &event_tx {
-                            let _ = tx
-                                .send(StreamingEvent::new(
-                                    identity.clone(),
-                                    StreamingEventKind::Error(error),
-                                ))
-                                .await;
-                        }
                         return;
                     }
                 }
@@ -1945,15 +2014,6 @@ pub fn start_buffer_download(
                     let error = PlaybackError::IoError(format!("cache write failed: {error}"));
                     fail(error.clone(), &buffer_clone);
                     drop(file);
-                    cache_store.cleanup_temp_file(&temp_path);
-                    if let Some(tx) = &event_tx {
-                        let _ = tx
-                            .send(StreamingEvent::new(
-                                identity.clone(),
-                                StreamingEventKind::Error(error),
-                            ))
-                            .await;
-                    }
                     return;
                 }
                 if start == buffer_clone.cached_prefix() {
@@ -1962,9 +2022,8 @@ pub fn start_buffer_download(
             }
             if feed_ring {
                 while !buffer_clone.append_window(start, &body, active_epoch) {
-                    if buffer_clone.is_cancelled() {
+                    if buffer_clone.is_cancelled() || buffer_clone.has_error() {
                         drop(file);
-                        cache_store.cleanup_temp_file(&temp_path);
                         return;
                     }
                     if buffer_clone.window_epoch() != active_epoch {
@@ -1982,60 +2041,18 @@ pub fn start_buffer_download(
                 });
             }
             downloaded = downloaded.max(end.saturating_add(1));
-
-            if feed_ring
-                && !playable_sent
-                && buffer_clone.policy().can_start_or_resume(
-                    buffer_clone.buffered_ahead(),
-                    buffer_clone.remote_eof_reached() || buffer_clone.is_download_complete(),
-                )
-            {
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Playable,
-                        ))
-                        .await;
-                }
-                playable_sent = true;
-            }
-            if let Some(tx) = &event_tx {
-                let _ = tx.try_send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::CacheProgress(buffer_clone.cached_prefix(), total_size),
-                ));
-            }
         }
 
         if let Err(error) = file.flush() {
             let error = PlaybackError::IoError(format!("cache flush failed: {error}"));
             fail(error.clone(), &buffer_clone);
             drop(file);
-            cache_store.cleanup_temp_file(&temp_path);
-            if let Some(tx) = &event_tx {
-                let _ = tx
-                    .send(StreamingEvent::new(
-                        identity.clone(),
-                        StreamingEventKind::Error(error),
-                    ))
-                    .await;
-            }
             return;
         }
         if let Err(error) = file.sync_all() {
             let error = PlaybackError::IoError(format!("cache sync failed: {error}"));
             fail(error.clone(), &buffer_clone);
             drop(file);
-            cache_store.cleanup_temp_file(&temp_path);
-            if let Some(tx) = &event_tx {
-                let _ = tx
-                    .send(StreamingEvent::new(
-                        identity.clone(),
-                        StreamingEventKind::Error(error),
-                    ))
-                    .await;
-            }
             return;
         }
         drop(file);
@@ -2051,15 +2068,6 @@ pub fn start_buffer_download(
                             "unknown or damaged audio prefix".to_string(),
                         );
                         drop(reader);
-                        cache_store.cleanup_temp_file(&temp_path);
-                        if let Some(tx) = &event_tx {
-                            let _ = tx
-                                .send(StreamingEvent::new(
-                                    identity.clone(),
-                                    StreamingEventKind::Error(error.clone()),
-                                ))
-                                .await;
-                        }
                         fail(error, &buffer_clone);
                         return;
                     }
@@ -2069,15 +2077,6 @@ pub fn start_buffer_download(
                 let error = PlaybackError::IoError(format!(
                     "could not open cache for format detection: {error}"
                 ));
-                cache_store.cleanup_temp_file(&temp_path);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::Error(error.clone()),
-                        ))
-                        .await;
-                }
                 fail(error, &buffer_clone);
                 return;
             }
@@ -2091,87 +2090,84 @@ pub fn start_buffer_download(
         let final_path = parent.join(format!("{stem}.{final_ext}"));
 
         buffer_clone.mark_complete();
-        if let Some(tx) = &event_tx {
-            let _ = tx
-                .send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::DownloadComplete,
-                ))
-                .await;
-        }
 
-        match cache_store.publish_or_reuse(&temp_path, &final_path, Some(total_size)) {
+        let prepared = match cache_store.prepare_audio_cache(temp_path.clone()).await {
+            Ok(path) => path,
             Err(error) => {
-                let message = format!("failed to finalize cache {:?}: {}", final_path, error);
-                cache_store.cleanup_temp_file(&temp_path);
-                if let Some(tx) = &event_tx {
-                    let _ = tx
-                        .send(StreamingEvent::new(
-                            identity.clone(),
-                            StreamingEventKind::CacheFinalizationFailed(message),
-                        ))
-                        .await;
+                // Tagging operates on a separate copy. The fully downloaded,
+                // synced raw file remains valid for existing and future readers
+                // of this buffer, including seeks outside the bounded ring.
+                // Transfer cleanup ownership before the coordinator exits.
+                *buffer_clone.inner.cache_file.lock() = Some(CacheFileReader {
+                    path: temp_path.clone(),
+                    reader: None,
+                    cleanup: Some(cache_store.clone()),
+                });
+                coordinator_guard.temporary_file = None;
+                *buffer_clone.inner.cache_finalization_error.write() =
+                    Some(format!("cache metadata failed: {error}"));
+                return;
+            }
+        };
+        let publish_path = prepared.as_ref().unwrap_or(&temp_path);
+        let publish_size = if prepared.is_some() {
+            match std::fs::metadata(publish_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    cache_store.cleanup_temp_file(publish_path);
+                    fail(PlaybackError::IoError(error.to_string()), &buffer_clone);
+                    return;
                 }
             }
-            Ok(publish_result) => match cache_store.write_audio_manifest(
-                &final_path,
-                cache_key.song_id,
-                cache_key.actual_quality,
-                total_size,
-                &final_ext,
-            ) {
-                Err(error) => {
-                    let message = format!(
-                        "failed to publish cache manifest for {:?}: {}",
-                        final_path, error
-                    );
-                    tracing::warn!(?error, ?final_path, "Failed to write audio cache manifest");
-                    if publish_result == PublishOutcome::Published {
-                        cache_store.remove_audio_cache(&final_path);
-                    }
-                    if let Some(tx) = &event_tx {
-                        let _ = tx
-                            .send(StreamingEvent::new(
-                                identity.clone(),
-                                StreamingEventKind::CacheFinalizationFailed(message),
-                            ))
-                            .await;
-                    }
-                }
-                Ok(()) => {
-                    buffer_clone.set_finalized_cache_path(final_path.clone());
-                    buffer_clone.mark_cache_finalized();
-                    if let Some(tx) = &event_tx {
-                        let _ = tx
-                            .send(StreamingEvent::new(
-                                identity.clone(),
-                                StreamingEventKind::CacheFinalized(final_path),
-                            ))
-                            .await;
-                    }
-                }
-            },
-        }
+        } else {
+            total_size
+        };
 
-        if buffer_clone.is_cache_finalized()
-            && let Some(tx) = &event_tx
-        {
-            let _ = tx
-                .send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::Complete,
-                ))
-                .await;
-        }
-        if let Some(tx) = &event_tx
-            && !playable_sent
-        {
-            let _ = tx
-                .send(StreamingEvent::new(
-                    identity.clone(),
-                    StreamingEventKind::Playable,
-                ))
-                .await;
+        // Close the temporary reader and exclude new opens during rename.
+        // Only expose the final path after both data and manifest are usable.
+        let publication = {
+            let mut cache_file = buffer_clone.inner.cache_file.lock();
+            cache_file.take();
+            cache_store
+                .publish_or_reuse(publish_path, &final_path, Some(publish_size))
+                .and_then(|outcome| {
+                    cache_store
+                        .write_audio_manifest(
+                            &final_path,
+                            cache_key.song_id,
+                            cache_key.actual_quality,
+                            total_size,
+                            &final_ext,
+                        )
+                        .inspect_err(|_| {
+                            if outcome == PublishOutcome::Published {
+                                cache_store.remove_audio_cache(&final_path);
+                            }
+                        })?;
+                    *cache_file = Some(CacheFileReader {
+                        path: if prepared.is_some() {
+                            temp_path.clone()
+                        } else {
+                            final_path.clone()
+                        },
+                        reader: None,
+                        cleanup: prepared.as_ref().map(|_| cache_store.clone()),
+                    });
+                    Ok(())
+                })
+        };
+        match publication {
+            Ok(()) => {
+                coordinator_guard.temporary_file = None;
+                *buffer_clone.inner.finalized_cache_path.write() = Some(final_path);
+                buffer_clone.mark_cache_finalized();
+            }
+            Err(error) => {
+                // A bounded ring cannot substitute for a missing full file.
+                buffer_clone.set_error(PlaybackError::IoError(format!(
+                    "audio cache publication failed: {error}"
+                )));
+            }
         }
         tracing::debug!("Strict Range download complete: {} bytes", downloaded);
     });
@@ -2179,20 +2175,19 @@ pub fn start_buffer_download(
     shared_buffer
 }
 
-/// Wait until the retained decoder window itself reaches the startup high
-/// watermark. Unlike event-channel waiting, this remains safe for callers
-/// that intentionally discard progress events (for example startup restore).
+/// Wait for bytes at the new decoder's origin, in memory or the contiguous
+/// file prefix. Event consumers and outgoing reader position cannot gate it.
 pub async fn wait_for_buffer_playable(buffer: &SharedBuffer, timeout_secs: u64) -> bool {
     tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
-            if buffer.is_cancelled() || buffer.has_error() {
+            if buffer.health().promotion_error().is_some() {
                 return false;
             }
-            if buffer.policy().can_start_or_resume(
-                buffer.buffered_ahead(),
-                buffer.remote_eof_reached() || buffer.is_complete(),
-            ) {
+            if buffer.startup_ready() {
                 return true;
+            }
+            if !buffer.inner.coordinator_active.load(Ordering::Acquire) {
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -2208,7 +2203,11 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Default)]
-    struct TestCacheStore;
+    struct TestCacheStore {
+        fail_manifest: bool,
+        tagged_copy: bool,
+        fail_prepare: bool,
+    }
 
     impl rustle_application::ports::cache::CachePublisher for TestCacheStore {
         fn unique_temp_path(&self, final_path: &std::path::Path) -> PathBuf {
@@ -2248,6 +2247,30 @@ mod tests {
     }
 
     impl AudioCacheStore for TestCacheStore {
+        fn prepare_audio_cache(
+            &self,
+            path: PathBuf,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = io::Result<Option<PathBuf>>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail_prepare {
+                    return Err(io::Error::other("injected metadata failure"));
+                }
+                if !self.tagged_copy {
+                    return Ok(None);
+                }
+                // Insert a WAV JUNK chunk before fmt, shifting every audio offset.
+                let mut bytes = std::fs::read(&path)?;
+                bytes.splice(12..12, *b"JUNK\x04\x00\x00\x00tags");
+                let size = (bytes.len() - 8) as u32;
+                bytes[4..8].copy_from_slice(&size.to_le_bytes());
+                let tagged = path.with_extension("tagged");
+                std::fs::write(&tagged, bytes)?;
+                Ok(Some(tagged))
+            })
+        }
+
         fn write_audio_manifest(
             &self,
             _path: &std::path::Path,
@@ -2256,6 +2279,11 @@ mod tests {
             _size: u64,
             _format: &str,
         ) -> std::io::Result<()> {
+            if self.fail_manifest {
+                return Err(std::io::Error::other(
+                    "injected manifest publication failure",
+                ));
+            }
             Ok(())
         }
 
@@ -2265,7 +2293,201 @@ mod tests {
     }
 
     fn test_cache_store() -> Arc<dyn AudioCacheStore> {
-        Arc::new(TestCacheStore)
+        Arc::new(TestCacheStore::default())
+    }
+
+    #[test]
+    fn replay_reads_only_the_written_prefix_without_stealing_demand() {
+        let store = test_cache_store();
+        let path = store.unique_temp_path(&std::env::temp_dir().join("rustle-prefix"));
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(100)
+            .unwrap();
+        let buffer =
+            SharedBuffer::with_capacity_and_stall_timeout(100, 8, Duration::from_millis(50));
+        buffer.set_coordinator_active_for_test(true);
+        buffer.set_cache_file_path(path.clone());
+        buffer.set_cached_prefix(8);
+        let mut outgoing = StreamingBuffer::new(buffer.clone());
+        outgoing.seek(SeekFrom::Start(80)).unwrap();
+        let epoch = buffer.window_epoch();
+        assert!(buffer.append_window(80, b"tail", epoch));
+        let mut replay = StreamingBuffer::new(buffer.clone());
+        replay.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = [0; 16];
+        assert_eq!(replay.read(&mut bytes).unwrap(), 8);
+        assert_eq!(&bytes[..8], b"abcdefgh");
+        assert_eq!(
+            replay.read(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(buffer.window_epoch(), epoch);
+        assert_eq!(buffer.reader_position(), 80);
+        assert!(!buffer.has_error());
+        drop(replay);
+        drop(outgoing);
+        drop(buffer);
+        store.cleanup_temp_file(&path);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn speculative_reader_past_the_ring_cannot_poison_active_playback() {
+        let buffer =
+            SharedBuffer::with_capacity_and_stall_timeout(100, 8, Duration::from_millis(20));
+        buffer.set_coordinator_active_for_test(true);
+        buffer.append(b"1234");
+        let _outgoing = StreamingBuffer::new(buffer.clone());
+        let mut speculative = StreamingBuffer::new(buffer.clone());
+        assert_eq!(speculative.read(&mut [0; 4]).unwrap(), 4);
+        assert_eq!(
+            speculative.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!buffer.has_error());
+        assert_eq!(buffer.reader_position(), 0);
+    }
+
+    #[tokio::test]
+    async fn tail_eof_and_unpublished_completion_do_not_make_a_new_decoder_ready() {
+        let buffer =
+            SharedBuffer::with_capacity_and_stall_timeout(100, 4, Duration::from_millis(50));
+        buffer.set_coordinator_active_for_test(true);
+        buffer.append(&[0; 100]);
+        buffer.set_reader_position(100);
+        assert!(buffer.remote_eof_reached());
+        assert!(!buffer.startup_ready());
+        buffer.mark_complete();
+        buffer.set_coordinator_active_for_test(false);
+        assert_eq!(buffer.health(), SharedBufferHealth::CoordinatorStopped);
+        assert!(
+            !tokio::time::timeout(
+                Duration::from_millis(200),
+                wait_for_buffer_playable(&buffer, 30)
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(StreamingBuffer::new(buffer).read(&mut []).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_event_follower_releases_a_full_channel_without_cancelling_cache() {
+        let buffer = SharedBuffer::new(10);
+        buffer.set_coordinator_active_for_test(true);
+        let controller = crate::identity::PlaybackGenerationController::new();
+        let context = controller.activate_generation();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(StreamingEvent::new(
+            StreamingIdentity::Playback(context.clone()),
+            StreamingEventKind::CacheProgress(0, 10),
+        ))
+        .unwrap();
+        follow_existing_download(
+            buffer.clone(),
+            StreamingIdentity::Playback(context.clone()),
+            tx,
+        );
+        tokio::task::yield_now().await;
+        context.cancellation.cancel();
+        rx.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!buffer.is_cancelled());
+        assert!(buffer.inner.coordinator_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn superseded_and_cancelled_ranges_interrupt_headers_and_body_waits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for body_stall in [false, true] {
+            for cancel in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 1024];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    if body_stall {
+                        socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/8\r\n\r\na").await.unwrap();
+                    }
+                    started_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(socket);
+                });
+                let buffer = SharedBuffer::new(8);
+                let pending_buffer = buffer.clone();
+                let request = tokio::spawn(async move {
+                    fetch_range_chunk(
+                        &reqwest::Client::new(),
+                        &format!("http://{address}/audio"),
+                        0,
+                        3,
+                        &pending_buffer,
+                        0,
+                    )
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(2), started_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::task::yield_now().await;
+                if cancel {
+                    buffer.cancel_coordinator();
+                } else {
+                    buffer.request_window(4);
+                }
+                let result = tokio::time::timeout(Duration::from_millis(500), request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if cancel {
+                    assert!(matches!(result, RangeFetchResult::Cancelled));
+                } else {
+                    assert!(matches!(result, RangeFetchResult::Superseded));
+                    assert!(!buffer.has_error());
+                }
+                assert_eq!(buffer.cached_bytes(), 0);
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_remote_size_is_rejected_before_bytes_are_cached() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(socket.read(&mut [0; 1024]).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/9\r\nConnection: close\r\n\r\na").await.unwrap();
+        });
+        let buffer = SharedBuffer::new(8);
+        let result = fetch_range_chunk(
+            &reqwest::Client::new(),
+            &format!("http://{address}/audio"),
+            0,
+            0,
+            &buffer,
+            0,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            RangeFetchResult::Fatal(PlaybackError::UnsupportedStreaming(_))
+        ));
+        server.await.unwrap();
     }
 
     #[test]
@@ -2420,6 +2642,7 @@ mod tests {
             .store(true, Ordering::Release);
         buffer.set_error(PlaybackError::NetworkError("body failed".to_string()));
         drop(CoordinatorGuard {
+            temporary_file: None,
             buffer: buffer.clone(),
             key: AudioCacheKey {
                 song_id: 1,
@@ -2725,6 +2948,7 @@ mod tests {
             .coordinator_active
             .store(true, Ordering::Release);
         drop(CoordinatorGuard {
+            temporary_file: None,
             buffer: buffer.clone(),
             key: AudioCacheKey {
                 song_id: 1,
@@ -2775,9 +2999,48 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persistent_cache_advances_beyond_a_full_playback_window() {
+        exercise_cache_lifecycle(false, false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_publication_is_terminal_and_cleans_up_files() {
+        exercise_cache_lifecycle(true, false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tagged_publication_preserves_streaming_offsets_and_cleans_raw_backing() {
+        exercise_cache_lifecycle(false, true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tagged_publication_failure_cleans_both_copies() {
+        exercise_cache_lifecycle(true, true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_failure_keeps_complete_audio_playable_without_publishing_cache() {
+        exercise_cache_lifecycle(false, false, true).await;
+    }
+
+    async fn exercise_cache_lifecycle(fail_manifest: bool, tagged_copy: bool, fail_prepare: bool) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const TOTAL_SIZE: u64 = 6 * MIB;
+        // Real PCM WAV: verify decoder restart as well as byte-level replay.
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&((TOTAL_SIZE - 8) as u32).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
+        header.extend_from_slice(&44_100u32.to_le_bytes());
+        header.extend_from_slice(&176_400u32.to_le_bytes());
+        header.extend_from_slice(&4u16.to_le_bytes());
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&((TOTAL_SIZE - 44) as u32).to_le_bytes());
+        let header = Arc::new(header);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2785,6 +3048,7 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
+                let header = header.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut chunk = [0u8; 1024];
@@ -2826,12 +3090,10 @@ mod tests {
                     let mut body = vec![0u8; len];
                     for (index, byte) in body.iter_mut().enumerate() {
                         let absolute = start + index as u64;
-                        *byte = match absolute {
-                            0 => b'I',
-                            1 => b'D',
-                            2 => b'3',
-                            _ => (absolute % 251) as u8,
-                        };
+                        *byte = header
+                            .get(absolute as usize)
+                            .copied()
+                            .unwrap_or((absolute % 251) as u8);
                     }
                     let response = format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{TOTAL_SIZE}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
@@ -2848,25 +3110,36 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // Windows clock resolution can give concurrent lifecycle tests the
+        // same timestamp. They must never join each other's in-flight key.
+        static NEXT_LIFECYCLE_ID: AtomicU64 = AtomicU64::new(1 << 62);
+        let song_id = NEXT_LIFECYCLE_ID.fetch_add(1, Ordering::Relaxed);
         let cache_dir = std::env::temp_dir().join(format!(
-            "rustle-cache-progress-{}-{unique}",
+            "rustle-cache-progress-{}-{unique}-{song_id}",
             std::process::id()
         ));
         std::fs::create_dir_all(&cache_dir).unwrap();
         let controller = crate::identity::PlaybackGenerationController::new();
         let context = controller.activate_generation();
+        // A stopped UI subscription must not own progress or publication.
+        let (event_tx, _undrained_events) = tokio::sync::mpsc::channel(1);
         let buffer = start_buffer_download(
             format!("http://{address}/audio.mp3"),
             cache_dir.join("range-cache"),
             AudioCacheKey {
-                song_id: unique as u64,
+                song_id,
                 actual_quality: rustle_domain::audio::QualityLevel::Standard,
             },
-            test_cache_store(),
+            Arc::new(TestCacheStore {
+                fail_manifest,
+                tagged_copy,
+                fail_prepare,
+            }),
             Some(320_000),
-            StreamingIdentity::Playback(context),
-            None,
+            StreamingIdentity::Playback(context.clone()),
+            Some(event_tx),
         );
+        context.cancellation.cancel();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if buffer.cached_bytes() > buffer.downloaded()
@@ -2883,12 +3156,61 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        while !buffer.is_cache_finalized() {
+        while buffer.inner.coordinator_active.load(Ordering::Acquire) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "cache did not finalize after its prefix reached the remote size"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if fail_manifest {
+            assert!(buffer.is_download_complete());
+            assert!(!buffer.is_cache_finalized());
+            assert!(buffer.finalized_cache_path().is_none());
+            assert!(matches!(
+                buffer.health(),
+                SharedBufferHealth::Failed(PlaybackError::IoError(_))
+            ));
+            assert!(!wait_for_buffer_playable(&buffer, 1).await);
+            assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 0);
+            server.abort();
+            drop(buffer);
+            std::fs::remove_dir(&cache_dir).unwrap();
+            return;
+        }
+        assert_eq!(buffer.is_cache_finalized(), !fail_prepare);
+        assert_eq!(buffer.health(), SharedBufferHealth::Complete);
+        assert!(wait_for_buffer_playable(&buffer, 1).await);
+        if fail_prepare {
+            assert!(buffer.finalized_cache_path().is_none());
+            assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 1);
+            // Every subscriber gets the cache failure, never a playback error
+            // or a false cache completion (also covers preload promotion).
+            let context = controller.activate_generation();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            follow_download_events(buffer.clone(), StreamingIdentity::Playback(context), tx).await;
+            let mut warned = false;
+            while let Some(event) = rx.recv().await {
+                match event.kind {
+                    StreamingEventKind::CacheFinalizationFailed(reason) => {
+                        assert!(reason.contains("injected metadata failure"));
+                        warned = true;
+                    }
+                    StreamingEventKind::Error(_)
+                    | StreamingEventKind::Complete
+                    | StreamingEventKind::CacheFinalized(_) => {
+                        panic!("unexpected completion: {event:?}")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(warned);
+        }
+        if tagged_copy {
+            let path = buffer.finalized_cache_path().unwrap();
+            assert_eq!(std::fs::metadata(path).unwrap().len(), TOTAL_SIZE + 12);
+            assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 2);
         }
 
         let mut reader = StreamingBuffer::new(buffer.clone());
@@ -2897,15 +3219,61 @@ mod tests {
         while consumed < TOTAL_SIZE {
             let count = reader.read(&mut bytes).unwrap();
             assert!(count > 0, "finalized cache returned an early EOF");
+            for (offset, &byte) in bytes[..count].iter().enumerate() {
+                let position = consumed + offset as u64;
+                if position >= 44 {
+                    assert_eq!(byte, (position % 251) as u8);
+                }
+            }
             consumed += count as u64;
         }
         assert_eq!(consumed, TOTAL_SIZE);
         assert_eq!(reader.read(&mut bytes).unwrap(), 0);
 
+        // A second decoder starts from zero even while the outgoing reader
+        // still owns the ring lease. Container probing may seek beyond it.
+        let mut replay = StreamingBuffer::new(buffer.clone());
+        replay.seek(SeekFrom::Start(TOTAL_SIZE - 100)).unwrap();
+        assert_eq!(replay.read(&mut bytes).unwrap(), 100);
+        for (offset, &byte) in bytes[..100].iter().enumerate() {
+            assert_eq!(byte, ((TOTAL_SIZE - 100 + offset as u64) % 251) as u8);
+        }
+        replay.seek(SeekFrom::Start(0)).unwrap();
+        assert!(replay.read(&mut bytes).unwrap() > 0);
+        assert_eq!(&bytes[..4], b"RIFF");
+        drop(replay);
+
+        let path = buffer.finalized_cache_path().unwrap_or_else(|| {
+            buffer
+                .inner
+                .cache_file
+                .lock()
+                .as_ref()
+                .unwrap()
+                .path
+                .clone()
+        });
+        let expected: Vec<_> = rodio::Decoder::try_from(std::fs::File::open(path).unwrap())
+            .unwrap()
+            .take(256)
+            .collect();
+        assert_eq!(expected.len(), 256);
+        for _ in 0..3 {
+            let decoder =
+                crate::player::prepare_streaming_source(StreamingBuffer::new(buffer.clone()))
+                    .unwrap();
+            assert_eq!(decoder.take(256).collect::<Vec<_>>(), expected);
+        }
+
         server.abort();
         drop(reader);
-        buffer.inner.finalized_cache_reader.lock().take();
         drop(buffer);
+        // The final buffer owner releases the raw backing, even after tagging
+        // failed. Only successful publications leave a persistent audio file.
+        assert_eq!(
+            std::fs::read_dir(&cache_dir).unwrap().count(),
+            usize::from(!fail_prepare)
+        );
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 

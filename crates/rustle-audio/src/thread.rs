@@ -17,10 +17,15 @@ use super::PlaybackStatus;
 use super::chain::{AudioProcessingChain, PlaybackProcessingRuntime};
 use super::events::{
     AudioCommand, AudioCommandReceiver, AudioEvent, AudioEventSender, BufferDataMailbox,
-    BufferDataUpdate, LatestControlMailbox, SharedPlaybackState, audio_command_channel,
-    audio_event_channel,
+    BufferDataUpdate, DeviceSignalMailbox, LatestControlMailbox, OutputFailureSignal,
+    SharedPlaybackState, audio_command_channel, audio_event_channel,
 };
 use super::handle::AudioHandle;
+use super::output_recovery::{
+    OUTPUT_RECOVERY_RETRY_DELAY, OutputGeneration, OutputRecoveryId, OutputRecoveryIntent,
+    OutputRecoveryRequest, OutputRecoverySnapshot, OutputRecoverySource, OutputRecoveryWorker,
+    OutputStallDetector, PreparedOutputRecovery, should_retry_output,
+};
 use super::player::{
     AudioPlayer, DetachedStreamingPlayback, PlaybackError, PlaybackResult, PreparedStreamingSource,
     prepare_streaming_source,
@@ -28,6 +33,7 @@ use super::player::{
 use super::streaming::{
     SharedBuffer, SharedBufferHealth, StreamingBuffer, StreamingReaderCancellation,
 };
+use super::{device, device::OutputRecoveryReason, device_watcher::DeviceWatcher};
 
 pub type WorkerTask = Box<dyn FnOnce() + Send + 'static>;
 pub type WorkerSpawner = fn(
@@ -40,6 +46,7 @@ const STREAMING_PREPARATION_QUEUE_CAPACITY: usize = 4;
 const STREAMING_PREPARATION_RESULT_CAPACITY: usize = 8;
 const STREAMING_SEEK_QUEUE_CAPACITY: usize = 1;
 const STREAMING_SEEK_RESULT_CAPACITY: usize = 2;
+const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_MAINTENANCE_INTERVAL: Duration =
     Duration::from_millis(super::automix::SCHEDULER_POLL_MS);
 
@@ -159,6 +166,7 @@ enum ControlEvent {
     Command(AudioCommand),
     Prepared(StreamingPreparationResult),
     StreamingSeekFinished(StreamingSeekResult),
+    OutputRecoveryFinished(Box<PreparedOutputRecovery>),
     Maintenance,
     Closed,
 }
@@ -167,6 +175,7 @@ async fn next_control_event(
     command_rx: &mut AudioCommandReceiver,
     preparation_result_rx: &mut tokio::sync::mpsc::Receiver<StreamingPreparationResult>,
     seek_result_rx: &mut tokio::sync::mpsc::Receiver<StreamingSeekResult>,
+    output_recovery_result_rx: &mut tokio::sync::mpsc::Receiver<PreparedOutputRecovery>,
     maintenance_deadline: tokio::time::Instant,
 ) -> ControlEvent {
     tokio::select! {
@@ -176,6 +185,7 @@ async fn next_control_event(
         },
         Some(prepared) = preparation_result_rx.recv() => ControlEvent::Prepared(prepared),
         Some(result) = seek_result_rx.recv() => ControlEvent::StreamingSeekFinished(result),
+        Some(result) = output_recovery_result_rx.recv() => ControlEvent::OutputRecoveryFinished(Box::new(result)),
         _ = tokio::time::sleep_until(maintenance_deadline) => ControlEvent::Maintenance,
     }
 }
@@ -505,10 +515,556 @@ impl StreamingPreparationPool {
     }
 }
 
+#[derive(Clone)]
+struct OutputRecoveryBase {
+    context: Option<super::identity::PlaybackContext>,
+    source_revision: u64,
+    source: OutputRecoverySource,
+    position: Duration,
+    duration: Duration,
+    intent: OutputRecoveryIntent,
+    volume: f32,
+    track_gain: f32,
+    pending_seek: Option<super::identity::SeekNonce>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputRecoveryAttempt {
+    recovery_id: OutputRecoveryId,
+    output_generation: OutputGeneration,
+    retry_count: u8,
+}
+
+#[derive(Debug)]
+struct InitialOutput<T> {
+    output: T,
+    fallback_from: Option<PlaybackError>,
+}
+
+fn initialize_output<T>(
+    requested_selection: Option<&str>,
+    mut open: impl FnMut(Option<&str>) -> PlaybackResult<T>,
+) -> PlaybackResult<InitialOutput<T>> {
+    let Some(requested_selection) = requested_selection else {
+        return open(None).map(|output| InitialOutput {
+            output,
+            fallback_from: None,
+        });
+    };
+
+    match open(Some(requested_selection)) {
+        Ok(output) => Ok(InitialOutput {
+            output,
+            fallback_from: None,
+        }),
+        Err(configured_error) => match open(None) {
+            Ok(output) => Ok(InitialOutput {
+                output,
+                fallback_from: Some(configured_error),
+            }),
+            Err(fallback_error) => Err(PlaybackError::DeviceUnavailable(format!(
+                "configured output failed ({configured_error}); default fallback failed ({fallback_error})"
+            ))),
+        },
+    }
+}
+
+struct OutputRecoveryCoordinator {
+    desired_selection: Option<String>,
+    selection_degraded: bool,
+    next_recovery_id: u64,
+    next_output_generation: u64,
+    active_output_generation: OutputGeneration,
+    source_revision: u64,
+    base: Option<OutputRecoveryBase>,
+    inflight: Option<OutputRecoveryAttempt>,
+    pending_reason: Option<OutputRecoveryReason>,
+    retry_at: Option<(Instant, OutputRecoveryReason)>,
+    inflight_failure: Option<OutputFailureSignal>,
+    output_broken: bool,
+    stall_detector: OutputStallDetector,
+}
+
+impl OutputRecoveryCoordinator {
+    fn new(requested_selection: Option<String>, resolved_selection: Option<String>) -> Self {
+        let selection_degraded = requested_selection.is_some() && resolved_selection.is_none();
+        let desired_selection =
+            requested_selection.map(|requested| resolved_selection.unwrap_or(requested));
+        Self {
+            desired_selection,
+            selection_degraded,
+            next_recovery_id: 0,
+            next_output_generation: 1,
+            active_output_generation: OutputGeneration(1),
+            source_revision: 0,
+            base: None,
+            inflight: None,
+            pending_reason: None,
+            retry_at: None,
+            inflight_failure: None,
+            output_broken: false,
+            stall_detector: OutputStallDetector::default(),
+        }
+    }
+
+    fn reserve_attempt(&mut self, retry_count: u8) -> OutputRecoveryAttempt {
+        self.next_recovery_id = self.next_recovery_id.wrapping_add(1).max(1);
+        self.next_output_generation = self.next_output_generation.wrapping_add(1).max(2);
+        OutputRecoveryAttempt {
+            recovery_id: OutputRecoveryId(self.next_recovery_id),
+            output_generation: OutputGeneration(self.next_output_generation),
+            retry_count,
+        }
+    }
+
+    fn is_recovering(&self) -> bool {
+        self.inflight.is_some() || self.retry_at.is_some()
+    }
+
+    fn note_source_changed(&mut self) {
+        self.source_revision = self.source_revision.wrapping_add(1);
+        self.base = None;
+        self.retry_at = None;
+        self.stall_detector.reset();
+    }
+
+    fn active_failure_is_actionable(&self, generation: u64) -> bool {
+        generation == self.active_output_generation.0
+            && !self.is_recovering()
+            && !self.output_broken
+    }
+
+    fn inflight_failure_is_actionable(&self, generation: u64) -> bool {
+        self.inflight
+            .is_some_and(|attempt| attempt.output_generation.0 == generation)
+    }
+
+    fn should_retry_after_topology(&self, devices: &[device::AudioDevice]) -> bool {
+        if (!self.output_broken && !self.selection_degraded) || self.is_recovering() {
+            return false;
+        }
+        match self.desired_selection.as_deref() {
+            Some(selection) => devices
+                .iter()
+                .any(|device| device.id == selection || device.name == selection),
+            None => !devices.is_empty(),
+        }
+    }
+}
+
+fn output_recovery_source_path(source: &OutputRecoverySource) -> Option<PathBuf> {
+    match source {
+        OutputRecoverySource::Idle => None,
+        OutputRecoverySource::Local { path } => Some(path.clone()),
+        OutputRecoverySource::Streaming { cache_path, .. } => cache_path.clone(),
+    }
+}
+
+fn capture_output_recovery_base(
+    player: &AudioPlayer,
+    current_context: Option<&super::identity::PlaybackContext>,
+    current_buffer: Option<&SharedBuffer>,
+    source_revision: u64,
+) -> OutputRecoveryBase {
+    let info = player.get_info();
+    let context = current_context.cloned();
+    let source = if context.is_none() || !player.has_current_sink() {
+        OutputRecoverySource::Idle
+    } else if player.is_streaming() {
+        current_buffer
+            .cloned()
+            .map(|shared_buffer| OutputRecoverySource::Streaming {
+                shared_buffer,
+                cache_path: player.current_path(),
+            })
+            .unwrap_or(OutputRecoverySource::Idle)
+    } else {
+        player
+            .current_path()
+            .map(|path| OutputRecoverySource::Local { path })
+            .unwrap_or(OutputRecoverySource::Idle)
+    };
+    let intent = if matches!(
+        info.status,
+        PlaybackStatus::Playing | PlaybackStatus::Buffering { .. }
+    ) {
+        OutputRecoveryIntent::Playing
+    } else {
+        OutputRecoveryIntent::Paused
+    };
+    OutputRecoveryBase {
+        context,
+        source_revision,
+        source,
+        position: info.position,
+        duration: info.duration,
+        intent,
+        volume: info.volume,
+        track_gain: player.current_track_gain(),
+        pending_seek: None,
+    }
+}
+
+fn detach_output_runtime(
+    player: &mut AudioPlayer,
+    state: &SharedPlaybackState,
+    current_buffer: Option<&SharedBuffer>,
+    preloaded_sinks: &mut HashMap<u64, PreloadedSink>,
+    scheduled_transition: &mut Option<ScheduledPreloadedTransition>,
+    transition_scheduler: &mut super::automix::AudioClockScheduler,
+    base: &OutputRecoveryBase,
+) {
+    cancel_scheduled_transition(scheduled_transition, transition_scheduler, preloaded_sinks);
+    for (_, preloaded) in preloaded_sinks.drain() {
+        cancel_preloaded_streaming_buffer(&preloaded);
+    }
+    if matches!(base.source, OutputRecoverySource::Streaming { .. }) {
+        if let Some(buffer) = current_buffer {
+            buffer.clear_buffer_callback();
+        }
+        player.cancel_current_streaming_reader();
+    }
+    player.stop();
+    state.set_output_recovery_state(
+        base.position,
+        base.duration,
+        base.volume,
+        output_recovery_source_path(&base.source),
+        base.context.is_some() && !matches!(base.source, OutputRecoverySource::Idle),
+    );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an output attempt joins one immutable snapshot with actor-owned channels"
+)]
+fn submit_output_recovery_attempt(
+    coordinator: &mut OutputRecoveryCoordinator,
+    worker: &OutputRecoveryWorker,
+    device_signals: &DeviceSignalMailbox,
+    event_tx: &AudioEventSender,
+    player: &AudioPlayer,
+    reason: OutputRecoveryReason,
+    retry_count: u8,
+    announce: bool,
+) {
+    let Some(base) = coordinator.base.clone() else {
+        return;
+    };
+    let attempt = coordinator.reserve_attempt(retry_count);
+    let snapshot = OutputRecoverySnapshot {
+        recovery_id: attempt.recovery_id,
+        output_generation: attempt.output_generation,
+        requested_selection: coordinator.desired_selection.clone(),
+        reason,
+        context: base.context.clone(),
+        source_revision: base.source_revision,
+        source: base.source.clone(),
+        position: base.position,
+        duration: base.duration,
+        intent: base.intent,
+        volume: base.volume,
+        track_gain: base.track_gain,
+    };
+    coordinator.inflight = Some(attempt);
+    coordinator.retry_at = None;
+    coordinator.inflight_failure = None;
+    coordinator.stall_detector.reset();
+
+    if announce {
+        let _ = event_tx.send(AudioEvent::OutputRecoveryStarted {
+            recovery_id: attempt.recovery_id,
+            reason,
+            requested_selection: snapshot.requested_selection.clone(),
+            context: snapshot.context.clone(),
+            position: snapshot.position,
+            intent: snapshot.intent,
+        });
+    }
+
+    let request = OutputRecoveryRequest {
+        snapshot: snapshot.clone(),
+        chain: player.processing_chain(),
+        device_signals: device_signals.clone(),
+    };
+    if let Err(rejected) = worker.try_submit(request) {
+        let (error, _) = *rejected;
+        coordinator.inflight = None;
+        coordinator.output_broken = true;
+        let _ = event_tx.send(AudioEvent::OutputRecoveryFailed {
+            recovery_id: snapshot.recovery_id,
+            reason,
+            requested_selection: snapshot.requested_selection,
+            context: snapshot.context,
+            position: snapshot.position,
+            error,
+        });
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery request owns the detach boundary for playback, preloads, and Automix"
+)]
+fn request_output_recovery(
+    coordinator: &mut OutputRecoveryCoordinator,
+    worker: &OutputRecoveryWorker,
+    device_signals: &DeviceSignalMailbox,
+    event_tx: &AudioEventSender,
+    player: &mut AudioPlayer,
+    state: &SharedPlaybackState,
+    current_context: Option<&super::identity::PlaybackContext>,
+    current_buffer: Option<&SharedBuffer>,
+    preloaded_sinks: &mut HashMap<u64, PreloadedSink>,
+    scheduled_transition: &mut Option<ScheduledPreloadedTransition>,
+    transition_scheduler: &mut super::automix::AudioClockScheduler,
+    reason: OutputRecoveryReason,
+    selection_update: Option<Option<String>>,
+) {
+    if let Some(selection) = selection_update {
+        coordinator.desired_selection = selection;
+    }
+    if matches!(
+        reason,
+        OutputRecoveryReason::StreamFailed | OutputRecoveryReason::OutputStalled
+    ) {
+        coordinator.output_broken = true;
+    }
+    coordinator.retry_at = None;
+
+    if coordinator.inflight.is_some() {
+        coordinator.pending_reason = Some(reason);
+        return;
+    }
+
+    if coordinator.base.is_none() {
+        let base = capture_output_recovery_base(
+            player,
+            current_context,
+            current_buffer,
+            coordinator.source_revision,
+        );
+        detach_output_runtime(
+            player,
+            state,
+            current_buffer,
+            preloaded_sinks,
+            scheduled_transition,
+            transition_scheduler,
+            &base,
+        );
+        coordinator.base = Some(base);
+    }
+
+    submit_output_recovery_attempt(
+        coordinator,
+        worker,
+        device_signals,
+        event_tx,
+        player,
+        reason,
+        0,
+        true,
+    );
+}
+
+fn poll_output_recovery_retry(
+    coordinator: &mut OutputRecoveryCoordinator,
+    worker: &OutputRecoveryWorker,
+    device_signals: &DeviceSignalMailbox,
+    event_tx: &AudioEventSender,
+    player: &AudioPlayer,
+    now: Instant,
+) {
+    let Some((deadline, reason)) = coordinator.retry_at else {
+        return;
+    };
+    if now < deadline || coordinator.inflight.is_some() {
+        return;
+    }
+    coordinator.retry_at = None;
+    submit_output_recovery_attempt(
+        coordinator,
+        worker,
+        device_signals,
+        event_tx,
+        player,
+        reason,
+        1,
+        false,
+    );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery commit validates actor identity before replacing all output-owned state"
+)]
+fn handle_output_recovery_result(
+    result: PreparedOutputRecovery,
+    coordinator: &mut OutputRecoveryCoordinator,
+    worker: &OutputRecoveryWorker,
+    device_signals: &DeviceSignalMailbox,
+    player: &mut AudioPlayer,
+    buffer_mailbox: &BufferDataMailbox,
+    event_tx: &AudioEventSender,
+    state: &SharedPlaybackState,
+    current_buffer: Option<&SharedBuffer>,
+    current_context: Option<&super::identity::PlaybackContext>,
+    preloaded_sinks: &mut HashMap<u64, PreloadedSink>,
+    scheduled_transition: &mut Option<ScheduledPreloadedTransition>,
+    transition_scheduler: &mut super::automix::AudioClockScheduler,
+) {
+    let PreparedOutputRecovery {
+        snapshot,
+        candidate,
+    } = result;
+    let attempt = coordinator.inflight.filter(|attempt| {
+        attempt.recovery_id == snapshot.recovery_id
+            && attempt.output_generation == snapshot.output_generation
+    });
+    let Some(attempt) = attempt else {
+        if let Ok(candidate) = candidate {
+            candidate.discard();
+        }
+        return;
+    };
+    coordinator.inflight = None;
+    let candidate = match coordinator.inflight_failure.take() {
+        Some(failure) if failure.generation == snapshot.output_generation.0 => {
+            if let Ok(candidate) = candidate {
+                candidate.discard();
+            }
+            Err(failure.error)
+        }
+        _ => candidate,
+    };
+
+    let source_changed = coordinator.source_revision != snapshot.source_revision
+        || current_context != snapshot.context.as_ref();
+    let superseded = source_changed
+        || coordinator.pending_reason.is_some()
+        || coordinator.desired_selection != snapshot.requested_selection;
+    if superseded {
+        if let Ok(candidate) = candidate {
+            candidate.discard();
+        }
+        let retained_base_is_current = coordinator.base.as_ref().is_some_and(|base| {
+            base.source_revision == coordinator.source_revision
+                && base.context.as_ref() == current_context
+        });
+        if source_changed && !retained_base_is_current {
+            coordinator.base = None;
+        }
+        let reason = coordinator.pending_reason.take().unwrap_or(snapshot.reason);
+        request_output_recovery(
+            coordinator,
+            worker,
+            device_signals,
+            event_tx,
+            player,
+            state,
+            current_context,
+            current_buffer,
+            preloaded_sinks,
+            scheduled_transition,
+            transition_scheduler,
+            reason,
+            None,
+        );
+        return;
+    }
+
+    match candidate {
+        Ok(mut candidate) => {
+            let Some(base) = coordinator.base.take() else {
+                candidate.discard();
+                return;
+            };
+            let resolved_selection = candidate.selected_device_id();
+            let active_device = candidate.active_device().clone();
+            let final_intent = base.intent;
+            if final_intent == OutputRecoveryIntent::Playing
+                && !matches!(&base.source, OutputRecoverySource::Idle)
+            {
+                candidate.resume();
+            }
+            candidate.activate_current_runtime();
+            let previous = std::mem::replace(player, candidate);
+            previous.discard();
+
+            if let OutputRecoverySource::Streaming { shared_buffer, .. } = &base.source
+                && let Some(context) = base.context.as_ref()
+            {
+                setup_buffer_callback(shared_buffer, buffer_mailbox, context);
+            }
+            update_state_from_player(player, state);
+            state.set_current_path(output_recovery_source_path(&base.source));
+
+            coordinator.active_output_generation = snapshot.output_generation;
+            coordinator.desired_selection = if snapshot.requested_selection.is_some() {
+                resolved_selection.clone()
+            } else {
+                None
+            };
+            coordinator.selection_degraded = false;
+            coordinator.output_broken = false;
+            coordinator.retry_at = None;
+            coordinator.pending_reason = None;
+            coordinator.stall_detector.reset();
+
+            if let (Some(context), Some(nonce)) = (base.context.as_ref(), base.pending_seek) {
+                let _ = event_tx.send(AudioEvent::SeekComplete {
+                    context: context.clone(),
+                    nonce,
+                    position: player.get_info().position,
+                });
+            }
+
+            let _ = event_tx.send(AudioEvent::OutputRecovered {
+                recovery_id: snapshot.recovery_id,
+                output_generation: snapshot.output_generation,
+                reason: snapshot.reason,
+                requested_selection: snapshot.requested_selection,
+                resolved_selection,
+                active_device,
+                context: base.context,
+                position: player.get_info().position,
+                intent: final_intent,
+            });
+        }
+        Err(error) => {
+            coordinator.output_broken = true;
+            if should_retry_output(attempt.retry_count, &error) {
+                coordinator.retry_at = Some((
+                    Instant::now() + OUTPUT_RECOVERY_RETRY_DELAY,
+                    snapshot.reason,
+                ));
+                let _ = event_tx.send(AudioEvent::OutputRecoveryRetryScheduled {
+                    recovery_id: snapshot.recovery_id,
+                    reason: snapshot.reason,
+                    requested_selection: snapshot.requested_selection,
+                    error,
+                });
+            } else {
+                let base = coordinator.base.as_ref();
+                let _ = event_tx.send(AudioEvent::OutputRecoveryFailed {
+                    recovery_id: snapshot.recovery_id,
+                    reason: snapshot.reason,
+                    requested_selection: snapshot.requested_selection,
+                    context: base.and_then(|base| base.context.clone()),
+                    position: base.map_or(snapshot.position, |base| base.position),
+                    error,
+                });
+            }
+        }
+    }
+}
+
 pub struct AudioThreadHandle {
     pub handle: AudioHandle,
     pub event_rx: Option<super::events::AudioEventReceiver>,
     thread_handle: Option<JoinHandle<()>>,
+    device_watcher: Option<DeviceWatcher>,
 }
 
 impl AudioThreadHandle {
@@ -519,6 +1075,9 @@ impl AudioThreadHandle {
 
 impl Drop for AudioThreadHandle {
     fn drop(&mut self) {
+        if let Some(mut watcher) = self.device_watcher.take() {
+            watcher.stop();
+        }
         self.handle.shutdown();
         // Intentionally detach in every case. The audio thread owns its backend
         // resources and must never be joined from arbitrary UI teardown paths.
@@ -546,12 +1105,16 @@ pub fn spawn_audio_thread_with(
     let (command_tx, command_rx) = audio_command_channel();
     let (event_tx, event_rx) = audio_event_channel();
     let latest_controls = LatestControlMailbox::new(command_tx.clone());
+    let device_signals = DeviceSignalMailbox::new(command_tx.clone());
     let (preparation_result_tx, preparation_result_rx) =
         tokio::sync::mpsc::channel(STREAMING_PREPARATION_RESULT_CAPACITY);
     let preparation_pool = StreamingPreparationPool::new(preparation_result_tx, spawn_worker)?;
     let (seek_result_tx, seek_result_rx) =
         tokio::sync::mpsc::channel(STREAMING_SEEK_RESULT_CAPACITY);
     let seek_worker = StreamingSeekWorker::new(seek_result_tx, spawn_worker)?;
+    let (output_recovery_result_tx, output_recovery_result_rx) = tokio::sync::mpsc::channel(2);
+    let output_recovery_worker =
+        OutputRecoveryWorker::new(output_recovery_result_tx, spawn_worker)?;
 
     // Create shared state
     let state = SharedPlaybackState::new();
@@ -567,6 +1130,10 @@ pub fn spawn_audio_thread_with(
 
     // Clone device name for thread
     let device_name_owned = device_name.map(|s| s.to_string());
+    let initial_requested_selection = device_name_owned.clone();
+    let device_signals_for_actor = device_signals.clone();
+    let output_failure_signals = device_signals.clone();
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
 
     // Spawn audio thread
     let thread_handle = spawn_worker(
@@ -574,48 +1141,106 @@ pub fn spawn_audio_thread_with(
         "audio_control_actor",
         Box::new(move || {
             // Create player in audio thread
-            let player_result = if let Some(ref name) = device_name_owned {
-                AudioPlayer::with_device(Some(name), chain)
-            } else {
-                AudioPlayer::new(chain)
-            };
+            let output_failure_callback: device::OutputFailureCallback =
+                std::sync::Arc::new(move |error| {
+                    output_failure_signals.publish_output_failure(1, error);
+                });
+            let player_result = initialize_output(device_name_owned.as_deref(), |selection| {
+                AudioPlayer::with_device_observer(
+                    selection,
+                    chain.clone(),
+                    std::sync::Arc::clone(&output_failure_callback),
+                )
+            });
 
             match player_result {
-                Ok(player) => {
+                Ok(initial_output) => {
+                    if let Some(error) = initial_output.fallback_from.as_ref() {
+                        tracing::warn!(
+                            %error,
+                            "Configured audio output is unavailable; using the system default temporarily"
+                        );
+                    }
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_time()
                         .build();
                     match runtime {
-                        Ok(runtime) => runtime.block_on(audio_thread_main(
-                            player,
-                            command_rx,
-                            buffer_mailbox,
-                            latest_controls,
-                            event_tx,
-                            state_clone,
-                            generation_controller,
-                            preparation_pool,
-                            preparation_result_rx,
-                            seek_worker,
-                            seek_result_rx,
-                        )),
+                        Ok(runtime) => {
+                            let _ = startup_tx.send(Ok(()));
+                            runtime.block_on(audio_thread_main(
+                                initial_output.output,
+                                command_rx,
+                                buffer_mailbox,
+                                latest_controls,
+                                event_tx,
+                                state_clone,
+                                generation_controller,
+                                device_signals_for_actor,
+                                preparation_pool,
+                                preparation_result_rx,
+                                seek_worker,
+                                seek_result_rx,
+                                output_recovery_worker,
+                                output_recovery_result_rx,
+                                initial_requested_selection,
+                            ));
+                        }
                         Err(error) => {
+                            let startup_error = PlaybackError::ControlUnavailable(format!(
+                                "failed to create audio control runtime: {error}"
+                            ));
+                            let _ = startup_tx.send(Err(startup_error));
                             tracing::error!("Failed to create audio control runtime: {}", error);
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to create audio player: {}", e);
+                Err(error) => {
+                    let _ = startup_tx.send(Err(error.clone()));
+                    tracing::error!("Failed to create audio player: {}", error);
                 }
             }
         }),
     )
     .map_err(|error| PlaybackError::ControlUnavailable(error.to_string()))?;
 
+    match startup_rx.recv_timeout(AUDIO_STARTUP_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            handle.shutdown();
+            return Err(PlaybackError::ControlUnavailable(
+                "audio control actor did not become ready before the startup deadline".to_string(),
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(PlaybackError::ControlUnavailable(
+                "audio control actor stopped during startup".to_string(),
+            ));
+        }
+    }
+
+    let watcher_signals = device_signals.clone();
+    let watcher_supported = DeviceWatcher::is_supported();
+    let device_watcher = match DeviceWatcher::new(Box::new(move |change| {
+        watcher_signals.publish_topology(device::get_audio_devices(), change.default_changed);
+    })) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                watcher_supported,
+                "Native audio device watcher is unavailable"
+            );
+            None
+        }
+    };
+    device_signals.publish_topology(device::get_audio_devices(), false);
+
     Ok(AudioThreadHandle {
         handle,
         event_rx: Some(event_rx),
         thread_handle: Some(thread_handle),
+        device_watcher,
     })
 }
 
@@ -637,12 +1262,27 @@ async fn audio_thread_main(
     event_tx: AudioEventSender,
     state: SharedPlaybackState,
     generation: super::identity::PlaybackGenerationController,
+    device_signals: DeviceSignalMailbox,
     preparation_pool: StreamingPreparationPool,
     mut preparation_result_rx: tokio::sync::mpsc::Receiver<StreamingPreparationResult>,
     seek_worker: StreamingSeekWorker,
     mut seek_result_rx: tokio::sync::mpsc::Receiver<StreamingSeekResult>,
+    output_recovery_worker: OutputRecoveryWorker,
+    mut output_recovery_result_rx: tokio::sync::mpsc::Receiver<PreparedOutputRecovery>,
+    initial_requested_selection: Option<String>,
 ) {
     tracing::info!("Audio thread started");
+
+    let mut output_recovery = OutputRecoveryCoordinator::new(
+        initial_requested_selection.clone(),
+        player.selected_device_id(),
+    );
+    let _ = event_tx.send(AudioEvent::OutputReady {
+        requested_selection: initial_requested_selection,
+        resolved_selection: player.selected_device_id(),
+        active_device: player.active_device().clone(),
+        output_generation: output_recovery.active_output_generation,
+    });
 
     // Storage for preloaded sinks (request_id -> PreloadedSink)
     let mut preloaded_sinks: HashMap<u64, PreloadedSink> = HashMap::new();
@@ -670,6 +1310,7 @@ async fn audio_thread_main(
             &mut command_rx,
             &mut preparation_result_rx,
             &mut seek_result_rx,
+            &mut output_recovery_result_rx,
             next_maintenance,
         )
         .await;
@@ -686,6 +1327,128 @@ async fn audio_thread_main(
                 );
             }
             next_maintenance = now + CONTROL_MAINTENANCE_INTERVAL;
+        }
+
+        let device_batch = device_signals.take();
+        let topology_retry = device_batch
+            .devices
+            .as_deref()
+            .is_some_and(|devices| output_recovery.should_retry_after_topology(devices));
+        if let Some(devices) = device_batch.devices {
+            let _ = event_tx.send(AudioEvent::DevicesChanged {
+                devices,
+                default_device_id: device_batch.default_device_id,
+            });
+        }
+        if device_batch.default_changed && output_recovery.desired_selection.is_none() {
+            tracing::info!("System default audio output changed");
+            request_output_recovery(
+                &mut output_recovery,
+                &output_recovery_worker,
+                &device_signals,
+                &event_tx,
+                &mut player,
+                &state,
+                current_context.as_ref(),
+                current_buffer.as_ref(),
+                &mut preloaded_sinks,
+                &mut scheduled_transition,
+                &mut transition_scheduler,
+                OutputRecoveryReason::DefaultDeviceChanged,
+                None,
+            );
+        } else if topology_retry {
+            request_output_recovery(
+                &mut output_recovery,
+                &output_recovery_worker,
+                &device_signals,
+                &event_tx,
+                &mut player,
+                &state,
+                current_context.as_ref(),
+                current_buffer.as_ref(),
+                &mut preloaded_sinks,
+                &mut scheduled_transition,
+                &mut transition_scheduler,
+                OutputRecoveryReason::ExplicitRetry,
+                None,
+            );
+        }
+        if let Some(failure) = device_batch.output_failure {
+            if output_recovery.active_failure_is_actionable(failure.generation) {
+                tracing::warn!(
+                    output_generation = failure.generation,
+                    error = %failure.error,
+                    "Audio output stream reported a runtime failure"
+                );
+                request_output_recovery(
+                    &mut output_recovery,
+                    &output_recovery_worker,
+                    &device_signals,
+                    &event_tx,
+                    &mut player,
+                    &state,
+                    current_context.as_ref(),
+                    current_buffer.as_ref(),
+                    &mut preloaded_sinks,
+                    &mut scheduled_transition,
+                    &mut transition_scheduler,
+                    OutputRecoveryReason::StreamFailed,
+                    None,
+                );
+            } else if output_recovery.inflight_failure_is_actionable(failure.generation) {
+                tracing::warn!(
+                    output_generation = failure.generation,
+                    error = %failure.error,
+                    "Prepared audio output failed before commit"
+                );
+                output_recovery.inflight_failure = Some(failure);
+            } else {
+                tracing::debug!(
+                    output_generation = failure.generation,
+                    active_output_generation = output_recovery.active_output_generation.0,
+                    "Ignored stale audio output failure"
+                );
+            }
+        }
+
+        if maintenance_due {
+            poll_output_recovery_retry(
+                &mut output_recovery,
+                &output_recovery_worker,
+                &device_signals,
+                &event_tx,
+                &player,
+                Instant::now(),
+            );
+            let playback_info = state.get_info();
+            let stall_eligible = !output_recovery.is_recovering()
+                && !output_recovery.output_broken
+                && player.has_current_sink()
+                && current_context.is_some()
+                && playback_info.status == PlaybackStatus::Playing;
+            let stalled = output_recovery.stall_detector.sample(
+                Instant::now(),
+                player.get_info().position,
+                stall_eligible,
+            );
+            if stalled {
+                request_output_recovery(
+                    &mut output_recovery,
+                    &output_recovery_worker,
+                    &device_signals,
+                    &event_tx,
+                    &mut player,
+                    &state,
+                    current_context.as_ref(),
+                    current_buffer.as_ref(),
+                    &mut preloaded_sinks,
+                    &mut scheduled_transition,
+                    &mut transition_scheduler,
+                    OutputRecoveryReason::OutputStalled,
+                    None,
+                );
+            }
         }
 
         let cmd = match event {
@@ -721,6 +1484,9 @@ async fn audio_thread_main(
                 continue;
             }
             ControlEvent::Prepared(prepared) => {
+                if matches!(&prepared, StreamingPreparationResult::Playback(_)) {
+                    output_recovery.note_source_changed();
+                }
                 handle_streaming_preparation_result(
                     prepared,
                     &mut player,
@@ -790,8 +1556,39 @@ async fn audio_thread_main(
                 }
                 continue;
             }
+            ControlEvent::OutputRecoveryFinished(result) => {
+                handle_output_recovery_result(
+                    *result,
+                    &mut output_recovery,
+                    &output_recovery_worker,
+                    &device_signals,
+                    &mut player,
+                    &buffer_mailbox,
+                    &event_tx,
+                    &state,
+                    current_buffer.as_ref(),
+                    current_context.as_ref(),
+                    &mut preloaded_sinks,
+                    &mut scheduled_transition,
+                    &mut transition_scheduler,
+                );
+                continue;
+            }
             ControlEvent::Command(cmd) => cmd,
         };
+
+        if matches!(
+            &cmd,
+            AudioCommand::Play { .. }
+                | AudioCommand::LoadPaused { .. }
+                | AudioCommand::LoadPausedStreaming { .. }
+                | AudioCommand::PlayAt { .. }
+                | AudioCommand::PlayStreaming { .. }
+                | AudioCommand::Stop { .. }
+                | AudioCommand::PlayPreloaded { .. }
+        ) {
+            output_recovery.note_source_changed();
+        }
 
         if matches!(
             &cmd,
@@ -983,6 +1780,20 @@ async fn audio_thread_main(
                 if !generation.accepts(&context) {
                     continue;
                 }
+                if let Some(base) = output_recovery
+                    .base
+                    .as_mut()
+                    .filter(|base| base.context.as_ref() == Some(&context))
+                {
+                    base.intent = OutputRecoveryIntent::Paused;
+                    state.set_status(PlaybackStatus::Paused);
+                    let _ = event_tx.send(AudioEvent::Paused {
+                        context,
+                        request_id: None,
+                        position: base.position,
+                    });
+                    continue;
+                }
                 if current_context.as_ref() != Some(&context) {
                     pause_after_preparation = Some(context.clone());
                 }
@@ -1002,6 +1813,14 @@ async fn audio_thread_main(
 
             AudioCommand::Resume { context, fade_in } => {
                 if !generation.accepts(&context) {
+                    continue;
+                }
+                if let Some(base) = output_recovery
+                    .base
+                    .as_mut()
+                    .filter(|base| base.context.as_ref() == Some(&context))
+                {
+                    base.intent = OutputRecoveryIntent::Playing;
                     continue;
                 }
                 if pause_after_preparation.as_ref() == Some(&context) {
@@ -1057,6 +1876,46 @@ async fn audio_thread_main(
                 position,
             } => {
                 if context.cancellation.is_cancelled() {
+                    continue;
+                }
+                let recovery_seek = if output_recovery
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| base.context.as_ref() == Some(&context))
+                {
+                    output_recovery.source_revision =
+                        output_recovery.source_revision.wrapping_add(1);
+                    if let Some(base) = output_recovery.base.as_mut() {
+                        base.source_revision = output_recovery.source_revision;
+                        base.position = position;
+                        base.pending_seek = Some(nonce);
+                    }
+                    state.set_position(position);
+                    true
+                } else {
+                    false
+                };
+                if recovery_seek {
+                    let _ = event_tx.send(AudioEvent::SeekStarted {
+                        context: context.clone(),
+                        nonce,
+                        target_position: position,
+                    });
+                    request_output_recovery(
+                        &mut output_recovery,
+                        &output_recovery_worker,
+                        &device_signals,
+                        &event_tx,
+                        &mut player,
+                        &state,
+                        current_context.as_ref(),
+                        current_buffer.as_ref(),
+                        &mut preloaded_sinks,
+                        &mut scheduled_transition,
+                        &mut transition_scheduler,
+                        OutputRecoveryReason::ExplicitRetry,
+                        None,
+                    );
                     continue;
                 }
                 let _ = finished_guard.try_mark(context.generation, FinishReason::SeekRebuild);
@@ -1382,14 +2241,39 @@ async fn audio_thread_main(
             }
 
             AudioCommand::SwitchDevice { device_name } => {
-                // Clear all preloaded sinks when switching device (they use old mixer)
-                for preloaded in preloaded_sinks.values() {
-                    cancel_preloaded_streaming_buffer(preloaded);
-                }
-                preloaded_sinks.clear();
-                cancel_current_streaming_buffer(&mut current_buffer);
-                current_context = None;
-                handle_switch_device(&mut player, &event_tx, &state, device_name);
+                request_output_recovery(
+                    &mut output_recovery,
+                    &output_recovery_worker,
+                    &device_signals,
+                    &event_tx,
+                    &mut player,
+                    &state,
+                    current_context.as_ref(),
+                    current_buffer.as_ref(),
+                    &mut preloaded_sinks,
+                    &mut scheduled_transition,
+                    &mut transition_scheduler,
+                    OutputRecoveryReason::ManualSelection,
+                    Some(device_name),
+                );
+            }
+
+            AudioCommand::RetryOutput => {
+                request_output_recovery(
+                    &mut output_recovery,
+                    &output_recovery_worker,
+                    &device_signals,
+                    &event_tx,
+                    &mut player,
+                    &state,
+                    current_context.as_ref(),
+                    current_buffer.as_ref(),
+                    &mut preloaded_sinks,
+                    &mut scheduled_transition,
+                    &mut transition_scheduler,
+                    OutputRecoveryReason::ExplicitRetry,
+                    None,
+                );
             }
 
             AudioCommand::LatestMailboxWake => {}
@@ -1406,6 +2290,8 @@ async fn audio_thread_main(
                     );
                 }
             }
+
+            AudioCommand::DeviceSignalWake => {}
         }
 
         if run_control_maintenance(
@@ -1824,9 +2710,15 @@ fn process_tick(
         check_buffer_status(player, state, event_tx, buf, context);
     }
 
-    let info = player.get_info();
-    state.set_position(info.position);
     let current_status = state.get_info().status;
+    let info = player.get_info();
+    if current_context.is_some()
+        && current_status == PlaybackStatus::Paused
+        && info.status == PlaybackStatus::Stopped
+    {
+        return;
+    }
+    state.set_position(info.position);
     if !matches!(
         current_status,
         PlaybackStatus::Buffering { .. } | PlaybackStatus::Paused
@@ -2747,23 +3639,6 @@ fn handle_play_preloaded(
     }
 }
 
-fn handle_switch_device(
-    player: &mut AudioPlayer,
-    event_tx: &AudioEventSender,
-    state: &SharedPlaybackState,
-    device_name: Option<String>,
-) {
-    match player.switch_device(device_name.as_deref()) {
-        Ok(restore_state) => {
-            update_state_from_player(player, state);
-            let _ = event_tx.send(AudioEvent::DeviceSwitched { restore_state });
-        }
-        Err(e) => {
-            let _ = event_tx.send(AudioEvent::DeviceSwitchFailed { error: e });
-        }
-    }
-}
-
 // ============ Helpers ============
 
 /// Set up buffer callback to send BufferDataAvailable command
@@ -3017,6 +3892,7 @@ mod tests {
             tokio::sync::mpsc::channel(STREAMING_PREPARATION_RESULT_CAPACITY);
         let (seek_result_tx, mut seek_result_rx) =
             tokio::sync::mpsc::channel(STREAMING_SEEK_RESULT_CAPACITY);
+        let (recovery_result_tx, mut recovery_result_rx) = tokio::sync::mpsc::channel(1);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -3026,6 +3902,7 @@ mod tests {
             &mut critical_rx,
             &mut result_rx,
             &mut seek_result_rx,
+            &mut recovery_result_rx,
             tokio::time::Instant::now() + Duration::from_millis(5),
         ));
 
@@ -3034,6 +3911,7 @@ mod tests {
         drop(critical_tx);
         drop(result_tx);
         drop(seek_result_tx);
+        drop(recovery_result_tx);
     }
 
     #[test]
@@ -3077,6 +3955,7 @@ mod tests {
             tokio::sync::mpsc::channel(STREAMING_PREPARATION_RESULT_CAPACITY);
         let (_other_seek_tx, mut other_seek_rx) =
             tokio::sync::mpsc::channel(STREAMING_SEEK_RESULT_CAPACITY);
+        let (_recovery_tx, mut recovery_rx) = tokio::sync::mpsc::channel(1);
         let stop_context = generation.activate_generation();
         critical_tx
             .try_send(AudioCommand::Stop {
@@ -3091,6 +3970,7 @@ mod tests {
             &mut critical_rx,
             &mut preparation_rx,
             &mut other_seek_rx,
+            &mut recovery_rx,
             tokio::time::Instant::now() + Duration::from_millis(300),
         ));
         assert!(matches!(
@@ -3298,5 +4178,147 @@ mod tests {
         assert!(!policy.should_enter_buffering(policy.low_water_mark_bytes(), false));
         assert!(!policy.should_enter_buffering(policy.high_water_mark_bytes() - 1, false));
         assert!(!policy.should_enter_buffering(0, true));
+    }
+
+    #[test]
+    fn output_failure_gates_prevent_retry_loops_and_accept_inflight_failures() {
+        let mut coordinator = OutputRecoveryCoordinator::new(None, None);
+        assert!(coordinator.active_failure_is_actionable(1));
+
+        coordinator.output_broken = true;
+        assert!(!coordinator.active_failure_is_actionable(1));
+
+        coordinator.output_broken = false;
+        coordinator.inflight = Some(OutputRecoveryAttempt {
+            recovery_id: OutputRecoveryId(1),
+            output_generation: OutputGeneration(2),
+            retry_count: 0,
+        });
+        assert!(!coordinator.active_failure_is_actionable(1));
+        assert!(coordinator.inflight_failure_is_actionable(2));
+        assert!(!coordinator.inflight_failure_is_actionable(3));
+    }
+
+    #[test]
+    fn broken_fixed_output_retries_only_after_its_device_returns() {
+        let mut coordinator = OutputRecoveryCoordinator::new(
+            Some("device-b".to_string()),
+            Some("device-b".to_string()),
+        );
+        coordinator.output_broken = true;
+        let device_a = device::AudioDevice {
+            id: "device-a".to_string(),
+            name: "Speakers".to_string(),
+            is_default: true,
+        };
+        let device_b = device::AudioDevice {
+            id: "device-b".to_string(),
+            name: "USB DAC".to_string(),
+            is_default: false,
+        };
+
+        assert!(!coordinator.should_retry_after_topology(std::slice::from_ref(&device_a)));
+        assert!(coordinator.should_retry_after_topology(&[device_a, device_b]));
+    }
+
+    #[test]
+    fn configured_output_falls_back_to_default_without_losing_the_first_error() {
+        let mut attempts = Vec::new();
+        let initialized = initialize_output(Some("usb-dac"), |selection| {
+            attempts.push(selection.map(str::to_owned));
+            if selection.is_some() {
+                Err(PlaybackError::DeviceUnavailable(
+                    "configured endpoint is offline".to_string(),
+                ))
+            } else {
+                Ok("system-default")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            attempts,
+            vec![Some("usb-dac".to_string()), None],
+            "the configured output must be attempted before the temporary fallback"
+        );
+        assert_eq!(initialized.output, "system-default");
+        assert!(matches!(
+            initialized.fallback_from,
+            Some(PlaybackError::DeviceUnavailable(message))
+                if message == "configured endpoint is offline"
+        ));
+    }
+
+    #[test]
+    fn follow_default_startup_never_retries_the_same_default_as_a_fallback() {
+        let mut attempts = 0;
+        let error = initialize_output::<()>(None, |_| {
+            attempts += 1;
+            Err(PlaybackError::DeviceUnavailable(
+                "no default output".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            error,
+            PlaybackError::DeviceUnavailable("no default output".to_string())
+        );
+    }
+
+    #[test]
+    fn temporary_default_keeps_fixed_selection_degraded_until_it_returns() {
+        let coordinator = OutputRecoveryCoordinator::new(Some("device-b".to_string()), None);
+        let device_a = device::AudioDevice {
+            id: "device-a".to_string(),
+            name: "Speakers".to_string(),
+            is_default: true,
+        };
+        let device_b = device::AudioDevice {
+            id: "device-b".to_string(),
+            name: "USB DAC".to_string(),
+            is_default: false,
+        };
+
+        assert_eq!(coordinator.desired_selection.as_deref(), Some("device-b"));
+        assert!(coordinator.selection_degraded);
+        assert!(!coordinator.output_broken);
+        assert!(coordinator.active_failure_is_actionable(1));
+        assert!(!coordinator.should_retry_after_topology(std::slice::from_ref(&device_a)));
+        assert!(coordinator.should_retry_after_topology(&[device_a, device_b]));
+    }
+
+    #[test]
+    fn legacy_name_degraded_selection_retries_by_display_name() {
+        let coordinator = OutputRecoveryCoordinator::new(Some("USB DAC".to_string()), None);
+        let device = device::AudioDevice {
+            id: "stable-device-b".to_string(),
+            name: "USB DAC".to_string(),
+            is_default: false,
+        };
+
+        assert!(coordinator.should_retry_after_topology(&[device]));
+    }
+
+    #[test]
+    fn successful_legacy_resolution_uses_the_stable_id_without_degraded_retry() {
+        let coordinator = OutputRecoveryCoordinator::new(
+            Some("USB DAC".to_string()),
+            Some("stable-device-b".to_string()),
+        );
+
+        assert_eq!(
+            coordinator.desired_selection.as_deref(),
+            Some("stable-device-b")
+        );
+        assert!(!coordinator.selection_degraded);
+        assert!(
+            !coordinator.should_retry_after_topology(&[device::AudioDevice {
+                id: "stable-device-b".to_string(),
+                name: "USB DAC".to_string(),
+                is_default: false,
+            }])
+        );
     }
 }
