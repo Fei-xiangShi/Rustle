@@ -969,6 +969,20 @@ impl SharedBuffer {
         self.read_at_with_reader_cancel(position, buf, None)
     }
 
+    fn demand_unavailable_error(&self, reader: &StreamingReaderCancellation) -> io::Error {
+        // cancel() publishes cancellation before releasing the demand lease.
+        // Recheck after observing that release, rather than reporting a
+        // cancelled owner as a speculative reader that merely lacks demand.
+        if self.is_cancelled() || reader.is_cancelled() {
+            io::Error::new(io::ErrorKind::Interrupted, "Streaming reader cancelled")
+        } else {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "streaming reader does not own retained-window demand",
+            )
+        }
+    }
+
     fn read_at_with_reader_cancel(
         &self,
         position: u64,
@@ -1038,14 +1052,12 @@ impl SharedBuffer {
             }
 
             if (position < base || position >= downloaded)
-                && reader_cancellation.is_some_and(|reader| !reader.owns_demand())
+                && let Some(reader) = reader_cancellation
+                && !reader.owns_demand()
             {
                 // A speculative decoder cannot turn its own cache miss into
                 // a shared timeout that kills the active playback.
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "streaming reader does not own retained-window demand",
-                ));
+                return Err(self.demand_unavailable_error(reader));
             }
 
             if position < downloaded {
@@ -1064,11 +1076,8 @@ impl SharedBuffer {
                     }
                     if reader_cancellation.is_some_and(StreamingReaderCancellation::owns_demand) {
                         self.request_window(position);
-                    } else if reader_cancellation.is_some() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "streaming reader does not own retained-window demand",
-                        ));
+                    } else if let Some(reader) = reader_cancellation {
+                        return Err(self.demand_unavailable_error(reader));
                     } else {
                         self.request_window(position);
                     }
@@ -1438,10 +1447,9 @@ impl Seek for StreamingBuffer {
             // network demand lease retained by the outgoing decoder.
         } else if new_pos < base || (new_pos >= end && new_pos < total) {
             if !self.reader_cancellation.owns_demand() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "streaming reader does not own retained-window demand",
-                ));
+                return Err(self
+                    .shared
+                    .demand_unavailable_error(&self.reader_cancellation));
             }
             self.shared.request_window(new_pos);
         } else if self.reader_cancellation.owns_demand() && self.shared.requested_window().is_some()
@@ -3305,6 +3313,46 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_after_initial_read_check_takes_priority_over_released_demand() {
+        let shared = SharedBuffer::new(100);
+        shared.set_coordinator_active_for_test(true);
+        let reader = StreamingBuffer::new(shared.clone());
+        let cancellation = reader.reader_cancellation();
+        assert!(cancellation.owns_demand());
+
+        let error = shared
+            .read_at_with_clock(0, &mut [0; 1], Some(&cancellation), || {
+                // The first clock sample is after the entry cancellation check.
+                // Reproduce cancellation releasing the lease before the miss check.
+                cancellation.cancel();
+                Instant::now()
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(shared.health(), SharedBufferHealth::Refillable);
+        assert!(!shared.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_reader_seek_miss_is_interrupted_without_poisoning_shared_health() {
+        let shared = SharedBuffer::new(100);
+        shared.set_coordinator_active_for_test(true);
+        let mut reader = StreamingBuffer::new(shared.clone());
+        reader.reader_cancellation().cancel();
+
+        let error = reader.seek(SeekFrom::Start(10)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(shared.health(), SharedBufferHealth::Refillable);
+
+        shared.append(&[7]);
+        let mut replacement = StreamingBuffer::new(shared);
+        let mut byte = [0; 1];
+        assert_eq!(replacement.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [7]);
+    }
+
+    #[test]
     fn reader_cancellation_wakes_only_that_reader_without_poisoning_shared_health() {
         let shared = SharedBuffer::new(100);
         shared.set_coordinator_active_for_test(true);
@@ -3327,27 +3375,37 @@ mod tests {
     }
 
     #[test]
-    fn shared_cancellation_wakes_all_reader_tokens() {
+    fn shared_cancellation_interrupts_all_reader_tokens() {
         let shared = SharedBuffer::new(100);
         shared.set_coordinator_active_for_test(true);
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
 
         for _ in 0..2 {
             let mut reader = StreamingBuffer::new(shared.clone());
             let result_tx = result_tx.clone();
-            std::thread::spawn(move || {
+            let cancelled = Arc::clone(&cancelled);
+            workers.push(std::thread::spawn(move || {
+                // Only one reader owns demand; the other would correctly
+                // return WouldBlock if allowed to read before cancellation.
+                cancelled.wait();
                 let result = reader.read(&mut [0; 1]).map_err(|error| error.kind());
                 let _ = result_tx.send(result);
-            });
+            }));
         }
         drop(result_tx);
 
         shared.cancel_coordinator();
+        cancelled.wait();
         for _ in 0..2 {
             assert_eq!(
                 result_rx.recv_timeout(Duration::from_millis(500)).unwrap(),
                 Err(io::ErrorKind::Interrupted)
             );
+        }
+        for worker in workers {
+            worker.join().unwrap();
         }
         assert_eq!(shared.health(), SharedBufferHealth::Cancelled);
     }
