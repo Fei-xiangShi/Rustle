@@ -84,8 +84,11 @@ jobs:
   linux-appimage:
     name: Linux x86_64 AppImage
     needs: release-preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
         with:
@@ -97,12 +100,12 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y fuse imagemagick libfuse2 libasound2-dev libpipewire-0.3-dev libclang-dev libudev-dev libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+          sudo apt-get install --no-install-recommends -y imagemagick libasound2-dev libpipewire-0.3-dev libclang-dev libudev-dev libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config patchelf dbus-x11 xvfb xauth xdotool libgl1-mesa-dri mesa-vulkan-drivers
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-linux-x86_64
+          shared-key: rust-linux-x86_64-glibc-2.35
           cache-on-failure: false
           save-if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
 
@@ -131,15 +134,15 @@ jobs:
             convert -size 256x256 xc:pink AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png 2>/dev/null || touch AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png
           fi
 
-          cat > AppDir/AppRun << APPRUN
+          cat > AppRun << APPRUN
           #!/bin/bash
           SELF=\$(readlink -f "\$0")
           HERE=\${SELF%/*}
           export PATH="\${HERE}/usr/bin:\${PATH}"
-          export LD_LIBRARY_PATH="\${HERE}/usr/lib:\${LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH="\${HERE}/usr/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
           exec "\${HERE}/usr/bin/${{ env.APP_NAME }}" "\$@"
           APPRUN
-          chmod +x AppDir/AppRun
+          chmod +x AppRun
 
       - name: Link files to AppDir root
         run: |
@@ -147,14 +150,98 @@ jobs:
           ln -sf usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png AppDir/${{ env.APP_ID }}.png
           ln -sf usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png AppDir/.DirIcon
 
-      - name: Download appimagetool
+      - name: Bundle shared libraries
         run: |
-          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl --fail --location --retry 3 -o linuxdeploy-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run --appdir AppDir --executable target/release/${{ env.APP_NAME }} --desktop-file packaging/linux/${{ env.APP_ID }}.desktop --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.APP_ID }}.png --custom-apprun AppRun
+
+      - name: Download appimagetool and static runtime
+        run: |
+          curl --fail --location --retry 3 -o appimagetool-x86_64.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl --fail --location --retry 3 -o runtime-x86_64 https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
           chmod +x appimagetool-x86_64.AppImage
+          # The runtime must not require the host's ELF loader or libfuse2.
+          readelf --file-header runtime-x86_64 > /dev/null
+          if readelf --program-headers runtime-x86_64 | grep -q INTERP; then
+            echo 'AppImage runtime is not static' >&2
+            exit 1
+          fi
+
+      - name: Check bundled glibc requirements
+        run: |
+          python3 - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          limit = (2, 35)
+          checked = 0
+          for path in Path('AppDir').rglob('*'):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              with path.open('rb') as stream:
+                  if stream.read(4) != b'\x7fELF':
+                      continue
+              versions = subprocess.check_output(['readelf', '--version-info', str(path)], text=True)
+              required = [tuple(map(int, version.split('.')))
+                          for version in re.findall(r'GLIBC_(\d+(?:\.\d+)+)', versions)]
+              if required and max(required) > limit:
+                  raise SystemExit(f'{path} requires glibc {max(required)}, exceeds {limit}')
+              checked += 1
+          if not checked:
+              raise SystemExit('No ELF files found in AppDir')
+          print(f'Checked glibc requirements of {checked} ELF files')
+          PY
 
       - name: Build AppImage
         run: |
-          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir ${{ env.APP_NAME }}-linux-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run --runtime-file runtime-x86_64 AppDir ${{ env.APP_NAME }}-linux-x86_64.AppImage
+
+      - name: Smoke test packaged application
+        run: |
+          ./${{ env.APP_NAME }}-linux-x86_64.AppImage --appimage-extract
+          LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" ldd squashfs-root/usr/bin/${{ env.APP_NAME }} | tee appimage-dependencies.log
+          if grep -q 'not found' appimage-dependencies.log; then
+            exit 1
+          fi
+          export XDG_CONFIG_HOME="$(mktemp -d)"
+          export XDG_DATA_HOME="$(mktemp -d)"
+          export XDG_CACHE_HOME="$(mktemp -d)"
+          dbus-run-session -- xvfb-run -a bash <<'SH'
+          set -euo pipefail
+          unset WAYLAND_DISPLAY
+          ./squashfs-root/AppRun > appimage-startup.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat appimage-startup.log
+              echo 'Packaged application exited before showing a window' >&2
+              exit 1
+            fi
+            if xdotool search --onlyvisible --pid "$app_pid" >/dev/null 2>&1; then
+              sleep 5
+              if kill -0 "$app_pid" 2>/dev/null; then
+                exit 0
+              fi
+              break
+            fi
+            sleep 1
+          done
+          cat appimage-startup.log
+          echo 'Packaged application failed the window/liveness check' >&2
+          exit 1
+          SH
+
+      - name: Upload AppImage diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: appimage-diagnostics
+          path: appimage-*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6

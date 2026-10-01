@@ -89,7 +89,7 @@ pub async fn start_linux_tray(
 }
 
 fn create_icon() -> Vec<Icon> {
-    static ICON_DATA: &[u8] = include_bytes!("../../../assets/icons/icon_256.png");
+    static ICON_DATA: &[u8] = include_bytes!("../../../../assets/icons/icon_256.png");
 
     if let Ok(img) = image::load_from_memory(ICON_DATA) {
         let rgba = img

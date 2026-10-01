@@ -55,21 +55,21 @@ pub fn setup_macos_url_handler(tx: super::ipc::IpcSender) {
                 let desc: Option<Retained<NSAppleEventDescriptor>> = unsafe {
                     msg_send![event, paramDescriptorForKeyword: 0x2d2d2d2du32]
                 };
-                if let Some(desc) = desc {
-                    if let Some(url) = desc.stringValue() {
-                        let url = url.to_string();
-                        tracing::info!("macOS URL handler received: {}", url);
-                        SENDER.with(|sender| {
-                            let Ok(sender) = sender.try_borrow() else {
-                                tracing::warn!("macOS URL sender is already borrowed");
-                                return;
-                            };
-                            if let Some(sender) = sender.as_ref() {
-                                let _ = sender
-                                    .send(super::ipc::IpcMessage::Uri(url));
-                            }
-                        });
-                    }
+                if let Some(desc) = desc
+                    && let Some(url) = desc.stringValue()
+                {
+                    let url = url.to_string();
+                    tracing::info!("macOS URL handler received: {}", url);
+                    SENDER.with(|sender| {
+                        let Ok(sender) = sender.try_borrow() else {
+                            tracing::warn!("macOS URL sender is already borrowed");
+                            return;
+                        };
+                        if let Some(sender) = sender.as_ref() {
+                            let _ = sender
+                                .send(super::ipc::IpcMessage::Uri(url));
+                        }
+                    });
                 }
             }
         }
