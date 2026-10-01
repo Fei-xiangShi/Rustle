@@ -203,38 +203,21 @@ mod tests {
     use super::*;
     use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 
-    fn load_test_font() -> (Vec<u8>, u32) {
-        let mut font_system = FontSystem::new();
-        crate::platform::theme::configure_cosmic_font_system(&mut font_system);
-        let db = font_system.db();
+    const TEST_FONT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fonts/RustleSdfTest.ttf"
+    ));
 
-        for family in [
-            "Noto Sans SC",
-            "Noto Sans CJK SC",
-            "Source Han Sans CN",
-            "Noto Sans",
-            "Arial",
-        ] {
-            if let Some(face) = db.faces().find(|face| {
-                face.families
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(family))
-            }) {
-                let data = match &face.source {
-                    cosmic_text::fontdb::Source::Binary(data) => data.as_ref().as_ref().to_vec(),
-                    cosmic_text::fontdb::Source::File(path) => {
-                        std::fs::read(path).expect("read system font file")
-                    }
-                    cosmic_text::fontdb::Source::SharedFile(_, data) => {
-                        data.as_ref().as_ref().to_vec()
-                    }
-                };
+    fn load_test_font() -> FontRef<'static> {
+        FontRef::try_from_slice(TEST_FONT).expect("valid SDF test font")
+    }
 
-                return (data, face.index);
-            }
-        }
-
-        panic!("No suitable system sans-serif font found for SDF tests");
+    fn test_font_system() -> FontSystem {
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(TEST_FONT.to_vec());
+        db.set_sans_serif_family("Rustle SDF Test");
+        assert_eq!(db.faces().count(), 1);
+        FontSystem::new_with_locale_and_db("en-US".to_string(), db)
     }
 
     #[test]
@@ -255,10 +238,11 @@ mod tests {
 
     #[test]
     fn test_generate_char_a() {
-        let (font_data, face_index) = load_test_font();
-        let font = FontRef::try_from_slice_and_index(&font_data, face_index).unwrap();
+        let font = load_test_font();
         let generator = SdfGenerator::new(64, 4);
-        let bitmap = generator.generate_from_font(&font, font.glyph_id('A'));
+        let glyph = font.glyph_id('A');
+        assert_ne!(glyph.0, 0, "fixture must contain A");
+        let bitmap = generator.generate_from_font(&font, glyph);
 
         assert!(bitmap.is_some());
         let bitmap = bitmap.unwrap();
@@ -269,10 +253,11 @@ mod tests {
 
     #[test]
     fn test_space_returns_none() {
-        let (font_data, face_index) = load_test_font();
-        let font = FontRef::try_from_slice_and_index(&font_data, face_index).unwrap();
+        let font = load_test_font();
         let generator = SdfGenerator::new(64, 4);
-        let bitmap = generator.generate_from_font(&font, font.glyph_id(' '));
+        let glyph = font.glyph_id(' ');
+        assert_ne!(glyph.0, 0, "fixture must contain space");
+        let bitmap = generator.generate_from_font(&font, glyph);
 
         // 空格没有轮廓，应该返回 None
         assert!(bitmap.is_none());
@@ -280,8 +265,7 @@ mod tests {
 
     #[test]
     fn test_generate_from_swash_image_keeps_swash_placement() {
-        let mut font_system = FontSystem::new();
-        crate::platform::theme::configure_cosmic_font_system(&mut font_system);
+        let mut font_system = test_font_system();
 
         let metrics = Metrics::new(64.0, 64.0 * 1.4);
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -294,8 +278,11 @@ mod tests {
         let generator = SdfGenerator::new(64, 12);
         let mut swash_cache = SwashCache::new();
 
+        let mut rendered_glyphs = 0;
         for run in buffer.layout_runs() {
             for glyph in run.glyphs.iter() {
+                assert_ne!(glyph.glyph_id, 0, "fixture must cover the shaped character");
+                rendered_glyphs += 1;
                 let key = glyph.physical((0.0, 0.0), 1.0).cache_key;
                 let swash = swash_cache
                     .get_image_uncached(&mut font_system, key)
@@ -311,5 +298,6 @@ mod tests {
                 assert_eq!(bitmap.height, swash.placement.height + 24);
             }
         }
+        assert_eq!(rendered_glyphs, 3, "all three scripts must be rasterized");
     }
 }
