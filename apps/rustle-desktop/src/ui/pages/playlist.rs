@@ -305,6 +305,105 @@ pub(crate) fn fade_gradient_color(target: Color, source: Color, progress: f32) -
 mod gradient_tests {
     use super::*;
 
+    #[test]
+    fn local_and_recent_headers_share_the_visible_cover_palette() {
+        use crate::image::{ImageKind, ImageVariant, artwork};
+
+        let song = PlaylistSongView::new(playlist_view::SongItemData {
+            id: 42,
+            cover_key: Some((ImageKind::SongCover, 99)),
+            cover_url: Some("https://example.invalid/cover.jpg".into()),
+            index: 1,
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            duration: String::new(),
+            added_date: String::new(),
+            source: crate::utils::compute_source("ncm://99", 42, None, None),
+        });
+        let mut page = PlaylistView {
+            kind: DetailPageKind::Playlist,
+            id: -1,
+            name: String::new(),
+            description: None,
+            profile_stats: None,
+            artist_tab: ArtistPageTab::TopSongs,
+            artist_albums: Vec::new(),
+            user_playlists: Vec::new(),
+            cover_path: None,
+            owner: String::new(),
+            owner_artist_id: None,
+            owner_avatar_path: None,
+            creator_id: 0,
+            song_count: 1,
+            total_duration: String::new(),
+            like_count: String::new(),
+            songs: vec![song],
+            palette: None,
+            is_local: true,
+            is_subscribed: false,
+            watched_folder_path: None,
+            watch_enabled: false,
+        };
+        let mut state = ImageState::default();
+        assert!(local_header_cover_entry(&page, &state).is_none());
+        for (kind, id, variant, rgb) in [
+            (
+                ImageKind::SongCover,
+                99,
+                ImageVariant::Thumbnail,
+                [220, 30, 20],
+            ),
+            (
+                ImageKind::SongCover,
+                99,
+                ImageVariant::Detail,
+                [20, 200, 30],
+            ),
+            (
+                ImageKind::LocalPlaylistCover,
+                7,
+                ImageVariant::Thumbnail,
+                [20, 30, 220],
+            ),
+            (
+                ImageKind::LocalPlaylistCover,
+                7,
+                ImageVariant::Detail,
+                [180, 30, 180],
+            ),
+        ] {
+            if kind == ImageKind::LocalPlaylistCover {
+                page.id = 7;
+            }
+            let entry = artwork::prepare(
+                kind,
+                variant,
+                "cover.png".into(),
+                "cover.png".into(),
+                image::RgbImage::from_pixel(8, 8, image::Rgb(rgb)).into(),
+            );
+            let primary = entry.palette.as_ref().unwrap().primary;
+            state.entries.insert((kind, id, variant), entry);
+            let selected = local_header_cover_entry(&page, &state).unwrap();
+            assert_eq!(selected.palette.as_ref().unwrap().primary, primary);
+            assert!(std::ptr::eq(
+                playlist_header_cover_handle(&page, &state).unwrap(),
+                &selected.handle
+            ));
+            // Opening another page model must reuse the cached palette too.
+            assert_eq!(
+                local_header_cover_entry(&page.clone(), &state)
+                    .unwrap()
+                    .palette
+                    .as_ref()
+                    .unwrap()
+                    .primary,
+                primary
+            );
+        }
+    }
+
     fn assert_color_close(actual: Color, expected: Color) {
         const EPSILON: f32 = 0.000_001;
         assert!((actual.r - expected.r).abs() < EPSILON);
@@ -722,12 +821,41 @@ fn playlist_header_cover_handle<'a>(
     playlist: &PlaylistView,
     image_state: &'a ImageState,
 ) -> Option<&'a iced::widget::image::Handle> {
+    if playlist.is_local {
+        return local_header_cover_entry(playlist, image_state).map(|entry| &entry.handle);
+    }
     playlist_page_cover_handle(playlist, image_state).or_else(|| {
         playlist.songs.iter().find_map(|song| {
             let (kind, id) = song.cover_key?;
             image_state.get(kind, id)
         })
     })
+}
+
+/// Use the same prepared image for a local header's artwork and palette.
+pub(crate) fn local_header_cover_entry<'a>(
+    playlist: &PlaylistView,
+    image_state: &'a ImageState,
+) -> Option<&'a crate::app::ImageEntry> {
+    let preferred = |kind, id| {
+        image_state
+            .entries
+            .get(&(kind, id, crate::image::ImageVariant::Detail))
+            .or_else(|| {
+                image_state
+                    .entries
+                    .get(&(kind, id, crate::image::ImageVariant::Thumbnail))
+            })
+    };
+    u64::try_from(playlist.id)
+        .ok()
+        .and_then(|id| preferred(crate::image::ImageKind::LocalPlaylistCover, id))
+        .or_else(|| {
+            playlist.songs.iter().find_map(|song| {
+                let (kind, id) = song.cover_key?;
+                preferred(kind, id)
+            })
+        })
 }
 
 fn playlist_owner_avatar_handle<'a>(

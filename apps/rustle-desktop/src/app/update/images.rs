@@ -144,6 +144,31 @@ impl App {
         let mut refs = Vec::new();
 
         match message {
+            Message::PlaylistViewLoaded(_) | Message::RecentlyPlayedLoaded(_) => {
+                if let Some(page) = self
+                    .ui
+                    .playlist_page
+                    .current
+                    .as_ref()
+                    .filter(|page| page.is_local)
+                {
+                    if let (Ok(id), Some(source)) =
+                        (u64::try_from(page.id), page.cover_path.as_deref())
+                    {
+                        refs.push(RemoteImage::detail(
+                            ImageKind::LocalPlaylistCover,
+                            id,
+                            source,
+                        ));
+                    } else if let Some((kind, id, source)) = page.songs.iter().find_map(|song| {
+                        let (kind, id) = song.cover_key?;
+                        Some((kind, id, song.cover_url.as_deref()?))
+                    }) {
+                        refs.push(RemoteImage::detail(kind, id, source));
+                    }
+                }
+                self.sync_local_header_cover();
+            }
             Message::AutoLoginResult(Ok(login_info), _) | Message::LoginSuccess(login_info) => {
                 refs.push(RemoteImage::global(
                     ImageKind::UserAvatar,
@@ -719,6 +744,16 @@ impl App {
     }
 
     fn sync_preferred_image_to_current_page(&mut self, kind: ImageKind, id: u64) {
+        if self
+            .ui
+            .playlist_page
+            .current
+            .as_ref()
+            .is_some_and(|page| page.is_local)
+        {
+            self.sync_local_header_cover();
+            return;
+        }
         let Some(path) = self
             .ui
             .image_state
@@ -789,6 +824,27 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn sync_local_header_cover(&mut self) {
+        let Some(page) = self
+            .ui
+            .playlist_page
+            .current
+            .as_mut()
+            .filter(|page| page.is_local)
+        else {
+            return;
+        };
+        if let Some(entry) =
+            crate::ui::pages::playlist::local_header_cover_entry(page, &self.ui.image_state)
+        {
+            set_detail_cover(
+                page,
+                entry.palette.clone(),
+                entry.path.to_string_lossy().into_owned(),
+            );
         }
     }
 }
