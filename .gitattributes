@@ -1,0 +1,2 @@
+# SQLx hashes raw migration bytes; Windows checkouts must preserve LF.
+crates/rustle-storage/migrations/**/*.sql text eol=lf

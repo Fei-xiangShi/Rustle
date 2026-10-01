@@ -1,9 +1,11 @@
 //! Embedded SQLx migrations and verified legacy-schema adoption routing.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
 use sqlx::SqlitePool;
+use sqlx::migrate::{Migration, Migrator};
 
 use super::StorageResult as Result;
 use super::error::StorageError;
@@ -34,7 +36,7 @@ impl SchemaState {
 pub(crate) async fn initialize(pool: SqlitePool, database_path: PathBuf) -> Result<SchemaState> {
     let state = classify(pool.clone()).await?;
     match state {
-        SchemaState::Empty | SchemaState::Managed => run_migrator(pool.clone()).await?,
+        SchemaState::Empty | SchemaState::Managed => run_migrator(pool.clone(), state).await?,
         SchemaState::Legacy(version) => {
             pool.close().await;
             run_legacy_adoption(database_path.clone(), version).await?;
@@ -143,10 +145,61 @@ async fn current_version(pool: SqlitePool) -> Result<i64> {
 
 fn run_migrator(
     pool: SqlitePool,
+    state: SchemaState,
 ) -> BoxFuture<'static, std::result::Result<(), sqlx::migrate::MigrateError>> {
     Box::pin(async move {
         let mut connection = pool.acquire().await?;
+        if state == SchemaState::Managed {
+            let checksum = sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT checksum FROM _sqlx_migrations WHERE version = 1 AND success = TRUE",
+            )
+            .fetch_optional(&mut *connection)
+            .await?;
+            if let Some(migrator) = checksum.as_deref().and_then(released_crlf_migrator) {
+                tracing::info!(
+                    event = "database_migration_crlf_compatibility",
+                    migration_version = 1,
+                    "Using the released Windows baseline checksum without rewriting the ledger"
+                );
+                return migrator.run_direct(&mut *connection).await;
+            }
+        }
         MIGRATOR.run_direct(&mut *connection).await
+    })
+}
+
+/// Windows releases embedded CRLF bytes before migration checkout was pinned to LF.
+/// Accept only that exact representation of baseline 0001. Keep the ledger intact
+/// so opening this database does not break an older binary with the same checksum.
+/// SQLx still validates dirty/missing migrations and all other checksums normally.
+fn released_crlf_migrator(checksum: &[u8]) -> Option<Migrator> {
+    let baseline = MIGRATOR.iter().find(|migration| migration.version == 1)?;
+    if checksum == baseline.checksum.as_ref() {
+        return None;
+    }
+    let crlf = Migration::new(
+        baseline.version,
+        baseline.description.clone(),
+        baseline.migration_type,
+        Cow::Owned(baseline.sql.replace('\n', "\r\n")),
+        baseline.no_tx,
+    );
+    if checksum != crlf.checksum.as_ref() {
+        return None;
+    }
+    let migrations = MIGRATOR
+        .iter()
+        .map(|migration| {
+            if migration.version == 1 {
+                crlf.clone()
+            } else {
+                migration.clone()
+            }
+        })
+        .collect();
+    Some(Migrator {
+        migrations: Cow::Owned(migrations),
+        ..Migrator::DEFAULT
     })
 }
 
@@ -352,6 +405,117 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))
+        ));
+        pool.close().await;
+    }
+
+    #[test]
+    fn embedded_migrations_use_lf_bytes() {
+        for migration in MIGRATOR.iter() {
+            assert!(
+                !migration.sql.contains('\r'),
+                "migration {} must use LF on every build host",
+                migration.version
+            );
+        }
+    }
+
+    fn windows_baseline() -> Migration {
+        let baseline = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 1)
+            .unwrap();
+        Migration::new(
+            1,
+            baseline.description.clone(),
+            baseline.migration_type,
+            baseline.sql.replace('\n', "\r\n").into(),
+            baseline.no_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn windows_baseline_preserves_ledger_history_and_playlist_writes() {
+        let database = TestDatabase::new("windows-baseline");
+        let pool = connection::connect(database.path.clone()).await.unwrap();
+        let windows = windows_baseline();
+        let old_migrator = Migrator {
+            migrations: Cow::Owned(vec![windows.clone()]),
+            ..Migrator::DEFAULT
+        };
+        old_migrator.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO songs (file_path, title, last_modified, created_at) \
+             VALUES ('fixture.flac', 'Preserved song', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::database::ops::record_play(&pool, 1, 30, true)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                initialize(pool.clone(), database.path.clone())
+                    .await
+                    .unwrap(),
+                SchemaState::Managed
+            );
+            let saved = sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT checksum FROM _sqlx_migrations WHERE version = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(saved, windows.checksum.as_ref());
+            let recent = crate::database::ops::get_recently_played(&pool, 200)
+                .await
+                .unwrap();
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].title, "Preserved song");
+        }
+        let playlist_id = crate::database::ops::create_playlist(
+            &pool,
+            crate::database::NewPlaylist {
+                name: "Imported after upgrade".into(),
+                description: None,
+                cover_path: None,
+                is_smart: false,
+            },
+        )
+        .await
+        .unwrap();
+        crate::database::ops::add_song_to_playlist(&pool, playlist_id, 1)
+            .await
+            .unwrap();
+        let songs = crate::database::ops::get_playlist_songs(&pool, playlist_id)
+            .await
+            .unwrap();
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Preserved song");
+        old_migrator.run(&pool).await.unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn windows_compatibility_does_not_accept_dirty_migrations() {
+        let database = TestDatabase::new("windows-dirty");
+        let pool = connection::connect(database.path.clone()).await.unwrap();
+        let migrator = Migrator {
+            migrations: Cow::Owned(vec![windows_baseline()]),
+            ..Migrator::DEFAULT
+        };
+        migrator.run(&pool).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET success = FALSE WHERE version = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            initialize(pool.clone(), database.path.clone()).await,
+            Err(StorageError::Migration(sqlx::migrate::MigrateError::Dirty(
+                1
+            )))
         ));
         pool.close().await;
     }
