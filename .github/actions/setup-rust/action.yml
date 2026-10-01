@@ -36,6 +36,8 @@ runs:
         sudo apt-get update
         sudo apt-get install --no-install-recommends -y \
           libasound2-dev \
+          libpipewire-0.3-dev \
+          libclang-dev \
           libudev-dev \
           libwayland-dev \
           libx11-xcb-dev \

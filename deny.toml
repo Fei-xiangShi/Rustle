@@ -43,6 +43,9 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 skip = [
+    { crate = "itertools@0.13.0", reason = "Linux PipeWire bindings use bindgen 0.72 (and cexpr); remove when pipewire/libspa-sys upgrade their build dependencies to the converged API generations" },
+    { crate = "nom@7.1.3", reason = "Linux PipeWire bindings use bindgen 0.72 (and cexpr); remove when pipewire/libspa-sys upgrade their build dependencies to the converged API generations" },
+    { crate = "shlex@1.3.0", reason = "Linux PipeWire bindings use bindgen 0.72 (and cexpr); remove when pipewire/libspa-sys upgrade their build dependencies to the converged API generations" },
     { crate = "bitflags@1.3.2", reason = "legacy renderer/audio/platform crates still require bitflags 1; converge through their owning dependency upgrades" },
     { crate = "core-foundation@0.9.4", reason = "macOS integrations span two upstream Core Foundation binding generations" },
     { crate = "cpufeatures@0.2.17", reason = "crypto/media transitive crates have not converged on cpufeatures 0.3" },

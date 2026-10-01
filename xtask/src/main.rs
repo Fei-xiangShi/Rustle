@@ -552,6 +552,10 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
             "rustle-domain" => &["regex", "serde", "serde_json"],
             "rustle-application" => &["rustle-domain"],
             "rustle-audio" => &[
+                "pipewire",
+                "objc2-core-audio",
+                "windows",
+                "windows-core",
                 "parking_lot",
                 "reqwest",
                 "rodio",
@@ -565,6 +569,9 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
             ],
             "rustle-cleanup" => &[],
             "rustle-media" => &[
+                "base64",
+                "flate2",
+                "serde_json",
                 "encoding_rs",
                 "image",
                 "lofty",
@@ -628,6 +635,10 @@ fn architecture_dependency_violations(metadata: &Value) -> XtaskResult<Vec<Strin
                 "xxhash-rust",
             ],
             "rustle-ncm" => &[
+                "base64",
+                "md-5",
+                "tokio",
+                "windows-sys",
                 "directories",
                 "futures-util",
                 "ncm-api-rs",
