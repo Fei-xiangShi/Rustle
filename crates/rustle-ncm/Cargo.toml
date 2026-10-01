@@ -14,8 +14,10 @@ publish = false
 workspace = true
 
 [dependencies]
+base64 = "0.22"
 directories = "6.0.0"
 futures-util = "0.3.34"
+md5 = { package = "md-5", version = "0.10" }
 ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs.git", rev = "133b65bfe482e41ebccf018870d3fce07bf58eb3" }
 parking_lot = "0.12"
 qrcode-generator = "6.0"
@@ -25,4 +27,11 @@ rustle-domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "fs"] }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

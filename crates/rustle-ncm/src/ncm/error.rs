@@ -12,6 +12,8 @@ pub enum NcmError {
     Upstream(#[from] ncm_api_rs::NcmError),
     #[error("NCM direct HTTP request failed")]
     Http(#[from] reqwest::Error),
+    #[error("NCM request `{operation}` timed out")]
+    Timeout { operation: &'static str },
     #[error("NCM session I/O failed")]
     Io(#[from] io::Error),
     #[error("NCM JSON conversion failed")]
@@ -26,6 +28,8 @@ pub enum NcmError {
     },
     #[error("NCM authentication is required: {0}")]
     Authentication(String),
+    #[error("NCM returned no official playback URL for song {song_id}")]
+    PlaybackUnavailable { song_id: u64 },
     #[error("NCM rejected the operation: {0}")]
     Business(String),
 }
@@ -49,6 +53,17 @@ impl NcmError {
         Self::Business(message.into())
     }
 
+    pub(crate) fn is_authentication(&self) -> bool {
+        matches!(
+            self,
+            Self::Upstream(ncm_api_rs::NcmError::AuthRequired(_)) | Self::Authentication(_)
+        )
+    }
+
+    pub(crate) fn is_playback_auth_candidate(&self) -> bool {
+        self.is_authentication() || matches!(self, Self::PlaybackUnavailable { .. })
+    }
+
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Upstream(ncm_api_rs::NcmError::Http(error)) if error.is_timeout() => {
@@ -59,12 +74,14 @@ impl NcmError {
                 ErrorCode::NetworkRequestFailed
             }
             Self::Upstream(ncm_api_rs::NcmError::Timeout(_)) => ErrorCode::NetworkTimeout,
+            Self::Timeout { .. } => ErrorCode::NetworkTimeout,
             Self::Upstream(ncm_api_rs::NcmError::AuthRequired(_)) | Self::Authentication(_) => {
                 ErrorCode::AuthenticationRequired
             }
             Self::Upstream(
                 ncm_api_rs::NcmError::Api { .. } | ncm_api_rs::NcmError::RateLimited(_),
             )
+            | Self::PlaybackUnavailable { .. }
             | Self::Business(_) => ErrorCode::BusinessRejected,
             Self::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 ErrorCode::StoragePermissionDenied

@@ -7,8 +7,9 @@ mod ncm;
 pub use ncm::quality_api_level;
 #[allow(unused_imports)]
 pub use ncm::{
-    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LoginInfo, NcmClient, NcmError,
-    NcmQualityLevel, NcmResult, PRIVATE_RADAR_PLAYLIST_ID, PlaylistDetail, PlaylistSummary,
-    RadioSummary, SearchType, SongQualityDetail, SongQualityOption, Track, TrackAvailability,
-    TrackUrl, UserDetail, UserSummary, VideoSummary, VipInfo, VipTier,
+    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LikeProtocol, LikeResult, LoginInfo,
+    NcmClient, NcmError, NcmQualityLevel, NcmResult, PRIVATE_RADAR_PLAYLIST_ID, PlaylistDetail,
+    PlaylistSummary, PlaylistTrackMutation, PlaylistTrackOperation, RadioSummary, ScrobbleResult,
+    SearchType, SongQualityDetail, SongQualityOption, Track, TrackAvailability, TrackUrl,
+    UserDetail, UserSummary, VideoSummary, VipInfo, VipTier,
 };

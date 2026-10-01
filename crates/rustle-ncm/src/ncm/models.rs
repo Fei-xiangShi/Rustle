@@ -460,6 +460,50 @@ pub struct TrackUrl {
     pub immerse_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LikeProtocol {
+    LegacyWeapi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LikeResult {
+    pub liked: bool,
+    pub playlist_id: Option<u64>,
+    pub protocol: LikeProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrobbleResult {
+    pub startplay_confirmed: bool,
+    pub play_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistTrackOperation {
+    Add,
+    Delete,
+}
+
+impl PlaylistTrackOperation {
+    pub(super) const fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Delete => "del",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistTrackMutation {
+    pub operation: PlaylistTrackOperation,
+    pub playlist_id: u64,
+    pub requested_track_ids: Vec<u64>,
+    pub returned_track_ids: Vec<u64>,
+    pub changed_count: u64,
+    pub cloud_count: Option<u64>,
+    pub retried_after_code_512: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Msg {
     pub code: i32,

@@ -7,14 +7,16 @@ mod client;
 mod error;
 mod mapper;
 mod models;
+mod session;
 
 pub use models::quality_api_level;
 
 pub use client::NcmClient;
 pub use error::{NcmError, NcmResult};
 pub use models::{
-    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LoginInfo, NcmQualityLevel,
-    PlaylistDetail, PlaylistSummary, RadioSummary, SearchType, SongQualityDetail,
+    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LikeProtocol, LikeResult, LoginInfo,
+    NcmQualityLevel, PlaylistDetail, PlaylistSummary, PlaylistTrackMutation,
+    PlaylistTrackOperation, RadioSummary, ScrobbleResult, SearchType, SongQualityDetail,
     SongQualityOption, Track, TrackAvailability, TrackUrl, UserDetail, UserSummary, VideoSummary,
     VipInfo, VipTier,
 };

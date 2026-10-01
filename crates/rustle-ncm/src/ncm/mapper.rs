@@ -7,6 +7,10 @@ fn code_ok(value: &Value) -> bool {
     value.get("code").and_then(as_i64).unwrap_or(200) == 200
 }
 
+pub(super) fn confirmed_code_ok(value: &Value) -> bool {
+    value.get("code").and_then(as_i64) == Some(200)
+}
+
 fn as_i64(value: &Value) -> Option<i64> {
     value
         .as_i64()
@@ -1133,6 +1137,94 @@ pub fn msg(value: &Value) -> Msg {
     }
 }
 
+pub fn login_status_has_authenticated_account(value: &Value) -> bool {
+    if !confirmed_code_ok(value) || value.get("anonimous").and_then(as_bool).unwrap_or(false) {
+        return false;
+    }
+    let account = value.get("account");
+    let profile = value.get("profile");
+    let anonymous = account
+        .and_then(|value| value.get("anonimous"))
+        .and_then(as_bool)
+        .or_else(|| {
+            profile
+                .and_then(|value| value.get("anonimous"))
+                .and_then(as_bool)
+        })
+        .unwrap_or(false);
+    let user_id = account
+        .and_then(|value| value.get("id").or_else(|| value.get("userId")))
+        .and_then(as_u64)
+        .or_else(|| {
+            profile
+                .and_then(|value| value.get("userId").or_else(|| value.get("id")))
+                .and_then(as_u64)
+        })
+        .unwrap_or_default();
+    !anonymous && user_id > 0
+}
+
+pub fn like_result(value: &Value, liked: bool) -> Result<LikeResult> {
+    if !confirmed_code_ok(value) {
+        return Err(NcmError::business("like mutation failed"));
+    }
+    Ok(LikeResult {
+        liked,
+        playlist_id: value.get("playlistId").and_then(as_u64),
+        protocol: LikeProtocol::LegacyWeapi,
+    })
+}
+
+pub fn scrobble_stage_confirmed(value: &Value) -> bool {
+    confirmed_code_ok(value) || value.get("data").and_then(Value::as_str) == Some("success")
+}
+
+pub fn playlist_track_mutation(
+    value: &Value,
+    operation: PlaylistTrackOperation,
+    playlist_id: u64,
+    requested_track_ids: &[u64],
+    retried_after_code_512: bool,
+) -> Result<PlaylistTrackMutation> {
+    if !confirmed_code_ok(value) {
+        return Err(NcmError::business("playlist track mutation failed"));
+    }
+    let mut returned_track_ids = mutation_track_ids(value.get("trackIds"));
+    returned_track_ids.sort_unstable();
+    returned_track_ids.dedup();
+    let reported_count = value.get("count").and_then(as_u64).unwrap_or_default();
+    let changed_count = reported_count.max(returned_track_ids.len() as u64);
+    if changed_count == 0 {
+        return Err(NcmError::business(
+            "playlist track mutation reported no changed tracks",
+        ));
+    }
+    Ok(PlaylistTrackMutation {
+        operation,
+        playlist_id,
+        requested_track_ids: requested_track_ids.to_vec(),
+        returned_track_ids,
+        changed_count,
+        cloud_count: value.get("cloudCount").and_then(as_u64),
+        retried_after_code_512,
+    })
+}
+
+fn mutation_track_ids(value: Option<&Value>) -> Vec<u64> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    if let Some(items) = value.as_array() {
+        return items.iter().filter_map(as_u64).collect();
+    }
+    if let Some(serialized) = value.as_str()
+        && let Ok(parsed) = serde_json::from_str::<Value>(serialized)
+    {
+        return mutation_track_ids(Some(&parsed));
+    }
+    Vec::new()
+}
+
 pub fn search(value: &Value, search_type: SearchType) -> Result<SearchResponse> {
     if !code_ok(value) {
         return Err(NcmError::business("search request failed"));
@@ -1181,6 +1273,101 @@ pub fn search(value: &Value, search_type: SearchType) -> Result<SearchResponse> 
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod endpoint_contract_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn login_status_requires_a_non_anonymous_account_identity() {
+        assert!(login_status_has_authenticated_account(&json!({
+            "code": 200,
+            "account": { "id": 42 },
+            "profile": { "userId": 42 }
+        })));
+        assert!(!login_status_has_authenticated_account(&json!({
+            "code": 200,
+            "account": { "id": 42, "anonimous": true }
+        })));
+        assert!(!login_status_has_authenticated_account(&json!({
+            "code": 200,
+            "account": null,
+            "profile": null
+        })));
+        assert!(login_status_has_authenticated_account(&json!({
+            "code": "200",
+            "account": { "id": "42" }
+        })));
+        assert!(!login_status_has_authenticated_account(&json!({
+            "account": { "id": 42 }
+        })));
+    }
+
+    #[test]
+    fn like_result_preserves_requested_state_and_playlist_identity() {
+        let result = like_result(&json!({ "code": 200, "playlistId": "99" }), true).unwrap();
+        assert!(result.liked);
+        assert_eq!(result.playlist_id, Some(99));
+        assert_eq!(result.protocol, LikeProtocol::LegacyWeapi);
+        assert!(like_result(&json!({ "code": "200" }), false).is_ok());
+        assert!(like_result(&json!({}), true).is_err());
+        assert!(like_result(&json!({ "code": 502 }), true).is_err());
+    }
+
+    #[test]
+    fn scrobble_stage_accepts_only_confirmed_success() {
+        assert!(scrobble_stage_confirmed(&json!({ "code": 200 })));
+        assert!(scrobble_stage_confirmed(&json!({ "code": "200" })));
+        assert!(scrobble_stage_confirmed(&json!({ "data": "success" })));
+        assert!(!scrobble_stage_confirmed(&json!({})));
+        assert!(!scrobble_stage_confirmed(&json!({ "code": 502 })));
+    }
+
+    #[test]
+    fn playlist_mutation_requires_actual_change_and_parses_string_ids() {
+        let result = playlist_track_mutation(
+            &json!({
+                "code": 200,
+                "count": 1,
+                "trackIds": "[\"8\", 8]",
+                "cloudCount": "3"
+            }),
+            PlaylistTrackOperation::Add,
+            7,
+            &[8],
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.returned_track_ids, vec![8]);
+        assert_eq!(result.changed_count, 1);
+        assert_eq!(result.cloud_count, Some(3));
+        assert!(result.retried_after_code_512);
+
+        assert!(
+            playlist_track_mutation(
+                &json!({ "count": 1, "trackIds": [8] }),
+                PlaylistTrackOperation::Add,
+                7,
+                &[8],
+                false,
+            )
+            .is_err()
+        );
+
+        assert!(
+            playlist_track_mutation(
+                &json!({ "code": 200, "count": 0, "trackIds": [] }),
+                PlaylistTrackOperation::Delete,
+                7,
+                &[8],
+                false,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
