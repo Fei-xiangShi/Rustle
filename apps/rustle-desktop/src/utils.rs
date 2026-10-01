@@ -1,5 +1,7 @@
 //! Utility functions
 
+pub mod audio_index;
+
 use iced::Color;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,6 +75,7 @@ pub struct ColorPalette {
 
 impl ColorPalette {
     /// Extract dominant color from an image file
+    #[cfg(test)]
     pub fn from_image_path(path: &Path) -> Option<Self> {
         match DominantColors::extract_from_path(path) {
             Some(colors) => {
@@ -110,18 +113,14 @@ impl DominantColors {
     /// Create default dark colors for when no image is available
     pub fn dark_default() -> Self {
         Self {
-            primary: Color::from_rgb(0.08, 0.06, 0.12),
-            secondary: Color::from_rgb(0.05, 0.05, 0.08),
-            tertiary: Color::from_rgb(0.02, 0.02, 0.04),
+            primary: rustle_ui::color::artwork::FALLBACK[0].to_color(),
+            secondary: rustle_ui::color::artwork::FALLBACK[1].to_color(),
+            tertiary: rustle_ui::color::artwork::FALLBACK[2].to_color(),
         }
     }
 
-    /// Extract dominant colors from an image file path (string version)
-    pub fn from_image_path(path: &str) -> Option<Self> {
-        Self::extract_from_path(Path::new(path))
-    }
-
     /// Extract dominant colors from an image file path
+    #[cfg(test)]
     pub fn extract_from_path(path: &Path) -> Option<Self> {
         let img = match image::open(path) {
             Ok(img) => img,
@@ -130,119 +129,20 @@ impl DominantColors {
                 return None;
             }
         };
-        let img = img.to_rgb8();
-        let img = image::imageops::resize(&img, 32, 32, image::imageops::FilterType::Nearest);
-
-        let mut pixels: Vec<(u8, u8, u8)> = Vec::new();
-        for pixel in img.pixels() {
-            pixels.push((pixel[0], pixel[1], pixel[2]));
-        }
-
-        if pixels.is_empty() {
-            return None;
-        }
-
-        let colors = kmeans_colors(&pixels, 3);
-
-        let to_background_color =
-            |r: u8, g: u8, b: u8, brightness_factor: f32, saturation_boost: f32| -> Color {
-                let rf = r as f32 / 255.0;
-                let gf = g as f32 / 255.0;
-                let bf = b as f32 / 255.0;
-
-                let max = rf.max(gf).max(bf);
-                let min = rf.min(gf).min(bf);
-                let delta = max - min;
-
-                let (r_out, g_out, b_out) = if delta < 0.01 {
-                    (
-                        rf * brightness_factor,
-                        gf * brightness_factor,
-                        bf * brightness_factor,
-                    )
-                } else {
-                    let avg = (rf + gf + bf) / 3.0;
-                    let boost = |v: f32| -> f32 {
-                        let diff = v - avg;
-                        (avg + diff * saturation_boost).clamp(0.0, 1.0) * brightness_factor
-                    };
-                    (boost(rf), boost(gf), boost(bf))
-                };
-
-                Color::from_rgb(r_out, g_out, b_out)
-            };
-
-        Some(Self {
-            primary: to_background_color(colors[0].0, colors[0].1, colors[0].2, 0.65, 1.6),
-            secondary: to_background_color(colors[1].0, colors[1].1, colors[1].2, 0.50, 1.5),
-            tertiary: to_background_color(colors[2].0, colors[2].1, colors[2].2, 0.25, 1.3),
-        })
-    }
-}
-
-/// Simple k-means clustering for color extraction
-fn kmeans_colors(pixels: &[(u8, u8, u8)], k: usize) -> Vec<(u8, u8, u8)> {
-    if pixels.is_empty() || k == 0 {
-        return vec![(20, 15, 30); k];
+        Some(Self::from_image(&img))
     }
 
-    let mut centroids: Vec<(f32, f32, f32)> = (0..k)
-        .map(|i| {
-            let idx = i * pixels.len() / k;
-            let p = pixels[idx.min(pixels.len() - 1)];
-            (p.0 as f32, p.1 as f32, p.2 as f32)
-        })
-        .collect();
-
-    for _ in 0..10 {
-        let mut clusters: Vec<Vec<(u8, u8, u8)>> = vec![Vec::new(); k];
-
-        for &pixel in pixels {
-            let mut min_dist = f32::MAX;
-            let mut min_idx = 0;
-
-            for (idx, centroid) in centroids.iter().enumerate() {
-                let dist = color_distance(pixel, *centroid);
-                if dist < min_dist {
-                    min_dist = dist;
-                    min_idx = idx;
-                }
-            }
-
-            clusters[min_idx].push(pixel);
-        }
-
-        for (idx, cluster) in clusters.iter().enumerate() {
-            if !cluster.is_empty() {
-                let sum: (u32, u32, u32) = cluster.iter().fold((0, 0, 0), |acc, p| {
-                    (acc.0 + p.0 as u32, acc.1 + p.1 as u32, acc.2 + p.2 as u32)
-                });
-                let len = cluster.len() as f32;
-                centroids[idx] = (sum.0 as f32 / len, sum.1 as f32 / len, sum.2 as f32 / len);
-            }
+    pub fn from_image(img: &image::DynamicImage) -> Self {
+        let sources = rustle_ui::color::artwork::dominant(img);
+        let colors: [Color; 3] = std::array::from_fn(|i| {
+            rustle_ui::color::artwork::background(sources[i], i).to_color()
+        });
+        Self {
+            primary: colors[0],
+            secondary: colors[1],
+            tertiary: colors[2],
         }
     }
-
-    centroids.sort_by(|a, b| {
-        let brightness_a = a.0 * 0.299 + a.1 * 0.587 + a.2 * 0.114;
-        let brightness_b = b.0 * 0.299 + b.1 * 0.587 + b.2 * 0.114;
-        brightness_a
-            .partial_cmp(&brightness_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    centroids
-        .iter()
-        .map(|(r, g, b)| (*r as u8, *g as u8, *b as u8))
-        .collect()
-}
-
-/// Calculate squared distance between a pixel and a centroid
-fn color_distance(pixel: (u8, u8, u8), centroid: (f32, f32, f32)) -> f32 {
-    let dr = pixel.0 as f32 - centroid.0;
-    let dg = pixel.1 as f32 - centroid.1;
-    let db = pixel.2 as f32 - centroid.2;
-    dr * dr + dg * dg + db * db
 }
 
 // ============================================================================
@@ -284,19 +184,15 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "m4a", "aac", "ogg", "wav", "opus", "wma", "aiff",
 ];
 
-/// Find an existing cached audio file with any common extension
-///
-/// # Arguments
-/// * `dir` - The directory to search in
-/// * `stem` - The filename without extension (e.g., "12345")
-///
-/// # Returns
-/// The path to the existing file if found, None otherwise
-pub fn find_cached_audio(dir: &Path, stem: &str) -> Option<PathBuf> {
+/// Enumerate cache formats so callers can validate every candidate instead
+/// of allowing a stale extension to hide a complete file.
+pub fn cached_audio_candidates<'a>(
+    dir: &'a Path,
+    stem: &'a str,
+) -> impl Iterator<Item = PathBuf> + 'a {
     AUDIO_EXTENSIONS
         .iter()
-        .map(|ext| dir.join(format!("{}.{}", stem, ext)))
-        .find(|p| p.exists())
+        .map(move |ext| dir.join(format!("{stem}.{ext}")))
 }
 
 /// Detect audio format from magic bytes
@@ -398,6 +294,11 @@ fn publish_downloaded_image(temp_path: &Path, parent: &Path, stem: &str) -> Opti
             return None;
         }
     };
+    if let Err(error) = image::load_from_memory(&bytes) {
+        error!("Downloaded image could not be decoded: {}", error);
+        crate::cache::cleanup_temp_file(temp_path);
+        return None;
+    }
     let ext = detect_image_format(&bytes);
     let final_path = parent.join(format!("{}.{}", stem, ext));
     if let Err(error) = crate::cache::publish_or_reuse(temp_path, &final_path, None) {
@@ -445,6 +346,8 @@ pub fn format_time_padded(seconds: f32) -> String {
 pub enum Source {
     /// Local file with absolute path that exists on disk (imported or downloaded)
     Local,
+    /// Fully downloaded streaming cache file (managed by Rustle).
+    Cached,
     /// NCM song only available online (not downloaded or cached)
     Online,
 }
@@ -452,35 +355,22 @@ pub enum Source {
 /// Determine the source of a song at runtime by checking file system state
 ///
 /// Checks in order:
-/// 1. Absolute path exists on disk → Local
+/// 1. Absolute path exists on disk → Cached inside the streaming cache, otherwise Local
 /// 2. NCM song with downloaded file in download dir → Local
-/// 3. Otherwise → Online
+/// 3. NCM song with a streaming cache file → Cached
+/// 4. Otherwise → Online
 pub fn compute_source(
     file_path: &str,
     song_id: i64,
     artist: Option<&str>,
     title: Option<&str>,
 ) -> Source {
-    let path = Path::new(file_path);
-    if path.is_absolute() && path.exists() {
-        return Source::Local;
+    let index = audio_index::snapshot();
+    match index.locate(file_path, song_id, artist, title) {
+        Some(file) if file.path.starts_with(&index.cache_dir) => Source::Cached,
+        Some(_) => Source::Local,
+        None => Source::Online,
     }
-    if song_id < 0 {
-        // Downloaded file is local; quality-scoped streaming cache is not
-        // sufficient to classify a song without the requested quality.
-        if let (Some(a), Some(t)) = (artist, title) {
-            let dl = crate::features::settings::StorageSettings::default().effective_download_dir();
-            let stem = format!("{} - {}", sanitize_filename(a), sanitize_filename(t));
-            if AUDIO_EXTENSIONS
-                .iter()
-                .map(|e| dl.join(format!("{}.{}", stem, e)))
-                .any(|p| p.exists())
-            {
-                return Source::Local;
-            }
-        }
-    }
-    Source::Online
 }
 
 /// Return the longest UTF-8-valid prefix that fits within `max_bytes`.
@@ -560,13 +450,33 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rustle-image-publish-{nonce}"));
         std::fs::create_dir_all(&root).unwrap();
         let temp = crate::cache::unique_temp_path(&root.join("cover"));
-        std::fs::write(&temp, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        let image = image::DynamicImage::new_rgb8(1, 1);
+        image
+            .save_with_format(&temp, image::ImageFormat::Png)
+            .unwrap();
 
         let published = publish_downloaded_image(&temp, &root, "cover").unwrap();
 
         assert_eq!(published, root.join("cover.png"));
         assert!(published.exists());
         assert!(!temp.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_html_response_is_not_published_as_an_image() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustle-invalid-image-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let temp = crate::cache::unique_temp_path(&root.join("cover"));
+        std::fs::write(&temp, b"<html>upstream error</html>").unwrap();
+
+        assert!(publish_downloaded_image(&temp, &root, "cover").is_none());
+        assert!(!temp.exists());
+        assert!(find_cached_image(&root, "cover").is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -84,6 +84,7 @@ impl App {
                         bg_colors: &self.ui.lyrics.bg_colors,
                         textured_bg_shader: &self.ui.lyrics.textured_bg_shader,
                         lyrics_engine: self.ui.lyrics.engine.as_ref(),
+                        lyrics_font: self.ui.lyrics.display_font,
                         power_saving_mode: self.core.settings.display.power_saving_mode,
                         is_liked: if song.id < 0 {
                             let ncm_id = (-song.id) as u64;
@@ -360,7 +361,7 @@ impl App {
         let progress_colors = self.playback.current_song.as_ref().and_then(|song| {
             self.playback
                 .preload_coordinator
-                .background_colors(song.id)
+                .progress_colors(song.id)
                 .map(|colors| {
                     let to_color = |[r, g, b, a]: [f32; 4]| iced::Color::from_rgba(r, g, b, a);
                     [to_color(colors.0), to_color(colors.1), to_color(colors.2)]
@@ -954,8 +955,8 @@ fn save_btn(locale: crate::i18n::Locale, context: ResponsiveContext) -> Element<
     widgets::hover_surface(button)
         .style(move |_theme, progress| container::Style {
             background: Some(iced::Background::Color(theme::lerp_color(
-                theme::ACCENT_PINK,
-                theme::ACCENT_PINK_HOVER,
+                theme::accent(_theme),
+                theme::accent_hover(_theme),
                 progress,
             ))),
             border: iced::Border {
@@ -1077,24 +1078,20 @@ fn accent_btn(
     context: ResponsiveContext,
 ) -> Element<'static, Message> {
     let tokens = context.tokens;
-    let button = button(
-        text(label)
-            .size(tokens.text(TextRole::BodyLarge))
-            .color(Color::WHITE),
-    )
-    .height(tokens.target(TargetRole::Control))
-    .padding([tokens.space(8.0), tokens.space(20.0)])
-    .style(|_theme, _status| button::Style {
-        background: Some(iced::Background::Color(Color::TRANSPARENT)),
-        text_color: Color::WHITE,
-        ..Default::default()
-    })
-    .on_press(msg);
+    let button = button(text(label).size(tokens.text(TextRole::BodyLarge)))
+        .height(tokens.target(TargetRole::Control))
+        .padding([tokens.space(8.0), tokens.space(20.0)])
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(Color::TRANSPARENT)),
+            text_color: theme::on_accent(_theme),
+            ..Default::default()
+        })
+        .on_press(msg);
     widgets::hover_surface(button)
         .style(move |_theme, progress| container::Style {
             background: Some(iced::Background::Color(theme::lerp_color(
-                theme::ACCENT_PINK,
-                theme::ACCENT_PINK_HOVER,
+                theme::accent(_theme),
+                theme::accent_hover(_theme),
                 progress,
             ))),
             border: iced::Border {

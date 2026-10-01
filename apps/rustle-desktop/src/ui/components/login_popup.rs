@@ -135,7 +135,7 @@ fn view_qr_login<'a>(
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_theme| container::Style {
-            background: Some(theme::SURFACE_SECONDARY.into()),
+            background: Some(theme::surface(_theme).into()),
             border: iced::Border {
                 radius: tokens.size(8.0).into(),
                 ..Default::default()

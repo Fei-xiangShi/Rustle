@@ -9,19 +9,20 @@
 //! - 位置使用 cosmic-text 的布局，尺寸使用 SDF 的度量
 
 use crate::features::lyrics::engine::sdf_generator::{SdfBitmap, SdfGenerator};
-use cosmic_text::{CacheKey, FontSystem, SwashCache};
+use cosmic_text::{CacheKey, FontSystem, SubpixelBin, SwashCache};
 use iced::wgpu;
 use iced::wgpu::{Device, Queue};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 /// 共享字体系统类型
 pub type SharedFontSystem = Arc<Mutex<FontSystem>>;
 
 // ---- 全局单例 ----
 
-/// 全局 FontSystem — 整个应用只有一个实例, 字形光栅化由 cosmic-text 内部处理
+/// Shared lyrics FontSystem. Iced owns a separate system for ordinary UI text.
 static GLOBAL_FONT_SYSTEM: LazyLock<RwLock<Option<SharedFontSystem>>> =
     LazyLock::new(|| RwLock::new(None));
 
@@ -39,36 +40,78 @@ pub fn global_font_system() -> SharedFontSystem {
         .expect("Global FontSystem not initialized. Call set_global_font_system first.")
 }
 
-/// 全局预生成缓存
-/// 用于在后台线程生成 SDF 位图后，在主线程导入到 SdfCache
-static GLOBAL_PRE_GENERATED: LazyLock<Mutex<HashMap<CacheKey, SdfBitmap>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A completed empty glyph is a cache hit too. Per-key cells prevent a preload
+/// and the renderer from rasterizing the same glyph concurrently.
+type GlyphBitmap = Option<Arc<SdfBitmap>>;
+type GlyphCell = Arc<OnceLock<GlyphBitmap>>;
 
-/// 导入预生成的位图到全局缓存
-pub fn import_to_global_cache(bitmaps: HashMap<CacheKey, SdfBitmap>) {
-    let mut cache = GLOBAL_PRE_GENERATED.lock();
-    for (key, bitmap) in bitmaps {
-        cache.insert(base_sdf_cache_key(key), bitmap);
-    }
+#[derive(Default)]
+struct GlyphBitmapCache {
+    entries: HashMap<CacheKey, GlyphCell>,
+    insertion_order: VecDeque<CacheKey>,
 }
 
-/// 从全局缓存中获取预生成的位图。
-///
-/// The global cache is intentionally reusable: shaping can be requested more
-/// than once for the same viewport/song window, and SDF generation is much more
-/// expensive than cloning the already generated bitmap.
-pub fn get_from_global_cache(key: &CacheKey) -> Option<SdfBitmap> {
-    GLOBAL_PRE_GENERATED
-        .lock()
-        .get(&base_sdf_cache_key(*key))
-        .cloned()
+const MAX_CACHED_BITMAPS: usize = 8192;
+static GLOBAL_BITMAPS: LazyLock<Mutex<GlyphBitmapCache>> = LazyLock::new(Mutex::default);
+static GLOBAL_SWASH: LazyLock<Mutex<SwashCache>> = LazyLock::new(|| Mutex::new(SwashCache::new()));
+
+impl GlyphBitmapCache {
+    fn cell(&mut self, key: CacheKey) -> GlyphCell {
+        let key = base_sdf_cache_key(key);
+        if let Some(cell) = self.entries.get(&key) {
+            return cell.clone();
+        }
+        if self.entries.len() >= MAX_CACHED_BITMAPS {
+            // Do not evict a generating or borrowed cell: it owns single-flight.
+            let evictable = self.insertion_order.iter().position(|key| {
+                self.entries
+                    .get(key)
+                    .is_some_and(|cell| Arc::strong_count(cell) == 1)
+            });
+            if let Some(index) = evictable {
+                let old = self.insertion_order.remove(index).expect("eviction index");
+                self.entries.remove(&old);
+            } else {
+                // Keep retention bounded even with an exceptional all-in-flight batch.
+                return Arc::new(OnceLock::new());
+            }
+        }
+        let cell = Arc::new(OnceLock::new());
+        self.entries.insert(key, cell.clone());
+        self.insertion_order.push_back(key);
+        cell
+    }
 }
 
 fn base_sdf_cache_key(cache_key: CacheKey) -> CacheKey {
     CacheKey {
         font_size_bits: (SDF_BASE_SIZE as f32).to_bits(),
+        // Geometry already retains cosmic-text's floating position and offsets.
+        // A single unshifted SDF serves every subpixel position and display size.
+        x_bin: SubpixelBin::Zero,
+        y_bin: SubpixelBin::Zero,
         ..cache_key
     }
+}
+
+fn generate_bitmap(cache_key: CacheKey) -> GlyphBitmap {
+    let generator = SdfGenerator::new(SDF_BASE_SIZE, SDF_BUFFER_SIZE);
+    let cache_key = CacheKey {
+        font_size_bits: (generator.config().base_size as f32).to_bits(),
+        ..cache_key
+    };
+    let image = {
+        let mut swash = GLOBAL_SWASH.lock();
+        let font_system = global_font_system();
+        swash.get_image_uncached(&mut font_system.lock(), cache_key)
+    }?;
+    generator.generate_from_swash_image(&image).map(Arc::new)
+}
+
+fn glyph_bitmap(cache_key: CacheKey) -> GlyphBitmap {
+    let key = base_sdf_cache_key(cache_key);
+    let cell = GLOBAL_BITMAPS.lock().cell(key);
+    cell.get_or_init(|| generate_bitmap(key)).clone()
 }
 
 /// 纹理图集大小
@@ -300,66 +343,28 @@ fn sdf_to_rgba(sdf: &[u8]) -> Vec<u8> {
     rgba
 }
 
-/// 预生成的 SDF 位图（用于异步生成）
-#[derive(Clone)]
-pub struct PreGeneratedSdf {
-    pub bitmap: SdfBitmap,
-}
-
-/// 线程安全的 SDF 缓存管理器
+/// GPU atlas owner. CPU bitmap generation is shared across all consumers.
 pub struct SdfCache {
-    /// SDF 生成器
-    generator: SdfGenerator,
-    /// 纹理图集
     atlas: Mutex<SdfAtlas>,
-    /// Enable debug logging
     debug_logging: bool,
-    /// 预生成的 SDF 位图缓存（用于异步生成后在主线程上传）
-    pre_generated: Mutex<HashMap<CacheKey, PreGeneratedSdf>>,
 }
 
 impl SdfCache {
-    fn sdf_cache_key(cache_key: CacheKey, base_size: u32) -> CacheKey {
-        CacheKey {
-            font_size_bits: (base_size as f32).to_bits(),
-            ..cache_key
-        }
-    }
-
-    fn generate_bitmap_from_swash(
-        &self,
-        font_system: &mut FontSystem,
-        cache_key: CacheKey,
-    ) -> Option<SdfBitmap> {
-        let base_key = Self::sdf_cache_key(cache_key, self.generator.config().base_size);
-        let mut swash_cache = SwashCache::new();
-        let image = swash_cache.get_image_uncached(font_system, base_key)?;
-        self.generator.generate_from_swash_image(&image)
-    }
-
     /// Create with debug logging enabled
     pub fn with_debug(device: &Device, debug_logging: bool) -> Self {
         Self {
-            // base_size = 64px, buffer = 12px
-            // 64px 是速度和质量的平衡点：
-            // - 比 96px 快约 2 倍
-            // - 质量足够好，适合大多数显示器
-            // - 更大的 buffer 能给 glow/blur 留出真实采样空间，减少矩形外推带来的颗粒感
-            generator: SdfGenerator::new(SDF_BASE_SIZE, SDF_BUFFER_SIZE),
             atlas: Mutex::new(SdfAtlas::new(device)),
             debug_logging,
-            pre_generated: Mutex::new(HashMap::new()),
         }
     }
 
     /// 获取或缓存字形
     ///
-    /// 使用 msdfgen 生成 SDF 纹理和度量。
-    /// 度量是在 base_size (48px) 下计算的，需要在渲染时缩放。
+    /// Uses shared Swash/SDF results at 64px; geometry scales these metrics.
     ///
     /// 当图集空间不足时，会自动清空图集并重试。
     pub fn get_glyph(&self, queue: &Queue, cache_key: CacheKey) -> Option<SdfGlyphInfo> {
-        let atlas_key = Self::sdf_cache_key(cache_key, self.generator.config().base_size);
+        let atlas_key = base_sdf_cache_key(cache_key);
 
         // 先检查图集缓存
         {
@@ -369,36 +374,8 @@ impl SdfCache {
             }
         }
 
-        // 检查本地预生成缓存
-        let pre_gen_bitmap = {
-            let mut pre_gen = self.pre_generated.lock();
-            pre_gen.remove(&atlas_key)
-        };
-
-        // 如果本地缓存没有，检查全局预生成缓存
-        let pre_gen_bitmap = pre_gen_bitmap
-            .or_else(|| get_from_global_cache(&atlas_key).map(|bitmap| PreGeneratedSdf { bitmap }));
-
-        let bitmap = if let Some(pre_gen) = pre_gen_bitmap {
-            // 使用预生成的位图（快速路径）
-            pre_gen.bitmap
-        } else {
-            // 需要同步生成（慢速路径）
-            let font_system = global_font_system();
-            let mut font_system = font_system.lock();
-
-            // Check if font_id exists in the font system
-            let font_info = font_system.db().face(cache_key.font_id);
-            if font_info.is_none() && self.debug_logging {
-                tracing::warn!(
-                    "[SdfCache] Font mismatch: font_id {:?} not found in font system",
-                    cache_key.font_id
-                );
-            }
-
-            // 生成 SDF（字形光栅化由 cosmic-text 的 SwashCache 内部处理）
-            self.generate_bitmap_from_swash(&mut font_system, cache_key)?
-        };
+        // Empty/missing images are retained too, so spaces never rasterize per frame.
+        let bitmap = glyph_bitmap(atlas_key)?;
 
         // 缓存到图集
         let mut atlas = self.atlas.lock();
@@ -426,38 +403,108 @@ impl SdfCache {
     }
 }
 
-/// 批量预生成 SDF 位图（无 GPU，可在后台线程使用）
-pub fn pre_generate_sdf_batch(cache_keys: &[CacheKey]) -> HashMap<CacheKey, SdfBitmap> {
-    let generator = SdfGenerator::new(SDF_BASE_SIZE, SDF_BUFFER_SIZE);
-    let mut bitmaps = HashMap::new();
-    let mut seen_keys = HashSet::new();
-    let cached_keys: HashSet<CacheKey> = GLOBAL_PRE_GENERATED.lock().keys().copied().collect();
-    let font_system = global_font_system();
-    let mut swash_cache = SwashCache::new();
-
-    for &cache_key in cache_keys {
-        let sdf_key = base_sdf_cache_key(cache_key);
-
-        if !seen_keys.insert(sdf_key) || cached_keys.contains(&sdf_key) {
+/// Warm shared CPU bitmaps before publishing layout. Stop obsolete work between
+/// glyphs and publish each result immediately for overlapping song preloads.
+pub fn pre_generate_sdf_batch(cache_keys: &[CacheKey], cancelled: &AtomicBool) -> usize {
+    let mut seen = HashSet::new();
+    let mut generated = 0;
+    for &key in cache_keys {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let key = base_sdf_cache_key(key);
+        if !seen.insert(key) {
             continue;
         }
+        let cell = GLOBAL_BITMAPS.lock().cell(key);
+        cell.get_or_init(|| {
+            generated += 1;
+            generate_bitmap(key)
+        });
+    }
+    generated
+}
 
-        let image = {
-            let mut font_system = font_system.lock();
-            if font_system.db().face(sdf_key.font_id).is_none() {
-                continue;
-            }
-            swash_cache.get_image_uncached(&mut font_system, sdf_key)
-        };
-        let Some(image) = image else {
-            continue;
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
 
-        let Some(bitmap) = generator.generate_from_swash_image(&image) else {
-            continue;
-        };
-        bitmaps.insert(sdf_key, bitmap);
+    fn key(glyph_id: u16) -> CacheKey {
+        CacheKey::new(
+            cosmic_text::fontdb::ID::dummy(),
+            glyph_id,
+            24.0,
+            (0.25, 0.75),
+            cosmic_text::Weight::NORMAL,
+            cosmic_text::CacheKeyFlags::empty(),
+        )
+        .0
     }
 
-    bitmaps
+    #[test]
+    fn sdf_identity_ignores_display_size_and_phase_but_preserves_weight_and_flags() {
+        let original = key(10);
+        let changed = CacheKey {
+            font_size_bits: 72.0_f32.to_bits(),
+            x_bin: SubpixelBin::Three,
+            y_bin: SubpixelBin::Zero,
+            ..original
+        };
+        assert_eq!(base_sdf_cache_key(original), base_sdf_cache_key(changed));
+        assert_ne!(
+            base_sdf_cache_key(original),
+            base_sdf_cache_key(CacheKey {
+                font_weight: cosmic_text::Weight::BOLD,
+                ..original
+            })
+        );
+        assert_ne!(
+            base_sdf_cache_key(original),
+            base_sdf_cache_key(CacheKey {
+                flags: cosmic_text::CacheKeyFlags::FAKE_ITALIC,
+                ..original
+            })
+        );
+    }
+
+    #[test]
+    fn concurrent_and_repeated_empty_glyphs_generate_once() {
+        let cache = Mutex::new(GlyphBitmapCache::default());
+        let generated = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..120 {
+                        let cell = cache.lock().cell(key(1));
+                        assert!(
+                            cell.get_or_init(|| {
+                                generated.fetch_add(1, Ordering::Relaxed);
+                                None
+                            })
+                            .is_none()
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(generated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn bitmap_retention_is_bounded_and_does_not_evict_an_inflight_cell() {
+        let mut cache = GlyphBitmapCache::default();
+        let inflight = cache.cell(key(0));
+        for glyph in 1..=MAX_CACHED_BITMAPS + 32 {
+            cache.cell(key(glyph as u16)).set(None).unwrap();
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED_BITMAPS);
+        assert!(Arc::ptr_eq(&inflight, &cache.cell(key(0))));
+        assert_eq!(cache.insertion_order.len(), MAX_CACHED_BITMAPS);
+    }
+
+    #[test]
+    fn cancelled_batch_does_not_initialize_fonts_or_rasterize() {
+        assert_eq!(pre_generate_sdf_batch(&[key(0)], &AtomicBool::new(true)), 0);
+    }
 }

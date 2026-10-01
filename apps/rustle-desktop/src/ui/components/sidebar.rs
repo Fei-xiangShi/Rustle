@@ -10,7 +10,7 @@ use crate::app::{ImageState, Message, Route, SidebarId};
 use crate::i18n::{Key, Locale};
 use crate::image::ImageKind;
 use crate::ui::animation::{HoverAnimations, SmoothScrollTarget};
-use crate::ui::components::importing_card::{self, ImportingPlaylist};
+use crate::ui::components::importing_card::ImportingPlaylist;
 use crate::ui::components::window_drag_region;
 use crate::ui::responsive::{
     ChromeRole, CoverRadiusRole, IconRole, RadiusRole, ResponsiveContext, SidebarPresentation,
@@ -230,7 +230,7 @@ fn full_view(props: &SidebarView<'_>, rendered_width: f32) -> Element<'static, M
             .width(metrics.logo_icon_size)
             .height(metrics.logo_icon_size)
             .style(|_theme, _status| svg::Style {
-                color: Some(theme::ACCENT_PINK),
+                color: Some(theme::accent(_theme)),
             })
         ),
         Space::new().width(metrics.logo_gap),
@@ -314,13 +314,41 @@ fn full_view(props: &SidebarView<'_>, rendered_width: f32) -> Element<'static, M
     // Build library section with proper spacing (same as nav_menu)
     let mut library_items: Vec<Element<'static, Message>> = vec![recently_played];
 
-    // Show importing playlist if any
+    // Render the importing playlist through the same playlist-item renderer.
     if let Some(playlist) = importing_playlist {
-        library_items.push(importing_card::view(playlist, context.tokens));
+        let on_press = Message::Noop;
+        let cover_handle = playlist
+            .playlist_id
+            .and_then(|id| u64::try_from(id).ok())
+            .and_then(|id| image_state.get(ImageKind::LocalPlaylistCover, id));
+        let cover = crate::ui::components::cover_image::custom(
+            cover_handle,
+            ImageKind::LocalPlaylistCover,
+            metrics.cover_size,
+            metrics.cover_radius,
+            context.tokens,
+        );
+        let hover_progress = sidebar_animations.get_progress(&SidebarId::Library(2));
+        library_items.push(sidebar_button_animated_opt_cover(SidebarButtonView {
+            fallback_svg: crate::ui::icons::MUSIC,
+            cover_icon: Some(cover),
+            label: playlist.name.clone(),
+            is_active: playlist.playlist_id.is_some_and(
+                |id| matches!(current_route, Route::Playlist(current_id) if *current_id == id),
+            ),
+            hover_progress,
+            sidebar_id: SidebarId::Library(2),
+            on_press,
+            metrics,
+            importing: Some(playlist.clone()),
+        }));
     }
 
     // Show local playlists with hover animations
     for playlist in playlists {
+        if importing_playlist.is_some_and(|importing| importing.playlist_id == Some(playlist.id)) {
+            continue;
+        }
         let name = playlist.name.clone();
         let id = playlist.id;
         let is_active = matches!(current_route, Route::Playlist(current_id) if *current_id == id);
@@ -344,7 +372,18 @@ fn full_view(props: &SidebarView<'_>, rendered_width: f32) -> Element<'static, M
             sidebar_id: SidebarId::Playlist(id),
             on_press: Message::OpenPlaylist(id),
             metrics,
+            importing: None,
         }));
+    }
+
+    if let Some(importing) = importing_playlist {
+        // Match SQLite's name order before and after replacing the import row.
+        let position = playlists
+            .iter()
+            .filter(|p| Some(p.id) != importing.playlist_id && p.name < importing.name)
+            .count();
+        let importing_row = library_items.remove(1);
+        library_items.insert(1 + position, importing_row);
     }
 
     library_items.push(import_playlist_btn);
@@ -397,6 +436,7 @@ fn full_view(props: &SidebarView<'_>, rendered_width: f32) -> Element<'static, M
                     sidebar_id: SidebarId::UserPlaylist(id),
                     on_press: Message::OpenNcmPlaylist(id),
                     metrics,
+                    importing: None,
                 })
             };
 
@@ -548,6 +588,7 @@ fn rail_view(props: &SidebarView<'_>) -> Element<'static, Message> {
 
     let mut playlist_buttons = playlists
         .iter()
+        .filter(|playlist| !props.importing_playlist.is_some_and(|importing| importing.playlist_id == Some(playlist.id)))
         .map(|playlist| {
             let id = playlist.id;
             let cover_handle = u64::try_from(id)
@@ -556,6 +597,7 @@ fn rail_view(props: &SidebarView<'_>) -> Element<'static, Message> {
             rail_cover_button(RailCoverButtonView {
                 cover_handle,
                 image_kind: ImageKind::LocalPlaylistCover,
+                importing: None,
                 label: playlist.name.clone(),
                 is_active: matches!(current_route, Route::Playlist(current_id) if *current_id == id),
                 hover_progress: sidebar_animations.get_progress(&SidebarId::Playlist(id)),
@@ -566,12 +608,38 @@ fn rail_view(props: &SidebarView<'_>) -> Element<'static, Message> {
         })
         .collect::<Vec<_>>();
 
+    if let Some(importing) = props.importing_playlist {
+        let cover_handle = importing
+            .playlist_id
+            .and_then(|id| u64::try_from(id).ok())
+            .and_then(|id| image_state.get(ImageKind::LocalPlaylistCover, id));
+        let position = playlists
+            .iter()
+            .filter(|p| Some(p.id) != importing.playlist_id && p.name < importing.name)
+            .count();
+        playlist_buttons.insert(
+            position,
+            rail_cover_button(RailCoverButtonView {
+                cover_handle,
+                image_kind: ImageKind::LocalPlaylistCover,
+                importing: Some(importing),
+                label: importing.name.clone(),
+                is_active: false,
+                hover_progress: sidebar_animations.get_progress(&SidebarId::Library(2)),
+                metrics,
+                sidebar_id: SidebarId::Library(2),
+                on_press: Message::Noop,
+            }),
+        );
+    }
+
     if is_logged_in {
         playlist_buttons.extend(user_playlists.iter().map(|playlist| {
             let id = playlist.id;
             rail_cover_button(RailCoverButtonView {
                 cover_handle: image_state.get(ImageKind::PlaylistCover, id),
                 image_kind: ImageKind::PlaylistCover,
+                importing: None,
                 label: playlist.name.clone(),
                 is_active: matches!(current_route, Route::NcmPlaylist(current_id) if *current_id == id),
                 hover_progress: sidebar_animations.get_progress(&SidebarId::UserPlaylist(id)),
@@ -627,6 +695,7 @@ fn rail_view(props: &SidebarView<'_>) -> Element<'static, Message> {
 struct RailCoverButtonView<'a> {
     cover_handle: Option<&'a iced::widget::image::Handle>,
     image_kind: ImageKind,
+    importing: Option<&'a ImportingPlaylist>,
     label: String,
     is_active: bool,
     hover_progress: f32,
@@ -639,6 +708,7 @@ fn rail_cover_button(view: RailCoverButtonView<'_>) -> Element<'static, Message>
     let RailCoverButtonView {
         cover_handle,
         image_kind,
+        importing,
         label,
         is_active,
         hover_progress,
@@ -654,6 +724,11 @@ fn rail_cover_button(view: RailCoverButtonView<'_>) -> Element<'static, Message>
         metrics.cover_radius,
         metrics.tokens,
     );
+    let cover = if let Some(importing) = importing {
+        import_cover(importing, Some(cover), metrics)
+    } else {
+        cover
+    };
     let button = button(
         container(cover)
             .width(button_size)
@@ -680,7 +755,7 @@ fn rail_cover_button(view: RailCoverButtonView<'_>) -> Element<'static, Message>
             } else {
                 0.0
             },
-            color: theme::ACCENT_PINK,
+            color: theme::accent(theme),
         },
         ..Default::default()
     })
@@ -695,6 +770,9 @@ fn rail_cover_button(view: RailCoverButtonView<'_>) -> Element<'static, Message>
             .into()
     };
 
+    if importing.is_some() {
+        return button;
+    }
     tooltip(
         button,
         text(label).size(metrics.header_text_size),
@@ -880,6 +958,7 @@ fn sidebar_button_animated(
         sidebar_id,
         on_press,
         metrics,
+        importing: None,
     })
 }
 
@@ -892,6 +971,7 @@ struct SidebarButtonView {
     sidebar_id: SidebarId,
     on_press: Message,
     metrics: SidebarMetrics,
+    importing: Option<ImportingPlaylist>,
 }
 
 fn sidebar_button_animated_opt_cover(view: SidebarButtonView) -> Element<'static, Message> {
@@ -904,10 +984,14 @@ fn sidebar_button_animated_opt_cover(view: SidebarButtonView) -> Element<'static
         sidebar_id,
         on_press,
         metrics,
+        importing,
     } = view;
-    let icon: Element<'static, Message> = match cover_icon {
-        Some(el) => el,
-        None => svg(svg::Handle::from_memory(fallback_svg.as_bytes()))
+    let icon: Element<'static, Message> = if let Some(playlist) = importing {
+        import_cover(&playlist, cover_icon, metrics)
+    } else if let Some(el) = cover_icon {
+        el
+    } else {
+        svg(svg::Handle::from_memory(fallback_svg.as_bytes()))
             .width(metrics.icon_size)
             .height(metrics.icon_size)
             .style(move |theme, _status| svg::Style {
@@ -917,7 +1001,7 @@ fn sidebar_button_animated_opt_cover(view: SidebarButtonView) -> Element<'static
                     theme::animated_brightness(theme, hover_progress)
                 }),
             })
-            .into(),
+            .into()
     };
 
     let label_text = text(label)
@@ -973,4 +1057,58 @@ fn sidebar_button_animated_opt_cover(view: SidebarButtonView) -> Element<'static
             .on_exit(Message::HoverSidebar(None))
             .into()
     }
+}
+
+/// Only the cover owns cancellation; pressing the importing label is inert.
+fn import_cover(
+    playlist: &ImportingPlaylist,
+    cover: Option<Element<'static, Message>>,
+    metrics: SidebarMetrics,
+) -> Element<'static, Message> {
+    let cover = cover.unwrap_or_else(|| {
+        Space::new()
+            .width(metrics.cover_size)
+            .height(metrics.cover_size)
+            .into()
+    });
+    let indicator = crate::ui::components::importing_card::indicator(
+        playlist,
+        metrics.cover_size,
+        metrics.tokens,
+    );
+    let content = iced::widget::stack![cover, indicator];
+    if playlist.completed || playlist.cancelling {
+        return content.into();
+    }
+    // Keep the cancel glyph above the opaque progress backdrop. Its foreground
+    // uses the theme's primary ink, independently of the progress accent.
+    let cancel = button(
+        container(
+            svg(svg::Handle::from_memory(crate::ui::icons::CLOSE.as_bytes()))
+                .width(metrics.tokens.icon(IconRole::Small))
+                .height(metrics.tokens.icon(IconRole::Small))
+                .style(|theme, _status| svg::Style {
+                    color: Some(theme::text_primary(theme)),
+                }),
+        )
+        .center(metrics.cover_size),
+    )
+    .padding(0)
+    .style(move |theme, status| iced::widget::button::Style {
+        background: Some(iced::Background::Color(theme::hover_bg_alpha(
+            theme,
+            match status {
+                iced::widget::button::Status::Hovered => 0.10,
+                iced::widget::button::Status::Pressed => 0.18,
+                _ => 0.0,
+            },
+        ))),
+        border: iced::Border {
+            radius: metrics.cover_radius.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .on_press(Message::CancelScan);
+    iced::widget::stack![content, cancel].into()
 }

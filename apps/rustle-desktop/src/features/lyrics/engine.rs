@@ -248,8 +248,6 @@ pub struct LyricsEngine {
     physics: ScrollPhysics,
     /// Interlude dots animation
     interlude_dots: InterludeDots,
-    /// Text shaper for calculating line heights
-    text_shaper: TextShaper,
     /// Per-line animation manager
     line_animations: LineAnimationManager,
     /// Pre-allocated animation buffers for efficient rendering
@@ -314,22 +312,13 @@ impl LyricsEngine {
         }
     }
 
-    /// Create new lyrics engine with shared font system
-    ///
-    /// The font system should be created once at app startup and shared
-    /// to avoid the expensive FontSystem::new() call.
-    pub fn new_with_font_system(
-        config: LyricsEngineConfig,
-        font_system: sdf_cache::SharedFontSystem,
-    ) -> Self {
+    /// Animation consumes asynchronously prepared layout and never loads fonts.
+    pub fn new(config: LyricsEngineConfig) -> Self {
         let physics = ScrollPhysics::new();
         debug_assert!(
             [AlignAnchor::Top, AlignAnchor::Center, AlignAnchor::Bottom]
                 .contains(&config.align_anchor)
         );
-
-        // Use provided font system for text shaping
-        let text_shaper = TextShaper::new(font_system);
 
         // Create line animation manager with config
         let mut line_animations = LineAnimationManager::new();
@@ -345,7 +334,6 @@ impl LyricsEngine {
         Self {
             physics,
             interlude_dots: InterludeDots::new(),
-            text_shaper,
             line_animations,
             animation_buffers: AnimationBuffers::new(),
             config,
@@ -424,7 +412,6 @@ impl LyricsEngine {
         let previous = self.config.visual_scale;
         self.config.set_visual_scale(visual_scale);
         if (self.config.visual_scale - previous).abs() > f32::EPSILON {
-            self.last_content_width = 0.0;
             self.layout_dirty = true;
         }
     }
@@ -441,7 +428,21 @@ impl LyricsEngine {
 
     /// Handle mouse wheel event
     pub fn handle_wheel(&mut self, delta: f32) {
-        self.physics.scroll_by(delta);
+        if delta.is_finite() && delta != 0.0 {
+            self.physics.scroll_by(delta);
+        }
+    }
+
+    /// Lyric presses are available only while browsing after a manual scroll.
+    pub fn is_manually_scrolling(&self) -> bool {
+        self.physics.state() == ScrollState::Idle
+    }
+
+    /// Resume playback tracking without snapping the existing line springs.
+    /// The next playback tick animates to the new time just like a slider seek.
+    pub fn resume_auto_follow(&mut self) {
+        self.physics.reset_manual_scroll();
+        self.layout_dirty = true;
     }
 
     /// Get mutable line animation manager
@@ -449,38 +450,8 @@ impl LyricsEngine {
         &mut self.line_animations
     }
 
-    /// Whether viewport/text metrics changed enough to require syncing layout inputs.
-    ///
-    /// This is intentionally separate from per-frame animation updates. Font shaping
-    /// and viewport-dependent layout inputs should only be refreshed when metrics
-    /// change or when no shaped cache is available yet.
-    pub fn needs_viewport_info_update(
-        &self,
-        line_count: usize,
-        content_width: f32,
-        font_size: f32,
-        viewport_height: f32,
-        viewport_width: f32,
-    ) -> bool {
-        let viewport_changed = (self.viewport_height - viewport_height).abs() > 0.5
-            || (self.viewport_width - viewport_width).abs() > 0.5;
-        let content_width_changed = (self.last_content_width - content_width).abs() > 1.0;
-        let font_changed = (self.last_font_size - font_size).abs() > 0.1;
-        let line_count_changed = self.cached_shaped_lines.len() != line_count;
-        let missing_shape_cache = line_count > 0 && self.cached_shaped_lines.is_empty();
-
-        viewport_changed
-            || content_width_changed
-            || font_changed
-            || line_count_changed
-            || missing_shape_cache
-    }
-
-    /// Invalidate layout cache to force re-calculation on next update
-    /// Call this when viewport size changes
+    /// Recalculate scroll layout on the next update while retaining shaped text.
     pub fn invalidate_layout(&mut self) {
-        self.last_content_width = 0.0;
-        self.last_font_size = 0.0;
         self.layout_dirty = true;
     }
 
@@ -565,23 +536,13 @@ impl LyricsEngine {
         }
     }
 
-    /// Set viewport information and recalculate line heights if needed
+    /// Set viewport information without reshaping the prepared text.
     /// Call this before set_current_time when viewport size changes
     ///
     /// Parameters:
-    /// - lines: The lyrics lines
-    /// - content_width: Available width for text (in logical pixels)
-    /// - font_size: Font size (in logical pixels, typically 48.0)
     /// - viewport_height: Viewport height (in logical pixels)
     /// - viewport_width: Viewport width (in logical pixels)
-    pub fn set_viewport_info(
-        &mut self,
-        lines: &[LyricLineData],
-        content_width: f32,
-        font_size: f32,
-        viewport_height: f32,
-        viewport_width: f32,
-    ) {
+    pub fn set_viewport_info(&mut self, viewport_height: f32, viewport_width: f32) {
         if (self.viewport_height - viewport_height).abs() > 0.5
             || (self.viewport_width - viewport_width).abs() > 0.5
         {
@@ -590,7 +551,6 @@ impl LyricsEngine {
         self.viewport_height = viewport_height;
         self.viewport_width = viewport_width;
         self.line_animations.set_viewport_height(viewport_height);
-        self.calculate_line_heights(lines, content_width, font_size);
     }
 
     fn update_dynamic_spring_params(&mut self, lines: &[LyricLineData]) {
@@ -762,110 +722,6 @@ impl LyricsEngine {
             self.physics.state() != ScrollState::AutoPlay || manual_scroll_offset.abs() > 0.5;
     }
 
-    /// Calculate and cache line heights using text shaper
-    /// Call this when lyrics change or viewport width changes
-    ///
-    /// 文本布局的唯一数据源
-    /// All shaped line data (glyphs, positions, heights) is cached here
-    /// and passed to GPU pipeline for rendering.
-    ///
-    /// Parameters:
-    /// - lines: The lyrics lines to calculate heights for
-    /// - content_width: Available width for text (in logical pixels)
-    /// - font_size: Font size (in logical pixels)
-    pub fn calculate_line_heights(
-        &mut self,
-        lines: &[LyricLineData],
-        content_width: f32,
-        font_size: f32,
-    ) {
-        // Check if we need to recalculate
-        let width_changed = (self.last_content_width - content_width).abs() > 1.0;
-        let font_changed = (self.last_font_size - font_size).abs() > 0.1;
-        let lines_changed = self.cached_shaped_lines.len() != lines.len();
-
-        // If nothing changed, skip the expensive shaping operation
-        if !lines_changed && !width_changed && !font_changed && !self.cached_shaped_lines.is_empty()
-        {
-            return;
-        }
-
-        // Shape all lines and cache the results (Single Source of Truth)
-        let shaped_lines: Vec<CachedShapedLine> = lines
-            .iter()
-            .map(|line| {
-                let main_font_size = if line.is_bg {
-                    (font_size * self.config.bg_font_size_ratio).max(10.0)
-                } else {
-                    font_size
-                };
-                let trans_font_size = (main_font_size * self.config.trans_height_ratio).max(10.0);
-                let roman_font_size = (main_font_size * self.config.roman_height_ratio).max(10.0);
-
-                // Shape main lyrics
-                let main_shaped = self.text_shaper.shape_line(
-                    &line.text,
-                    &line.words,
-                    main_font_size,
-                    content_width,
-                );
-                let mut total_height = main_shaped.height;
-
-                // Shape translation line if present
-                let translation_shaped = if let Some(ref translated) = line.translated {
-                    if !translated.is_empty() {
-                        let shaped = self.text_shaper.shape_simple(
-                            translated,
-                            trans_font_size,
-                            content_width,
-                        );
-                        total_height += shaped.height;
-                        Some(shaped)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Shape romanized line if present
-                let romanized_shaped = if let Some(ref romanized) = line.romanized {
-                    if !romanized.is_empty() {
-                        let shaped = self.text_shaper.shape_simple(
-                            romanized,
-                            roman_font_size,
-                            content_width,
-                        );
-                        total_height += shaped.height;
-                        Some(shaped)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                CachedShapedLine {
-                    main: main_shaped,
-                    main_font_size,
-                    translation: translation_shaped,
-                    translation_font_size: trans_font_size,
-                    romanized: romanized_shaped,
-                    romanized_font_size: roman_font_size,
-                    total_height,
-                }
-            })
-            .collect();
-
-        // Update cached line heights (for convenience)
-        self.cached_line_heights = Arc::new(shaped_lines.iter().map(|s| s.total_height).collect());
-        self.cached_shaped_lines = Arc::new(shaped_lines);
-
-        self.last_content_width = content_width;
-        self.last_font_size = font_size;
-        self.layout_dirty = true;
-    }
-
     /// Get cached line heights as an O(1) snapshot.
     pub fn cached_line_heights_arc(&self) -> Arc<Vec<f32>> {
         Arc::clone(&self.cached_line_heights)
@@ -904,6 +760,12 @@ impl LyricsEngine {
         content_width: f32,
         font_size: f32,
     ) {
+        if Arc::ptr_eq(&self.cached_shaped_lines, &shaped_lines)
+            && self.last_content_width == content_width
+            && self.last_font_size == font_size
+        {
+            return;
+        }
         // Update cached line heights from shaped lines
         self.cached_line_heights = Arc::new(shaped_lines.iter().map(|s| s.total_height).collect());
 
@@ -1218,24 +1080,6 @@ impl LyricsEngine {
         self.is_playing
     }
 
-    /// Update the font family used for shaping.
-    ///
-    /// `None` triggers auto-detection via the platform font candidate list.
-    /// Call this when the user changes the font family in settings.
-    /// Invalidates layout so the next frame re-shapes all lines.
-    pub fn set_font_family(
-        &mut self,
-        font_family: Option<String>,
-        font_system: crate::features::lyrics::engine::sdf_cache::SharedFontSystem,
-    ) {
-        let config = FontConfig {
-            font_family: font_family.clone(),
-            ..Default::default()
-        };
-        self.text_shaper = TextShaper::with_config(font_system, config);
-        self.invalidate_layout();
-    }
-
     /// Get interlude dots state for rendering
     pub fn interlude_dots(&self) -> &InterludeDots {
         &self.interlude_dots
@@ -1264,5 +1108,109 @@ impl LyricsEngine {
     /// Static traits for the current lyrics.
     pub fn line_traits(&self) -> LyricsLineTraits {
         self.line_traits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_browsing_ends_on_resume_timeout_and_new_lyrics() {
+        let mut engine = LyricsEngine::new(LyricsEngineConfig::default());
+        assert!(!engine.is_manually_scrolling());
+        engine.handle_wheel(0.0);
+        engine.handle_wheel(f32::NAN);
+        assert!(!engine.is_manually_scrolling());
+
+        engine.handle_wheel(40.0);
+        assert!(engine.is_manually_scrolling());
+        engine.resume_auto_follow();
+        assert!(!engine.is_manually_scrolling());
+
+        engine.handle_wheel(40.0);
+        engine.config.scroll_timeout = 0.0;
+        engine.update(1.0 / 60.0);
+        assert!(!engine.is_manually_scrolling());
+
+        engine.handle_wheel(40.0);
+        engine.reset_for_new_lyrics();
+        assert!(!engine.is_manually_scrolling());
+    }
+
+    #[test]
+    fn lyric_seek_keeps_drawn_positions_then_animates_to_playback() {
+        let lines: Vec<_> = (0..8)
+            .map(|index| LyricLineData {
+                text: format!("Line {index}"),
+                start_ms: index * 2000,
+                end_ms: (index + 1) * 2000,
+                ..Default::default()
+            })
+            .collect();
+        let positions = |engine: &LyricsEngine| {
+            engine
+                .line_animations
+                .animations_slice()
+                .iter()
+                .map(|line| line.current_y())
+                .collect::<Vec<_>>()
+        };
+
+        for (initial_time, target_time) in [(0.0, 6000.0), (10000.0, 2000.0), (4000.0, 4000.0)] {
+            let mut engine = LyricsEngine::new(LyricsEngineConfig::default());
+            engine.set_viewport_info(800.0, 600.0);
+            engine.set_current_time(initial_time, &lines, true);
+            engine.handle_wheel(120.0);
+            engine.set_current_time(initial_time, &lines, false);
+            for _ in 0..180 {
+                engine.update(1.0 / 60.0);
+            }
+            let before = positions(&engine);
+
+            engine.resume_auto_follow();
+            engine.set_current_time(target_time, &lines, false);
+            assert_eq!(
+                positions(&engine),
+                before,
+                "click must not snap line positions"
+            );
+            assert!(!engine.is_manually_scrolling());
+
+            for _ in 0..240 {
+                engine.update(1.0 / 60.0);
+            }
+            let after = positions(&engine);
+            assert_ne!(
+                after, before,
+                "lines must move toward the playback position"
+            );
+
+            let mut target = LyricsEngine::new(LyricsEngineConfig::default());
+            target.set_viewport_info(800.0, 600.0);
+            target.set_current_time(target_time, &lines, true);
+            for (actual, expected) in after.into_iter().zip(positions(&target)) {
+                assert!(
+                    (actual - expected).abs() < 0.1,
+                    "animation must settle at playback: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn animation_and_resize_never_shape_or_replace_prepared_layout() {
+        let mut engine = LyricsEngine::new(LyricsEngineConfig::default());
+        let prepared = Arc::new(Vec::new());
+        engine.set_cached_shaped_lines_arc_with_metrics(prepared.clone(), 600.0, 48.0);
+        let heights = engine.cached_line_heights_arc();
+        for frame in 0..120 {
+            engine.set_viewport_info(800.0, 900.0 + frame as f32);
+            engine.update(1.0 / 60.0);
+            engine.set_cached_shaped_lines_arc_with_metrics(prepared.clone(), 600.0, 48.0);
+        }
+        assert!(Arc::ptr_eq(&engine.cached_shaped_lines(), &prepared));
+        assert!(Arc::ptr_eq(&engine.cached_line_heights_arc(), &heights));
+        assert_eq!(engine.resolved_font_size(), 48.0);
     }
 }

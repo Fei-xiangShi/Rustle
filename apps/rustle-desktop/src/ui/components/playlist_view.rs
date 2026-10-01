@@ -407,6 +407,7 @@ pub fn build_list<'a>(view: SongListView<'a>) -> Element<'a, Message> {
     let indices_for_visible = filtered_indices.clone();
     let songs_for_visible = songs;
     let image_generation = image_state.generation;
+    let image_token = image_generation.wrapping_add(image_state.artwork_epoch << 32);
 
     VirtualList::new(song_count, row_height, tokens, item_builder)
         .keyed_by(move |index| {
@@ -455,16 +456,15 @@ pub fn build_list<'a>(view: SongListView<'a>) -> Element<'a, Message> {
                 let Some((kind, id)) = song.cover_key else {
                     continue;
                 };
-                let Some(url) = song.cover_url.as_deref() else {
-                    continue;
-                };
-                if !url.is_empty() {
-                    images.push((kind, id, url.to_string()));
-                }
+                let url = song
+                    .cover_url
+                    .clone()
+                    .unwrap_or_else(|| format!("ncm://{id}"));
+                images.push((kind, id, url));
             }
             Message::ImageViewportChanged(image_generation, images)
         })
-        .visible_range_token(image_generation)
+        .visible_range_token(image_token)
         .into()
 }
 
@@ -507,7 +507,7 @@ fn build_song_row(
             .width(tokens.icon(crate::ui::responsive::IconRole::Small))
             .height(tokens.icon(crate::ui::responsive::IconRole::Small))
             .style(|_theme, _status| svg::Style {
-                color: Some(theme::ACCENT_PINK),
+                color: Some(theme::accent(_theme)),
             })
             .opacity(1.0 - hover_progress);
 
@@ -559,7 +559,7 @@ fn build_song_row(
             .ellipsis(Ellipsis::End)
             .style(move |theme| text::Style {
                 color: Some(if is_playing {
-                    theme::ACCENT_PINK
+                    theme::accent(theme)
                 } else {
                     theme::text_primary(theme)
                 })
@@ -623,7 +623,7 @@ fn build_song_row(
                     .height(favorite_glyph_size)
                     .style(move |theme, _status| svg::Style {
                         color: Some(if is_liked {
-                            theme::ACCENT_PINK
+                            theme::accent(theme)
                         } else {
                             theme::text_primary(theme)
                         }),

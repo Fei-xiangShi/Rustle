@@ -7,7 +7,7 @@ use iced::Task;
 
 use crate::app::state::{ImageRequest, ImageRequestScope};
 use crate::app::{App, Message, Route};
-use crate::image::{ImageKind, ImageResult};
+use crate::image::{ImageKind, ImageVariant};
 
 const MAX_IMAGE_DOWNLOADS: usize = 6;
 
@@ -17,31 +17,91 @@ impl App {
     /// Handle unified image-pipeline messages.
     pub fn handle_image(&mut self, message: &Message) -> Option<Task<Message>> {
         match message {
-            Message::ImageDownloadReady(generation, scope, kind, id, path) => {
-                if !self
+            Message::ImageDownloadReady(generation, scope, kind, id, variant, entry) => {
+                let path = &entry.path;
+                if !self.ui.image_state.is_current_variant_inflight(
+                    *kind,
+                    *id,
+                    *variant,
+                    *generation,
+                    *scope,
+                ) || self
                     .ui
                     .image_state
-                    .is_current_inflight(*kind, *id, *generation, *scope)
+                    .inflight
+                    .get(&(*kind, *id, *variant))
+                    .is_none_or(|request| {
+                        entry.source_url.as_deref() != Some(request.source_url.as_str())
+                    })
                 {
                     return Some(Task::none());
                 }
-                self.store_image_handle(*kind, *id, path.clone());
+                self.ui
+                    .image_state
+                    .clear_variant_inflight(*kind, *id, *variant);
+                self.ui
+                    .image_state
+                    .insert_prepared(*kind, *id, *variant, entry.as_ref().clone());
+                self.sync_preferred_image_to_current_page(*kind, *id);
                 Some(Task::batch([
-                    self.after_image_ready(*kind, *id, path),
+                    self.after_image_ready(*kind, *id, *variant, path),
                     self.pump_image_downloads(),
                 ]))
             }
 
-            Message::ImageDownloadFailed(generation, scope, kind, id) => {
-                if !self
-                    .ui
-                    .image_state
-                    .is_current_inflight(*kind, *id, *generation, *scope)
-                {
+            Message::ImageDownloadFailed(generation, scope, kind, id, variant) => {
+                if !self.ui.image_state.is_current_variant_inflight(
+                    *kind,
+                    *id,
+                    *variant,
+                    *generation,
+                    *scope,
+                ) {
                     return Some(Task::none());
                 }
-                self.ui.image_state.clear_inflight(*kind, *id);
+                let replacement_queued = self
+                    .ui
+                    .image_state
+                    .clear_variant_inflight(*kind, *id, *variant);
+                if !replacement_queued {
+                    self.ui
+                        .image_state
+                        .failures
+                        .insert((*kind, *id, *variant), std::time::Instant::now());
+                }
                 Some(self.pump_image_downloads())
+            }
+
+            Message::CurrentSongImageSourceResolved(song_id, ncm_id, url) => {
+                self.ui
+                    .image_state
+                    .finish_source_resolution(ImageKind::SongCover, *ncm_id);
+                let is_current = self.playback.current_song.as_ref().is_some_and(|song| {
+                    song.id == *song_id
+                        && crate::image::song_cover_key_for_source(song.id, &song.file_path)
+                            == Some((ImageKind::SongCover, *ncm_id))
+                });
+                if !is_current {
+                    return Some(Task::none());
+                }
+                let Some(url) = url.as_deref().filter(|url| !url.is_empty()) else {
+                    return Some(Task::none());
+                };
+                let mut tasks =
+                    current_song_remote_variants(ImageKind::SongCover, self.ui.lyrics.is_open)
+                        .into_iter()
+                        .map(|variant| {
+                            self.enqueue_image_variant_download_scoped(
+                                ImageKind::SongCover,
+                                *ncm_id,
+                                variant,
+                                url,
+                                ImageRequestScope::Global,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                tasks.push(self.pump_image_downloads());
+                Some(Task::batch(tasks))
             }
 
             Message::ImageViewportChanged(generation, images) => {
@@ -64,7 +124,11 @@ impl App {
     pub(super) fn collect_image_tasks_after_message(&mut self, message: &Message) -> Task<Message> {
         if matches!(
             message,
-            Message::ImageDownloadReady(..) | Message::ImageDownloadFailed(..)
+            Message::ImageDownloadReady(..)
+                | Message::ImageDownloadFailed(..)
+                | Message::PlaybackTick
+                | Message::AnimationTick(_)
+                | Message::MouseMoved(_)
         ) {
             return Task::none();
         }
@@ -80,7 +144,7 @@ impl App {
         let mut refs = Vec::new();
 
         match message {
-            Message::AutoLoginResult(Some(login_info), _) | Message::LoginSuccess(login_info) => {
+            Message::AutoLoginResult(Ok(login_info), _) | Message::LoginSuccess(login_info) => {
                 refs.push(RemoteImage::global(
                     ImageKind::UserAvatar,
                     login_info.user_id,
@@ -141,9 +205,8 @@ impl App {
             {
                 refs.extend(remote_playlist_covers(std::slice::from_ref(playlist)));
             }
-            Message::AddNcmPlaylist(songs, _) | Message::AddNcmPlaylistWithSource(songs, _, _) => {
-                refs.extend(remote_track_covers(songs));
-            }
+            // Enqueuing a playlist must not decode every song cover: visible
+            // rows and the current song independently request what they need.
             Message::PlayNcmSong(song) => {
                 refs.push(RemoteImage::global(
                     ImageKind::SongCover,
@@ -182,7 +245,7 @@ impl App {
                 if *generation == self.ui.playlist_page.ncm_load_generation
                     && matches!(self.ui.current_route, Route::NcmPlaylist(id) if id == detail.id) =>
             {
-                refs.push(RemoteImage::new(
+                refs.push(RemoteImage::detail(
                     ImageKind::PlaylistCover,
                     detail.id,
                     &detail.cover_url,
@@ -199,7 +262,7 @@ impl App {
                 if *generation == self.ui.playlist_page.ncm_load_generation
                     && matches!(self.ui.current_route, Route::NcmPlaylist(id) if id == *playlist_id) =>
             {
-                refs.push(RemoteImage::new(
+                refs.push(RemoteImage::detail(
                     ImageKind::PlaylistCover,
                     detail.id,
                     &detail.cover_url,
@@ -216,7 +279,7 @@ impl App {
                 if *generation == self.ui.playlist_page.ncm_load_generation
                     && matches!(self.ui.current_route, Route::NcmPlaylist(id) if id == detail.id) =>
             {
-                refs.push(RemoteImage::new(
+                refs.push(RemoteImage::detail(
                     ImageKind::PlaylistCover,
                     detail.id,
                     &detail.cover_url,
@@ -229,9 +292,11 @@ impl App {
                     ));
                 }
             }
-            Message::AlbumDetailLoaded(detail) if matches!(self.ui.current_route, Route::Album(id) if id == detail.id) =>
+            Message::AlbumDetailLoaded(generation, detail)
+                if *generation == self.ui.playlist_page.ncm_load_generation
+                    && matches!(self.ui.current_route, Route::Album(id) if id == detail.id) =>
             {
-                refs.push(RemoteImage::new(
+                refs.push(RemoteImage::detail(
                     ImageKind::AlbumCover,
                     detail.id,
                     &detail.image_url,
@@ -244,9 +309,11 @@ impl App {
                     ));
                 }
             }
-            Message::ArtistDetailLoaded(detail) if matches!(self.ui.current_route, Route::Artist(id) if id == detail.id) =>
+            Message::ArtistDetailLoaded(generation, detail)
+                if *generation == self.ui.playlist_page.ncm_load_generation
+                    && matches!(self.ui.current_route, Route::Artist(id) if id == detail.id) =>
             {
-                refs.push(RemoteImage::new(
+                refs.push(RemoteImage::detail(
                     ImageKind::ArtistCover,
                     detail.id,
                     &detail.image_url,
@@ -257,21 +324,32 @@ impl App {
             {
                 refs.extend(remote_album_covers(albums));
             }
-            Message::UserPageDetailLoaded(page_id, detail)
-                if user_route_matches_page_id(&self.ui.current_route, *page_id) =>
+            Message::UserPageDetailLoaded(generation, page_id, detail)
+                if *generation == self.ui.playlist_page.ncm_load_generation
+                    && user_route_matches_page_id(&self.ui.current_route, *page_id) =>
             {
-                refs.push(RemoteImage::new(
+                refs.push(RemoteImage::detail(
                     ImageKind::UserAvatar,
                     detail.user_id,
                     &detail.avatar_url,
                 ));
                 if detail.artist_id != 0 {
-                    refs.push(RemoteImage::new(
+                    refs.push(RemoteImage::detail(
                         ImageKind::ArtistCover,
                         detail.artist_id,
                         &detail.background_url,
                     ));
                 }
+            }
+            Message::UserArtistDetailLoaded(generation, page_id, detail)
+                if *generation == self.ui.playlist_page.ncm_load_generation
+                    && user_route_matches_page_id(&self.ui.current_route, *page_id) =>
+            {
+                refs.push(RemoteImage::detail(
+                    ImageKind::ArtistCover,
+                    detail.id,
+                    &detail.image_url,
+                ));
             }
             Message::UserPagePlaylistsLoaded(page_id, playlists)
                 if user_route_matches_page_id(&self.ui.current_route, *page_id) =>
@@ -307,7 +385,13 @@ impl App {
         let mut tasks = refs
             .into_iter()
             .map(|image| {
-                self.enqueue_image_download_scoped(image.kind, image.id, &image.url, image.scope)
+                self.enqueue_image_variant_download_scoped(
+                    image.kind,
+                    image.id,
+                    image.variant,
+                    &image.url,
+                    image.scope,
+                )
             })
             .collect::<Vec<_>>();
         tasks.push(self.pump_image_downloads());
@@ -316,6 +400,14 @@ impl App {
     }
 
     fn collect_current_song_image_task(&mut self) -> Task<Message> {
+        if self.library.audio_index.running
+            && crate::utils::audio_index::snapshot()
+                .cache_dir
+                .as_os_str()
+                .is_empty()
+        {
+            return Task::none();
+        }
         let Some(song) = self.playback.current_song.clone() else {
             return Task::none();
         };
@@ -324,32 +416,63 @@ impl App {
             return Task::none();
         };
 
-        if let Some(local_path) = self.resolved_song_cover_local_path(&song) {
-            if self.ui.image_state.get(kind, id).is_none() {
-                self.store_image_path(kind, id, local_path.clone());
+        let source = if kind == ImageKind::LocalSongCover {
+            Some(song.file_path.clone())
+        } else {
+            song.cover_path
+                .as_deref()
+                .filter(|p| crate::image::is_remote_url(p))
+                .map(str::to_owned)
+                .or_else(|| self.ui.image_state.known_sources.get(&(kind, id)).cloned())
+                .or_else(|| {
+                    self.current_ncm_track(id)
+                        .map(|track| track.cover_url().to_owned())
+                })
+                .or_else(|| {
+                    crate::utils::audio_index::snapshot()
+                        .locate(
+                            &song.file_path,
+                            song.id,
+                            Some(&song.artist),
+                            Some(&song.title),
+                        )
+                        .map(|_| format!("ncm://{id}"))
+                })
+        };
+        if let Some(source) = source {
+            let mut tasks = Vec::new();
+            for variant in
+                current_song_remote_variants(ImageKind::SongCover, self.ui.lyrics.is_open)
+            {
+                tasks.push(self.enqueue_image_variant_download_scoped(
+                    kind,
+                    id,
+                    variant,
+                    &source,
+                    ImageRequestScope::Global,
+                ));
             }
-
-            if !cover_path_matches(song.cover_path.as_deref(), &local_path) {
-                return self.after_image_ready(kind, id, &local_path);
-            }
-
-            return Task::none();
+            tasks.push(self.pump_image_downloads());
+            return Task::batch(tasks);
         }
-
-        if let Some(path_or_url) = song.cover_path.as_deref()
-            && crate::image::is_remote_url(path_or_url)
+        if kind == ImageKind::SongCover
+            && let Some(client) = self.core.ncm_client.as_ref().cloned()
+            && self.ui.image_state.begin_source_resolution(kind, id)
         {
-            let enqueue_task = self.enqueue_image_download_scoped(
-                kind,
-                id,
-                path_or_url,
-                ImageRequestScope::Global,
+            let song_id = song.id;
+            return Task::perform(
+                async move {
+                    client.track_detail(&[id]).await.ok().and_then(|tracks| {
+                        tracks
+                            .into_iter()
+                            .next()
+                            .map(|track| track.cover_url().to_owned())
+                    })
+                },
+                move |url| Message::CurrentSongImageSourceResolved(song_id, id, url),
             );
-            return Task::batch([enqueue_task, self.pump_image_downloads()]);
         }
-
-        self.register_cached_image(kind, id)
-            .unwrap_or_else(Task::none)
+        Task::none()
     }
 
     /// Re-register discover covers after a route transition cancelled page-scoped work.
@@ -371,7 +494,13 @@ impl App {
         let mut tasks = refs
             .into_iter()
             .map(|image| {
-                self.enqueue_image_download_scoped(image.kind, image.id, &image.url, image.scope)
+                self.enqueue_image_variant_download_scoped(
+                    image.kind,
+                    image.id,
+                    image.variant,
+                    &image.url,
+                    image.scope,
+                )
             })
             .collect::<Vec<_>>();
         tasks.push(self.pump_image_downloads());
@@ -386,205 +515,159 @@ impl App {
     ) -> Option<std::path::PathBuf> {
         let (kind, id) = crate::image::song_cover_key_for_source(song.id, &song.file_path)?;
 
-        if let Some((path, _, _)) = self.ui.image_state.image_data(kind, id)
-            && path.exists()
-        {
-            return Some(path.clone());
-        }
-
-        crate::image::resolve_cached(kind, id)
+        self.ui
+            .image_state
+            .image_data_variant(kind, id, ImageVariant::Hero)
+            .or_else(|| self.ui.image_state.image_data(kind, id))
+            .map(|(path, _, _)| path.clone())
     }
 
-    /// Resolve the local cover file for a song without starting network work.
     pub(super) fn resolved_song_cover_local_path(
         &self,
         song: &crate::database::DbSong,
     ) -> Option<std::path::PathBuf> {
-        if let Some(path) = song.cover_path.as_deref()
-            && crate::image::is_valid_local_path(path)
-        {
-            return Some(std::path::PathBuf::from(path));
-        }
-
         self.cached_song_cover_local_path(song)
     }
 
     // ── Internal ──
 
-    /// If the given `(kind, id)` is already in memory or on disk, populate
-    /// `ImageState` immediately. Otherwise queue it for the bounded downloader.
-    fn enqueue_image_download_scoped(
+    /// Populate an exact role/source derivative from memory or disk, retain a
+    /// legacy Thumbnail as fallback, and otherwise queue bounded network work.
+    fn enqueue_image_variant_download_scoped(
         &mut self,
         kind: ImageKind,
         id: u64,
+        variant: ImageVariant,
         url: &str,
         scope: ImageRequestScope,
     ) -> Task<Message> {
+        let fallback;
+        let url = if url.is_empty() && kind == ImageKind::SongCover {
+            fallback = format!("ncm://{id}");
+            fallback.as_str()
+        } else {
+            url
+        };
         if url.is_empty() {
             return Task::none();
         }
-        if self.ui.image_state.get(kind, id).is_some() {
-            // The image may have been loaded while the user was on another
-            // page (for example, from a playlist grid). Keep the current
-            // detail page in sync as well; otherwise its palette remains the
-            // default even though the cover is already available.
-            if let Some(path) = self
-                .ui
-                .image_state
-                .image_data(kind, id)
-                .map(|(path, _, _)| path.clone())
-            {
-                self.sync_loaded_image_to_current_page(kind, id, &path);
+
+        if self
+            .ui
+            .image_state
+            .has_current_remote_variant(kind, id, variant, url)
+        {
+            let key = (kind, id, variant);
+            if self.ui.image_state.song_lru.contains(&key) {
+                self.ui
+                    .image_state
+                    .song_lru
+                    .retain(|candidate| *candidate != key);
+                self.ui.image_state.song_lru.push_back(key);
             }
-            return Task::none();
-        }
-        if let Some(task) = self.register_cached_image(kind, id) {
-            return task;
-        }
-        if self.core.ncm_client.is_none() {
+            self.sync_preferred_image_to_current_page(kind, id);
             return Task::none();
         }
 
         self.ui
             .image_state
-            .enqueue_with_scope(kind, id, url.to_string(), scope);
+            .enqueue_variant_with_scope(kind, id, variant, url.to_string(), scope);
         Task::none()
     }
 
     pub(super) fn pump_image_downloads(&mut self) -> Task<Message> {
-        let Some(client) = self.core.ncm_client.as_ref().cloned() else {
-            return Task::none();
-        };
-
+        let client = self.core.ncm_client.clone();
         let mut tasks = Vec::new();
-
         while self.ui.image_state.inflight.len() < MAX_IMAGE_DOWNLOADS {
             let Some(request) = self.ui.image_state.pop_pending() else {
                 break;
             };
-
-            if self.ui.image_state.get(request.kind, request.id).is_some()
-                || self.ui.image_state.is_inflight(request.kind, request.id)
+            if matches!(
+                request.kind,
+                ImageKind::SongCover | ImageKind::LocalSongCover
+            ) && self.library.audio_index.running
+                && crate::utils::audio_index::snapshot()
+                    .cache_dir
+                    .as_os_str()
+                    .is_empty()
             {
-                continue;
+                self.ui
+                    .image_state
+                    .queued
+                    .insert((request.kind, request.id, request.variant));
+                self.ui.image_state.pending.push_front(request);
+                break;
             }
-
-            if let Some(path) = crate::image::resolve_cached(request.kind, request.id) {
-                self.store_image_handle(request.kind, request.id, path.clone());
-                tasks.push(self.after_image_ready(request.kind, request.id, &path));
-                continue;
-            }
-
-            let (task, handle) = start_image_download(client.clone(), request.clone());
-            self.ui.image_state.mark_inflight(
+            if self.ui.image_state.has_current_remote_variant(
                 request.kind,
                 request.id,
-                request.generation,
-                request.scope,
-                handle,
-            );
+                request.variant,
+                &request.url,
+            ) || self.ui.image_state.is_variant_inflight(
+                request.kind,
+                request.id,
+                request.variant,
+            ) {
+                continue;
+            }
+            let local_audio = if request.kind == ImageKind::SongCover {
+                let index = crate::utils::audio_index::snapshot();
+                let track = self.current_ncm_track(request.id);
+                let current = self.playback.current_song.as_ref().filter(|song| {
+                    crate::image::ncm_song_id(song.id, &song.file_path) == Some(request.id)
+                });
+                let artist = track
+                    .map(|track| track.artist_names())
+                    .or_else(|| current.map(|song| song.artist.clone()));
+                let title = track
+                    .map(|track| track.title.as_str())
+                    .or_else(|| current.map(|song| song.title.as_str()));
+                index
+                    .locate("", -(request.id as i64), artist.as_deref(), title)
+                    .map(|file| file.path.clone())
+            } else {
+                None
+            };
+            let (task, handle) = start_image_download(client.clone(), request.clone(), local_audio);
+            self.ui.image_state.mark_request_inflight(&request, handle);
             tasks.push(task);
         }
-
         Task::batch(tasks)
-    }
-
-    fn register_cached_image(&mut self, kind: ImageKind, id: u64) -> Option<Task<Message>> {
-        if self.ui.image_state.get(kind, id).is_some() {
-            return None;
-        }
-        let path = crate::image::resolve_cached(kind, id)?;
-        self.store_image_handle(kind, id, path.clone());
-        Some(self.after_image_ready(kind, id, &path))
-    }
-
-    fn store_image_handle(&mut self, kind: ImageKind, id: u64, path: std::path::PathBuf) {
-        self.ui.image_state.insert_path(kind, id, path.clone());
-        self.sync_loaded_image_to_current_page(kind, id, &path);
     }
 
     fn after_image_ready(
         &mut self,
         kind: ImageKind,
         id: u64,
+        _variant: ImageVariant,
         path: &std::path::Path,
     ) -> Task<Message> {
         if !matches!(kind, ImageKind::SongCover | ImageKind::LocalSongCover) {
             return Task::none();
         }
-        let key = (kind, id);
-
-        let path_string = path.to_string_lossy().to_string();
-
-        if let Some(current) = &mut self.playback.current_song
-            && crate::image::song_cover_key_for_source(current.id, &current.file_path) == Some(key)
+        if let Some(song) = self.playback.current_song.as_ref()
+            && crate::image::song_cover_key_for_source(song.id, &song.file_path) == Some((kind, id))
         {
-            current.cover_path = Some(path_string.clone());
+            return self.prepare_lyrics_background_for_cover_path(song.id, path.to_owned());
         }
-
-        let mut matched_song = None;
-        if let Some(idx) = self.playback.current_index
-            && let Some(queue_song) = self.playback.queue.get_mut(idx)
-            && crate::image::song_cover_key_for_source(queue_song.id, &queue_song.file_path)
-                == Some(key)
-        {
-            queue_song.cover_path = Some(path_string.clone());
-            matched_song = Some(queue_song.clone());
-
-            if let Some(db) = &self.core.db {
-                let db = db.clone();
-                match kind {
-                    ImageKind::SongCover => {
-                        let song_clone = queue_song.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = db.upsert_ncm_song(&song_clone).await {
-                                tracing::warn!("Failed to update cover path in database: {}", e);
-                            }
-                        });
-                    }
-                    ImageKind::LocalSongCover => {
-                        let song_id = queue_song.id;
-                        let cover_path = path_string.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = db.update_song_cover(song_id, &cover_path).await {
-                                tracing::warn!(
-                                    "Failed to update local cover path in database: {}",
-                                    e
-                                );
-                            }
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(song) = self.playback.current_song.clone()
-            && crate::image::song_cover_key_for_source(song.id, &song.file_path) == Some(key)
-        {
-            return self.update_lyrics_background(&song);
-        }
-
-        if let Some(song) = matched_song
-            && self.ui.lyrics.is_open
-            && self
-                .playback
-                .preload_coordinator
-                .window()
-                .contains_song(song.id)
-        {
-            return self
-                .prepare_lyrics_background_for_cover_path(song.id, std::path::PathBuf::from(path));
-        }
-
         Task::none()
     }
 
     pub(crate) fn store_image_path(&mut self, kind: ImageKind, id: u64, path: std::path::PathBuf) {
-        if !path.exists() {
-            return;
+        let source = path.to_string_lossy().into_owned();
+        self.ui
+            .image_state
+            .known_sources
+            .insert((kind, id), source.clone());
+        if !matches!(kind, ImageKind::SongCover | ImageKind::LocalSongCover) {
+            self.ui.image_state.enqueue_variant_with_scope(
+                kind,
+                id,
+                ImageVariant::Thumbnail,
+                source,
+                ImageRequestScope::Global,
+            );
         }
-        self.store_image_handle(kind, id, path);
     }
 
     pub(crate) fn store_image_paths<I>(&mut self, images: I)
@@ -597,15 +680,23 @@ impl App {
     }
 
     pub(crate) fn store_db_song_cover_paths(&mut self, songs: &[crate::database::DbSong]) {
-        let images = songs.iter().filter_map(|song| {
-            let path = song.cover_path.as_deref()?;
-            if !crate::image::is_valid_local_path(path) {
-                return None;
+        for song in songs {
+            if let Some((kind, id)) =
+                crate::image::song_cover_key_for_source(song.id, &song.file_path)
+            {
+                let source = if kind == ImageKind::LocalSongCover {
+                    Some(song.file_path.clone())
+                } else {
+                    song.cover_path
+                        .as_deref()
+                        .filter(|p| crate::image::is_remote_url(p))
+                        .map(str::to_owned)
+                };
+                if let Some(source) = source {
+                    self.ui.image_state.known_sources.insert((kind, id), source);
+                }
             }
-            let (kind, id) = crate::image::song_cover_key_for_source(song.id, &song.file_path)?;
-            Some((kind, id, std::path::PathBuf::from(path)))
-        });
-        self.store_image_paths(images);
+        }
     }
 
     pub(crate) fn store_local_playlist_cover_paths(
@@ -627,12 +718,28 @@ impl App {
         self.store_image_paths(images);
     }
 
-    fn sync_loaded_image_to_current_page(
-        &mut self,
-        kind: ImageKind,
-        id: u64,
-        path: &std::path::Path,
-    ) {
+    fn sync_preferred_image_to_current_page(&mut self, kind: ImageKind, id: u64) {
+        let Some(path) = self
+            .ui
+            .image_state
+            .image_data_variant(kind, id, ImageVariant::Detail)
+            .or_else(|| self.ui.image_state.image_data(kind, id))
+            .map(|(path, _, _)| path.clone())
+        else {
+            return;
+        };
+        let palette = self
+            .ui
+            .image_state
+            .entries
+            .get(&(kind, id, ImageVariant::Detail))
+            .or_else(|| {
+                self.ui
+                    .image_state
+                    .entries
+                    .get(&(kind, id, ImageVariant::Thumbnail))
+            })
+            .and_then(|entry| entry.palette.clone());
         let Some(page) = self.ui.playlist_page.current.as_mut() else {
             return;
         };
@@ -643,31 +750,31 @@ impl App {
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::Playlist
                     && page.id == ncm_playlist_page_id(id) =>
             {
-                set_detail_cover(page, path, path_string);
+                set_detail_cover(page, palette, path_string);
             }
             ImageKind::LocalPlaylistCover
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::Playlist
                     && page.id == id as i64 =>
             {
-                set_detail_cover(page, path, path_string);
+                set_detail_cover(page, palette, path_string);
             }
             ImageKind::AlbumCover
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::Album
                     && page.id == album_page_id(id) =>
             {
-                set_detail_cover(page, path, path_string);
+                set_detail_cover(page, palette, path_string);
             }
             ImageKind::ArtistCover
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::Artist
                     && page.id == artist_page_id(id) =>
             {
-                set_detail_cover(page, path, path_string);
+                set_detail_cover(page, palette, path_string);
             }
             ImageKind::ArtistCover
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::User
                     && page.owner_artist_id == Some(id) =>
             {
-                set_detail_cover(page, path, path_string);
+                set_detail_cover(page, palette, path_string);
             }
             ImageKind::ArtistCover if page.owner_artist_id == Some(id) => {
                 page.owner_avatar_path = Some(path_string);
@@ -676,7 +783,7 @@ impl App {
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::User
                     && page.cover_path.is_none()
                 {
-                    set_detail_cover(page, path, path_string);
+                    set_detail_cover(page, palette, path_string);
                 } else {
                     page.owner_avatar_path = Some(path_string);
                 }
@@ -687,45 +794,166 @@ impl App {
 }
 
 fn start_image_download(
-    client: crate::api::NcmClient,
+    client: Option<crate::api::NcmClient>,
     request: ImageRequest,
+    local_audio: Option<std::path::PathBuf>,
 ) -> (Task<Message>, iced::task::Handle) {
     let ImageRequest {
         kind,
         id,
+        variant,
         url,
         generation,
         scope,
     } = request;
-    let resize = match kind {
-        // Membership artwork is already a compact horizontal badge. Asking
-        // the CDN for a square derivative changes its composition and makes
-        // the visible mark look much smaller inside a contain-fit widget.
-        ImageKind::VipBadge => None,
-        ImageKind::SongCover | ImageKind::LocalSongCover | ImageKind::UserAvatar => {
-            Some((200, 200))
-        }
-        _ => Some((300, 300)),
-    };
-
     Task::perform(
         async move {
-            let base_path = kind.cache_dir().join(format!("{}.jpg", kind.file_stem(id)));
-            crate::utils::download_img(&client, &url, base_path, resize)
+            let source = url.clone();
+            let local = local_audio.or_else(|| {
+                (!crate::image::is_remote_url(&url)).then(|| std::path::PathBuf::from(&url))
+            });
+            let decoded = if let Some(path) = local {
+                tokio::task::spawn_blocking(move || {
+                    crate::image::artwork::load(&path).map(|image| (path, image))
+                })
                 .await
-                .map(|path| ImageResult { kind, id, path })
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let url = if decoded.is_none() && url.starts_with("ncm://") {
+                if let Some(client) = client.as_ref() {
+                    client
+                        .track_detail(&[id])
+                        .await
+                        .ok()
+                        .and_then(|tracks| {
+                            tracks
+                                .into_iter()
+                                .find(|track| track.id == id)
+                                .map(|track| track.cover_url().to_owned())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                url
+            };
+            let decoded = if decoded.is_some() {
+                decoded
+            } else if crate::image::is_remote_url(&url) {
+                if matches!(kind, ImageKind::SongCover | ImageKind::LocalSongCover) {
+                    if let Some(client) = client.as_ref() {
+                        match client
+                            .image_bytes(&url, kind.requested_resize(variant))
+                            .await
+                        {
+                            Ok(bytes) => tokio::task::spawn_blocking(move || {
+                                image::load_from_memory(&bytes)
+                                    .ok()
+                                    .map(|image| (std::path::PathBuf::from(url), image))
+                            })
+                            .await
+                            .ok()
+                            .flatten(),
+                            Err(error) => {
+                                tracing::warn!(%error, "Song artwork request failed");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    load_collection_image(
+                        client.as_ref(),
+                        kind,
+                        id,
+                        variant,
+                        &url,
+                        kind.cache_dir(),
+                    )
+                    .await
+                }
+            } else {
+                None
+            };
+            let (path, image) = decoded?;
+            let backing_file = path.is_absolute().then(|| path.clone());
+            let path = if matches!(kind, ImageKind::SongCover | ImageKind::LocalSongCover) {
+                std::path::PathBuf::from(format!("artwork://{kind:?}/{id}/{variant:?}"))
+            } else {
+                path
+            };
+            tokio::task::spawn_blocking(move || {
+                let mut entry = crate::image::artwork::prepare(kind, variant, path, source, image);
+                entry.backing_file = backing_file;
+                std::sync::Arc::new(entry)
+            })
+            .await
+            .ok()
         },
         move |result| match result {
-            Some(r) => Message::ImageDownloadReady(generation, scope, r.kind, r.id, r.path),
-            None => Message::ImageDownloadFailed(generation, scope, kind, id),
+            Some(entry) => Message::ImageDownloadReady(generation, scope, kind, id, variant, entry),
+            None => Message::ImageDownloadFailed(generation, scope, kind, id, variant),
         },
     )
     .abortable()
 }
 
+/// Collection caches remain available before login and while offline. Song
+/// artwork never enters this disk-backed branch.
+async fn load_collection_image(
+    client: Option<&crate::api::NcmClient>,
+    kind: ImageKind,
+    id: u64,
+    variant: ImageVariant,
+    url: &str,
+    cache_dir: std::path::PathBuf,
+) -> Option<(std::path::PathBuf, image::DynamicImage)> {
+    if matches!(kind, ImageKind::SongCover | ImageKind::LocalSongCover) {
+        return None;
+    }
+    let lookup_dir = cache_dir.clone();
+    let lookup_url = url.to_owned();
+    let cached = tokio::task::spawn_blocking(move || {
+        crate::image::resolve_remote_cached(&lookup_dir, kind, id, variant, &lookup_url)
+    })
+    .await
+    .ok()
+    .flatten();
+    let path = if cached.is_some() {
+        cached
+    } else if let Some(client) = client {
+        crate::utils::download_img(
+            client,
+            url,
+            cache_dir.join(format!(
+                "{}.jpg",
+                crate::image::remote_file_stem(kind, id, variant, url)
+            )),
+            kind.requested_resize(variant),
+        )
+        .await
+    } else {
+        None
+    };
+    tokio::task::spawn_blocking(move || {
+        let path =
+            path.or_else(|| crate::utils::find_cached_image(&cache_dir, &kind.file_stem(id)))?;
+        crate::image::artwork::load(&path).map(|image| (path, image))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 struct RemoteImage {
     kind: ImageKind,
     id: u64,
+    variant: ImageVariant,
     url: String,
     scope: ImageRequestScope,
 }
@@ -735,6 +963,17 @@ impl RemoteImage {
         Self {
             kind,
             id,
+            variant: ImageVariant::Thumbnail,
+            url: url.to_string(),
+            scope: ImageRequestScope::Page,
+        }
+    }
+
+    fn detail(kind: ImageKind, id: u64, url: &str) -> Self {
+        Self {
+            kind,
+            id,
+            variant: ImageVariant::Detail,
             url: url.to_string(),
             scope: ImageRequestScope::Page,
         }
@@ -744,6 +983,7 @@ impl RemoteImage {
         Self {
             kind,
             id,
+            variant: ImageVariant::Thumbnail,
             url: url.to_string(),
             scope: ImageRequestScope::Global,
         }
@@ -753,6 +993,7 @@ impl RemoteImage {
         Self {
             kind,
             id,
+            variant: ImageVariant::Thumbnail,
             url: url.to_string(),
             scope: ImageRequestScope::Viewport,
         }
@@ -805,10 +1046,15 @@ fn remote_radio_covers(
         .map(|item| RemoteImage::new(ImageKind::RadioCover, item.id, &item.cover_url))
 }
 
-fn cover_path_matches(path_or_url: Option<&str>, local_path: &std::path::Path) -> bool {
-    path_or_url.is_some_and(|path| {
-        crate::image::is_valid_local_path(path) && std::path::Path::new(path) == local_path
-    })
+fn current_song_remote_variants(
+    kind: ImageKind,
+    full_screen_artwork_open: bool,
+) -> Vec<ImageVariant> {
+    let mut variants = vec![ImageVariant::Thumbnail];
+    if full_screen_artwork_open && kind == ImageKind::SongCover {
+        variants.push(ImageVariant::Hero);
+    }
+    variants
 }
 
 fn ncm_playlist_page_id(id: u64) -> i64 {
@@ -837,17 +1083,91 @@ fn user_route_matches_page_id(route: &Route, page_id: i64) -> bool {
 
 fn set_detail_cover(
     page: &mut crate::ui::pages::PlaylistView,
-    path: &std::path::Path,
+    palette: Option<crate::utils::ColorPalette>,
     path_string: String,
 ) {
-    let palette = crate::utils::ColorPalette::from_image_path(path);
     page.cover_path = Some(path_string);
-    page.palette = palette;
+    // A higher resolution derivative can be unavailable or temporarily
+    // undecodable. Keep the palette extracted from the already visible
+    // thumbnail instead of replacing it with `None` and flashing defaults.
+    if palette.is_some() {
+        page.palette = palette;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn offline_collection_cache_survives_but_song_disk_cache_is_never_used() {
+        let root =
+            crate::cache::unique_temp_path(&std::env::temp_dir().join("rustle-offline-artwork"));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = "https://example.invalid/artwork";
+        let variant = ImageVariant::Thumbnail;
+        for kind in [ImageKind::AlbumCover, ImageKind::SongCover] {
+            let path = root.join(format!(
+                "{}.png",
+                crate::image::remote_file_stem(kind, 42, variant, url)
+            ));
+            image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+                .save(path)
+                .unwrap();
+        }
+        assert!(
+            load_collection_image(None, ImageKind::AlbumCover, 42, variant, url, root.clone())
+                .await
+                .is_some()
+        );
+        assert!(
+            load_collection_image(None, ImageKind::SongCover, 42, variant, url, root.clone())
+                .await
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_roles_map_to_research_dimensions() {
+        let thumbnail = RemoteImage::new(
+            ImageKind::PlaylistCover,
+            1,
+            "https://example.invalid/cover.jpg",
+        );
+        let detail = RemoteImage::detail(
+            ImageKind::PlaylistCover,
+            1,
+            "https://example.invalid/cover.jpg",
+        );
+
+        assert_eq!(thumbnail.variant, ImageVariant::Thumbnail);
+        assert_eq!(
+            thumbnail.kind.requested_resize(thumbnail.variant),
+            Some((300, 300))
+        );
+        assert_eq!(detail.variant, ImageVariant::Detail);
+        assert_eq!(
+            detail.kind.requested_resize(detail.variant),
+            Some((600, 600))
+        );
+        assert_eq!(
+            ImageKind::SongCover.requested_resize(ImageVariant::Hero),
+            Some((1024, 1024))
+        );
+        assert_eq!(
+            current_song_remote_variants(ImageKind::SongCover, false),
+            vec![ImageVariant::Thumbnail]
+        );
+        assert_eq!(
+            current_song_remote_variants(ImageKind::SongCover, true),
+            vec![ImageVariant::Thumbnail, ImageVariant::Hero]
+        );
+        assert_eq!(
+            current_song_remote_variants(ImageKind::LocalSongCover, true),
+            vec![ImageVariant::Thumbnail]
+        );
+    }
 
     #[test]
     fn user_route_matches_encoded_page_id() {

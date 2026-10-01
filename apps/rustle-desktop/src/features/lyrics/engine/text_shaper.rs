@@ -7,8 +7,8 @@
 //!
 //! Text shaping is expensive, so we cache results based on:
 //! - Text content
-//! - Font size (rounded to avoid cache misses from floating point differences)
-//! - Max width (rounded)
+//! - Exact font size and layout width
+//! - Word segmentation for timed lines
 //!
 //! The cache is stored in the TextShaper and persists across frames.
 
@@ -24,10 +24,11 @@ use super::types::{FontConfig, SUB_LINE_HEIGHT_MULTIPLIER, WordData};
 struct ShapingCacheKey {
     /// Text content
     text: String,
-    /// Font size (multiplied by 100 and rounded to avoid float comparison issues)
-    font_size_x100: u32,
-    /// Max width (rounded to nearest 10 pixels)
-    max_width_rounded: u32,
+    /// Exact layout inputs: rounding width can reuse a different wrap boundary.
+    font_size_bits: u32,
+    max_width_bits: u32,
+    /// Glyph timing assignments depend on segmentation, even for identical text.
+    words: Vec<String>,
 }
 
 /// Shaped glyph with position and timing information
@@ -86,20 +87,56 @@ pub struct TextShaper {
 }
 
 impl TextShaper {
-    fn resolve_font_config(
+    pub(crate) fn resolve_font_config(
         font_system: &Arc<Mutex<FontSystem>>,
         mut config: FontConfig,
     ) -> FontConfig {
-        if config.font_family.is_some() {
-            return config;
+        let mut font_system = font_system.lock();
+        let requested_family = config.font_family.as_deref().and_then(|requested| {
+            font_system
+                .db()
+                .faces()
+                .flat_map(|face| &face.families)
+                .map(|(name, _)| name)
+                .find(|name| name.eq_ignore_ascii_case(requested.trim()))
+                .cloned()
+        });
+        config.font_family = requested_family.or_else(|| {
+            crate::platform::theme::preferred_lyrics_font_family(font_system.db())
+                .map(str::to_owned)
+        });
+        let family = config
+            .font_family
+            .as_deref()
+            .map(Family::Name)
+            .unwrap_or(Family::SansSerif);
+        if let Some(id) = font_system.db().query(&cosmic_text::fontdb::Query {
+            families: &[family],
+            weight: config.font_weight,
+            ..Default::default()
+        }) {
+            let face_weight = font_system.db().face(id).expect("queried font face").weight;
+            if face_weight != config.font_weight {
+                // cosmic-text 0.19's default_font_match_key rejects static faces
+                // without an exact weight. CSS-nearest weight within the selected
+                // family prevents an unintended switch to a fallback family.
+                let variable_weight =
+                    font_system
+                        .get_font(id, config.font_weight)
+                        .is_some_and(|font| {
+                            font.as_swash()
+                                .variations()
+                                .find_by_tag(u32::from_be_bytes(*b"wght"))
+                                .is_some_and(|axis| {
+                                    (axis.min_value()..=axis.max_value())
+                                        .contains(&(config.font_weight.0 as f32))
+                                })
+                        });
+                if !variable_weight {
+                    config.font_weight = face_weight;
+                }
+            }
         }
-
-        let font_system = font_system.lock();
-        if let Some(family) = crate::platform::theme::preferred_lyrics_font_family(font_system.db())
-        {
-            config.font_family = Some(family.to_string());
-        }
-
         config
     }
 
@@ -128,13 +165,17 @@ impl TextShaper {
     }
 
     /// Create a cache key for shaping
-    fn make_cache_key(text: &str, font_size: f32, max_width: f32) -> ShapingCacheKey {
+    fn make_cache_key(
+        text: &str,
+        words: &[WordData],
+        font_size: f32,
+        max_width: f32,
+    ) -> ShapingCacheKey {
         ShapingCacheKey {
             text: text.to_string(),
-            // Round font size to avoid cache misses from tiny floating point differences
-            font_size_x100: (font_size * 100.0).round() as u32,
-            // Round max width to nearest 10 pixels
-            max_width_rounded: ((max_width / 10.0).round() * 10.0) as u32,
+            font_size_bits: font_size.to_bits(),
+            max_width_bits: max_width.to_bits(),
+            words: words.iter().map(|word| word.text.clone()).collect(),
         }
     }
 
@@ -149,7 +190,7 @@ impl TextShaper {
     /// Shape a line of text with word timing information
     ///
     /// Returns shaped glyphs with position-in-word information for gradient mask.
-    /// Results are cached based on text content, font size, and max width.
+    /// Results are cached by text, segmentation, exact font size and max width.
     pub fn shape_line(
         &self,
         text: &str,
@@ -167,7 +208,7 @@ impl TextShaper {
         }
 
         // Check cache first
-        let cache_key = Self::make_cache_key(text, font_size, max_width);
+        let cache_key = Self::make_cache_key(text, words, font_size, max_width);
         {
             let cache = self.shape_cache.lock();
             if let Some(cached) = cache.get(&cache_key) {
@@ -214,7 +255,7 @@ impl TextShaper {
         buffer.shape_until_scroll(&mut font_system, false);
 
         // Build character to word mapping
-        let char_to_word = self.build_char_word_map(text, words);
+        let char_to_word = Self::build_char_word_map(text, words);
 
         // === Calculate visual line count from layout_runs ===
         // layout_runs() 返回所有视觉行的迭代器
@@ -230,23 +271,8 @@ impl TextShaper {
         for run in buffer.layout_runs() {
             for glyph in run.glyphs.iter() {
                 let char_idx = glyph.start;
-                let word_idx = char_to_word.get(char_idx).copied().unwrap_or(0);
-
-                // Calculate position within word
-                let pos_in_word = if word_idx < words.len() {
-                    let word = &words[word_idx];
-                    let word_text = &word.text;
-                    let word_start_char = self.find_word_start_char(text, word_idx, words);
-                    let char_offset = char_idx.saturating_sub(word_start_char);
-                    let word_char_count = word_text.chars().count();
-                    if word_char_count > 0 {
-                        char_offset as f32 / word_char_count as f32
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                };
+                let (word_idx, pos_in_word) =
+                    char_to_word.get(char_idx).copied().unwrap_or_default();
 
                 // Update word bounds
                 if word_idx < word_bounds.len() {
@@ -358,8 +384,8 @@ impl TextShaper {
     }
 
     /// Build mapping from character index to word index
-    fn build_char_word_map(&self, text: &str, words: &[WordData]) -> Vec<usize> {
-        let mut map = vec![0usize; text.len()];
+    fn build_char_word_map(text: &str, words: &[WordData]) -> Vec<(usize, f32)> {
+        let mut map = vec![(0, 0.0); text.len()];
         let mut char_pos = 0;
 
         for (word_idx, word) in words.iter().enumerate() {
@@ -368,8 +394,10 @@ impl TextShaper {
                 let abs_start = char_pos + start;
                 let abs_end = abs_start + word.text.len();
 
-                for i in abs_start..abs_end.min(map.len()) {
-                    map[i] = word_idx;
+                let char_count = word.text.chars().count().max(1) as f32;
+                for (char_index, (byte, ch)) in word.text.char_indices().enumerate() {
+                    map[abs_start + byte..abs_start + byte + ch.len_utf8()]
+                        .fill((word_idx, char_index as f32 / char_count));
                 }
 
                 char_pos = abs_end;
@@ -377,20 +405,6 @@ impl TextShaper {
         }
 
         map
-    }
-
-    /// Find the starting character index for a word
-    fn find_word_start_char(&self, text: &str, word_idx: usize, words: &[WordData]) -> usize {
-        let mut pos = 0;
-        for (i, word) in words.iter().enumerate() {
-            if i == word_idx {
-                return pos;
-            }
-            if let Some(start) = text[pos..].find(&word.text) {
-                pos += start + word.text.len();
-            }
-        }
-        pos
     }
 
     /// Shape translation/romanized text (simpler, no word timing)
@@ -406,7 +420,7 @@ impl TextShaper {
         }
 
         // Check cache first
-        let cache_key = Self::make_cache_key(text, font_size, max_width);
+        let cache_key = Self::make_cache_key(text, &[], font_size, max_width);
         {
             let cache = self.simple_cache.lock();
             if let Some(cached) = cache.get(&cache_key) {
@@ -492,6 +506,89 @@ mod tests {
     use crate::features::lyrics::engine::types::FontConfig;
     use cosmic_text::Weight;
 
+    fn test_font_system() -> Arc<Mutex<FontSystem>> {
+        static FONTS: std::sync::LazyLock<Arc<Mutex<FontSystem>>> =
+            std::sync::LazyLock::new(|| Arc::new(Mutex::new(FontSystem::new())));
+        FONTS.clone()
+    }
+
+    fn word(text: &str) -> WordData {
+        WordData {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn same_text_with_different_word_segmentation_is_not_reused() {
+        let shaper = TextShaper::new(test_font_system());
+        let joined = shaper.shape_line("ab", &[word("ab")], 48.0, 800.0);
+        let split = shaper.shape_line("ab", &[word("a"), word("b")], 48.0, 800.0);
+        assert_eq!(joined.word_bounds.len(), 1);
+        assert_eq!(split.word_bounds.len(), 2);
+        assert_eq!(joined.glyphs.last().unwrap().word_index, 0);
+        assert_eq!(split.glyphs.last().unwrap().word_index, 1);
+    }
+
+    #[test]
+    fn unicode_cluster_mapping_uses_character_positions_and_actual_word_starts() {
+        let map = TextShaper::build_char_word_map("前 你好a世", &[word("前"), word("你好a世")]);
+        for (offset, position) in [(4, 0.0), (7, 0.25), (10, 0.5), (11, 0.75)] {
+            assert_eq!(map[offset], (1, position));
+        }
+    }
+
+    #[test]
+    fn widths_on_opposite_sides_of_wrap_boundary_are_distinct() {
+        let shaper = TextShaper::new(test_font_system());
+        let width = shaper.shape_simple("hello world", 32.0, 1000.0).width;
+        let narrow = shaper.shape_simple("hello world", 32.0, width - 0.01);
+        let wide = shaper.shape_simple("hello world", 32.0, width + 0.01);
+        assert!(narrow.height > wide.height, "{narrow:?} vs {wide:?}");
+    }
+
+    #[test]
+    fn selected_family_is_verified_against_shaped_face_ids() {
+        let fonts = test_font_system();
+        let family = {
+            let fs = fonts.lock();
+            [
+                "Arial",
+                "Helvetica Neue",
+                "DejaVu Sans",
+                "Noto Sans",
+                "Liberation Sans",
+                "Segoe UI",
+            ]
+            .into_iter()
+            .find(|family| {
+                fs.db()
+                    .faces()
+                    .any(|face| face.families.iter().any(|(name, _)| name == family))
+            })
+            .expect("an installed Latin UI font")
+        };
+        let shaper = TextShaper::with_config(
+            fonts.clone(),
+            FontConfig::with_family(format!(" {} ", family.to_lowercase())),
+        );
+        for shaped in [
+            shaper.shape_line("Custom", &[word("Custom")], 48.0, 800.0),
+            shaper.shape_simple("Translation", 24.0, 800.0),
+        ] {
+            assert!(!shaped.glyphs.is_empty());
+            let fs = fonts.lock();
+            for glyph in shaped.glyphs {
+                let face = fs.db().face(glyph.cache_key.font_id).unwrap();
+                assert!(
+                    face.families.iter().any(|(name, _)| name == family),
+                    "expected {family}, got {:?}",
+                    face.families
+                );
+            }
+        }
+    }
+
     /// Property 3: Font Family Consistency
     /// Property 7: Configured Font Usage
     /// Validates: Requirements 2.1, 5.2
@@ -500,7 +597,7 @@ mod tests {
     /// that font family for all text shaping operations.
     #[test]
     fn test_font_family_consistency() {
-        let font_system = Arc::new(Mutex::new(FontSystem::new()));
+        let font_system = test_font_system();
 
         // Test with default config (SansSerif fallback)
         let default_config = FontConfig::default();
@@ -536,7 +633,7 @@ mod tests {
     /// Test that shape_simple also uses configured font family
     #[test]
     fn test_shape_simple_uses_config() {
-        let font_system = Arc::new(Mutex::new(FontSystem::new()));
+        let font_system = test_font_system();
         let config = FontConfig::with_family("DejaVu Sans");
         let shaper = TextShaper::with_config(font_system, config);
 
@@ -550,7 +647,7 @@ mod tests {
     /// Test empty text handling
     #[test]
     fn test_empty_text_handling() {
-        let font_system = Arc::new(Mutex::new(FontSystem::new()));
+        let font_system = test_font_system();
         let config = FontConfig::default();
         let shaper = TextShaper::with_config(font_system, config);
 
@@ -576,7 +673,7 @@ mod tests {
     /// Test font weight configuration
     #[test]
     fn test_font_weight_configuration() {
-        let font_system = Arc::new(Mutex::new(FontSystem::new()));
+        let font_system = test_font_system();
 
         let config_normal = FontConfig::default();
         assert_eq!(config_normal.font_weight, Weight::SEMIBOLD);

@@ -118,14 +118,18 @@ fn build_header<'a>(
     let tokens = context.tokens;
     let header_metrics = detail_header_metrics(context);
     let avatar_size = header_metrics.artwork_size;
-    let avatar_handle = artist
-        .owner_artist_id
-        .and_then(|id| image_state.get(ImageKind::ArtistCover, id));
+    let avatar_handle = artist.owner_artist_id.and_then(|id| {
+        image_state.get_with_fallback(
+            ImageKind::ArtistCover,
+            id,
+            crate::image::ImageVariant::Detail,
+        )
+    });
     let avatar = circular_avatar(
         avatar_handle,
         &artist.name,
         avatar_size,
-        theme::TEXT_PRIMARY,
+        theme::text_primary(&iced::Theme::Dark),
         tokens,
     );
 

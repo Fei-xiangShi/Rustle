@@ -120,6 +120,8 @@ pub struct LyricsEnginePrimitive {
     pub shaped_lines: Arc<Vec<CachedShapedLine>>,
     /// Current scroll position (legacy, kept for compatibility)
     pub scroll_position: f32,
+    /// Whether the user is browsing lyrics after scrolling manually.
+    pub is_manually_scrolling: bool,
     /// Buffered (active) line indices
     pub buffered_lines: HashSet<usize>,
     /// Scroll target index
@@ -164,6 +166,35 @@ pub struct InterludeDotsState {
 }
 
 impl LyricsEnginePrimitive {
+    /// Hit-test the same animated layout used by the GPU, in logical pixels.
+    pub(super) fn hit_test(&self, bounds: Rectangle, cursor: iced::mouse::Cursor) -> Option<usize> {
+        if !self.is_manually_scrolling {
+            return None;
+        }
+        let position = cursor.position_in(bounds)?;
+        let styles = self.compute_line_styles_physical(&bounds, 1.0);
+
+        // Later lines are painted on top when spring animations overlap.
+        styles.iter().enumerate().rev().find_map(|(index, style)| {
+            let line = self.lines.get(index)?;
+            let shaped = self.shaped_lines.get(index)?;
+            if style.opacity < 0.01 || line.text.trim().is_empty() {
+                return None;
+            }
+
+            // The shader scales vertically about the center of the whole line,
+            // including wrapped text, translation and romanization.
+            let height = shaped.total_height * style.scale;
+            let row = Rectangle {
+                x: bounds.width * 0.05,
+                y: style.y_position + (shaped.total_height - height) * 0.5,
+                width: bounds.width * 0.9,
+                height,
+            };
+            row.contains(position).then_some(index)
+        })
+    }
+
     /// Create a new primitive from engine state
     ///
     /// Captures all animation state including:
@@ -279,6 +310,7 @@ impl LyricsEnginePrimitive {
             lines,                // Arc clone is O(1)
             shaped_lines,         // Arc clone is O(1)
             scroll_position: 0.0, // No longer used with per-line animations
+            is_manually_scrolling: engine.is_manually_scrolling(),
             buffered_lines: engine.buffered_lines().clone(),
             scroll_to_index: engine.scroll_to_index(),
             current_time_ms,
@@ -552,11 +584,7 @@ impl Primitive for LyricsEnginePrimitive {
         // visible line blur or emphasis glow work.
         let enable_blur = self.config.enable_blur && gpu_pipeline.has_preparable_blur();
         if enable_blur {
-            gpu_pipeline.prepare_blur(
-                device,
-                viewport.physical_width(),
-                viewport.physical_height(),
-            );
+            gpu_pipeline.prepare_blur(device, queue);
         } else {
             gpu_pipeline.clear_prepared_blur();
         }

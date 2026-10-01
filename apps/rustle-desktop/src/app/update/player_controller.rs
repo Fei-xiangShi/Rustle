@@ -109,9 +109,11 @@ impl App {
         }
 
         self.ui
-            .home
-            .current_ncm_playlist_songs
-            .iter()
+            .playlist_page
+            .current_online_tracks()
+            .into_iter()
+            .flatten()
+            .chain(self.ui.home.current_ncm_playlist_songs.iter())
             .chain(self.ui.search.tracks.iter())
             .find(|candidate| {
                 if let Some(id) = ncm_id {
@@ -262,6 +264,20 @@ impl App {
                 buffer,
                 duration_secs: resolved.duration_secs,
                 finalized_cache_path: resolved.finalized_cache_path.clone(),
+            });
+        }
+
+        if let Some(path) = &resolved.finalized_cache_path {
+            let path = PathBuf::from(path);
+            if !path.is_file() {
+                return Err(crate::audio::PlaybackError::FileNotFound(
+                    path.to_string_lossy().into_owned(),
+                ));
+            }
+            return Ok(PlaybackSource::AudioPath {
+                path,
+                gain_mode: TrackGainMode::MetadataOnly,
+                start_position: None,
             });
         }
 
@@ -1514,8 +1530,9 @@ impl App {
             return Task::none();
         };
 
-        let Ok(source) = Self::playback_source_from_resolved_song(&song, &resolved) else {
-            return self.skip_to_next_playable(idx);
+        let source = match Self::playback_source_from_resolved_song(&song, &resolved) {
+            Ok(source) => source,
+            Err(error) => return self.handle_playback_failure(idx, &error.to_string()),
         };
 
         match self.start_resolved_queue_song_from_source(idx, song, source, &context) {
@@ -1525,7 +1542,7 @@ impl App {
                 }
                 task
             }
-            Err(_) => self.skip_to_next_playable(idx),
+            Err(error) => self.handle_playback_failure(idx, &error.to_string()),
         }
     }
 
@@ -1694,11 +1711,15 @@ impl App {
                 let source_id = self.playback.ncm_scrobble_source_id;
                 let time_secs = song.duration_secs.max(0) as u64;
                 tokio::spawn(async move {
-                    if let Err(e) = client
+                    if let Err(error) = client
                         .scrobble_song(ncm_song_id, source_id, time_secs)
                         .await
                     {
-                        tracing::warn!("Failed to scrobble NCM song {}: {}", ncm_song_id, e);
+                        tracing::warn!(
+                            ncm_song_id,
+                            error_code = %error.code().as_str(),
+                            "ncm_scrobble_failed"
+                        );
                     }
                 });
             }
@@ -1764,13 +1785,77 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolvedSong, apply_resolved_song_metadata, extend_ncm_artist_metadata,
-        handoff_active_streaming_buffer,
+        App, PlaybackSource, ResolvedSong, apply_resolved_song_metadata,
+        extend_ncm_artist_metadata, handoff_active_streaming_buffer,
     };
     use crate::api::{ArtistSummary, Track};
     use crate::audio::SharedBuffer;
     use crate::database::DbSong;
     use std::collections::HashMap;
+    use std::path::Path;
+
+    #[test]
+    fn completed_stream_replays_from_the_resolved_cache_file() {
+        let path = crate::cache::unique_temp_path(&std::env::temp_dir().join("rustle-replay.wav"));
+        std::fs::write(&path, b"cached audio").unwrap();
+        let mut song = App::ncm_track_to_db_song(&Track {
+            id: 208567,
+            ..Track::default()
+        });
+        let logical_source = song.file_path.clone();
+        let mut resolved = ResolvedSong {
+            finalized_cache_path: None,
+            cover_path: None,
+            shared_buffer: Some(SharedBuffer::new(12)),
+            duration_secs: Some(180),
+            quality: None,
+        };
+        assert!(matches!(
+            App::playback_source_from_resolved_song(&song, &resolved),
+            Ok(PlaybackSource::StreamingBuffer { .. })
+        ));
+
+        // The next resolution is a disk cache hit. Metadata deliberately keeps
+        // ncm:// identity; the controller must choose the resolved transport.
+        resolved.shared_buffer = None;
+        resolved.finalized_cache_path = Some(path.to_string_lossy().into_owned());
+        apply_resolved_song_metadata(&mut song, &resolved);
+        let replay = App::playback_source_from_resolved_song(&song, &resolved);
+        assert_eq!(song.file_path, logical_source);
+        song.file_path = "ncm://208567".to_string();
+        let ncm_replay = App::playback_source_from_resolved_song(&song, &resolved);
+        std::fs::remove_file(&path).unwrap();
+        for result in [replay, ncm_replay] {
+            let source =
+                result.unwrap_or_else(|error| panic!("cached replay was rejected: {error}"));
+            assert!(
+                matches!(source, PlaybackSource::AudioPath { path: actual, start_position: None, .. }
+                if actual == path)
+            );
+        }
+        assert_eq!(song.file_path, "ncm://208567");
+    }
+
+    #[test]
+    fn missing_resolved_cache_reports_that_path_instead_of_the_song_identity() {
+        let song = App::ncm_track_to_db_song(&Track {
+            id: 208567,
+            ..Track::default()
+        });
+        let path =
+            crate::cache::unique_temp_path(&std::env::temp_dir().join("rustle-missing-cache.wav"));
+        let resolved = ResolvedSong {
+            finalized_cache_path: Some(path.to_string_lossy().into_owned()),
+            cover_path: None,
+            shared_buffer: None,
+            duration_secs: None,
+            quality: None,
+        };
+        assert!(
+            matches!(App::playback_source_from_resolved_song(&song, &resolved),
+            Err(crate::audio::PlaybackError::FileNotFound(actual)) if Path::new(&actual) == path)
+        );
+    }
 
     #[test]
     fn finalized_cache_transport_does_not_replace_ncm_source_identity() {

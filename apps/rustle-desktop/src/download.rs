@@ -154,7 +154,14 @@ impl DownloadManager {
     pub fn restore_from_rows(&mut self, rows: Vec<crate::database::DownloadRow>) {
         self.completed.clear();
         for row in rows {
-            let path = std::path::PathBuf::from(&row.file_path);
+            let mut path = std::path::PathBuf::from(&row.file_path);
+            // Older download records could contain a relative path. Resolve those
+            // against the current download directory so they remain visible locally.
+            if !path.is_absolute() {
+                path = crate::features::settings::StorageSettings::default()
+                    .effective_download_dir()
+                    .join(path);
+            }
             if !path.exists() {
                 continue;
             }

@@ -70,6 +70,7 @@ impl App {
     }
 
     pub(super) fn reset_playlist_page_state(&mut self) {
+        self.ui.playlist_page.advance_load_generation();
         self.ui.playlist_page.search_expanded = false;
         self.ui.playlist_page.search_query.clear();
         self.ui.playlist_page.viewing_recently_played = false;
@@ -181,20 +182,36 @@ impl App {
 
             Message::PlaylistDeleted(id) => {
                 tracing::info!("Playlist {} deleted", id);
+                let was_open = matches!(self.ui.current_route, Route::Playlist(current_id) if current_id == *id);
                 // Remove from sidebar list
                 self.library.playlists.retain(|p| p.id != *id);
                 // Clear current playlist if it was the deleted one
                 if self.ui.playlist_page.current.as_ref().map(|p| p.id) == Some(*id) {
                     self.ui.playlist_page.current = None;
                 }
+                // A deleted playlist must not remain the active route. Navigate
+                // away after the delete completes so the page cannot render a
+                // stale playlist detail view.
+                let navigation = if was_open {
+                    self.navigate_to_route(
+                        Route::Discover(crate::app::DiscoverViewMode::Overview),
+                        true,
+                    )
+                } else {
+                    Task::none()
+                };
                 if let Some(db) = &self.core.db {
                     let db = db.clone();
                     return Some(Task::batch([
+                        navigation,
                         Self::toast_success("歌单已删除".to_string()),
                         Task::perform(load_watched_folders(db), Message::WatchedFoldersLoaded),
                     ]));
                 }
-                Some(Self::toast_success("歌单已删除".to_string()))
+                Some(Task::batch([
+                    navigation,
+                    Self::toast_success("歌单已删除".to_string()),
+                ]))
             }
 
             Message::PlaylistViewLoaded(payload) => {
@@ -241,6 +258,11 @@ impl App {
             }
 
             Message::AnimationTick(now) => {
+                if let Some(importing) = &mut self.ui.importing_playlist
+                    && importing.tick(*now)
+                {
+                    self.ui.importing_playlist = None;
+                }
                 // Update audio state
                 self.update_audio_tick();
 

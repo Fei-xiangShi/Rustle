@@ -51,6 +51,7 @@ pub struct LyricsPageView<'a> {
     pub textured_bg_shader: &'a TexturedBackgroundProgram,
     pub lyrics_engine: Option<&'a std::cell::RefCell<LyricsEngine>>,
     pub power_saving_mode: bool,
+    pub lyrics_font: iced::Font,
     pub is_liked: bool,
     pub download_progress: Option<f32>,
     pub is_fm_mode: bool,
@@ -74,6 +75,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
         textured_bg_shader,
         lyrics_engine,
         power_saving_mode,
+        lyrics_font,
         is_liked,
         download_progress,
         is_fm_mode,
@@ -105,6 +107,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
                     cached_engine_lines,
                     position * duration_secs * 1000.0,
                     context,
+                    lyrics_font,
                 )
             } else {
                 build_right_panel_engine(
@@ -112,6 +115,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
                     lyrics_engine,
                     position * duration_secs * 1000.0,
                     context,
+                    lyrics_font,
                 )
             };
 
@@ -206,6 +210,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
                                     cached_engine_lines,
                                     position * duration_secs * 1000.0,
                                     context,
+                                    lyrics_font,
                                 )
                             } else {
                                 build_right_panel_engine(
@@ -213,6 +218,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
                                     lyrics_engine,
                                     position * duration_secs * 1000.0,
                                     context,
+                                    lyrics_font,
                                 )
                             };
 
@@ -513,10 +519,11 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
     // Block all pointer events from reaching the main content behind the lyrics page while
     // preserving the controls and scrollable lyrics inside this full-screen surface.
     overlay::block_mouse_events(
-        container(content_with_shader)
-            .width(Fill)
-            .height(Fill)
-            .into(),
+        iced::widget::themer(
+            Some(theme::application(true)),
+            container(content_with_shader).width(Fill).height(Fill),
+        )
+        .into(),
     )
 }
 
@@ -590,7 +597,7 @@ fn build_artwork_panel<'a>(view: ArtworkPanelView<'a>) -> Element<'a, Message> {
     let (cover_kind, cover_id) = crate::image::song_cover_key_for_source(song.id, &song.file_path)
         .unwrap_or((crate::image::ImageKind::SongCover, 0));
     let cover = crate::ui::components::cover_image::custom(
-        image_state.get(cover_kind, cover_id),
+        image_state.get_with_fallback(cover_kind, cover_id, crate::image::ImageVariant::Hero),
         cover_kind,
         media_width,
         tokens.cover_radius(CoverRadiusRole::Hero),
@@ -687,9 +694,9 @@ fn build_artwork_panel<'a>(view: ArtworkPanelView<'a>) -> Element<'a, Message> {
             icons::HEART_OUTLINE
         };
         let heart_color = if is_liked {
-            theme::ACCENT_PINK
+            theme::accent(&iced::Theme::Dark)
         } else {
-            theme::TEXT_SECONDARY
+            theme::text_secondary(&iced::Theme::Dark)
         };
         button(
             svg(svg::Handle::from_memory(heart_icon.as_bytes()))
@@ -797,6 +804,7 @@ fn build_right_panel_engine<'a>(
     lyrics_engine: Option<&'a std::cell::RefCell<LyricsEngine>>,
     current_time_ms: f32,
     context: ResponsiveContext,
+    lyrics_font: iced::Font,
 ) -> Element<'a, Message> {
     let tokens = context.tokens;
     // Check if we have cached engine lines
@@ -844,9 +852,12 @@ fn build_right_panel_engine<'a>(
             );
 
         let content = Sensor::new(
-            shader(crate::features::lyrics::engine::program::LyricsEngineProgram::new(primitive))
-                .width(Length::Fill)
-                .height(Length::Fill),
+            shader(
+                crate::features::lyrics::engine::program::LyricsEngineProgram::new(primitive)
+                    .on_line_press(Message::LyricsSeek),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
         .on_show(Message::LyricsViewportResized)
         .on_resize(Message::LyricsViewportResized);
@@ -866,7 +877,12 @@ fn build_right_panel_engine<'a>(
             .into()
     } else {
         // Fallback: show simple text-based lyrics without engine
-        build_simple_lyrics_panel_from_engine_lines(engine_lines, current_time_ms, context)
+        build_simple_lyrics_panel_from_engine_lines(
+            engine_lines,
+            current_time_ms,
+            context,
+            lyrics_font,
+        )
     }
 }
 
@@ -876,6 +892,7 @@ fn build_simple_lyrics_panel_from_engine_lines(
     engine_lines: &[LyricLineData],
     current_time_ms: f32,
     context: ResponsiveContext,
+    lyrics_font: iced::Font,
 ) -> Element<'static, Message> {
     let tokens = context.tokens;
     let current_time = current_time_ms as u64;
@@ -908,8 +925,9 @@ fn build_simple_lyrics_panel_from_engine_lines(
                 };
 
                 text(line_text)
+                    .font(lyrics_font)
                     .size(size)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, opacity))
+                    .color(rustle_ui::theme::white(opacity))
                     .into()
             })
             .collect::<Vec<_>>(),
@@ -931,6 +949,7 @@ fn build_simple_lyrics_panel(
     cached_engine_lines: Option<&Arc<Vec<LyricLineData>>>,
     current_time_ms: f32,
     context: ResponsiveContext,
+    lyrics_font: iced::Font,
 ) -> Element<'static, Message> {
     let tokens = context.tokens;
     // Check if we have cached engine lines
@@ -1005,23 +1024,18 @@ fn build_simple_lyrics_panel(
                 } else {
                     tokens.text(TextRole::TitleLarge)
                 };
-                let weight = if is_active {
-                    BOLD_WEIGHT
-                } else {
-                    iced::font::Weight::Normal
-                };
-
                 let main_text = text(line_text)
                     .size(size)
-                    .color(Color::from_rgba(1.0, 1.0, 1.0, opacity))
-                    .font(iced::Font::DEFAULT.weight(weight));
+                    .color(rustle_ui::theme::white(opacity))
+                    .font(lyrics_font);
 
                 if let Some(trans) = translated {
                     column![
                         main_text,
                         text(trans)
+                            .font(lyrics_font)
                             .size(tokens.text(TextRole::Subtitle))
-                            .color(Color::from_rgba(1.0, 1.0, 1.0, opacity * 0.7))
+                            .color(rustle_ui::theme::white(opacity * 0.7))
                     ]
                     .spacing(tokens.space(6.0))
                     .into()

@@ -12,7 +12,9 @@ use crate::api::{
     AlbumSummary, ArtistSummary, NcmClient, PlaylistSummary, RadioSummary, Track, VideoSummary,
 };
 use crate::app::SettingsSection;
-use crate::audio::{AudioAnalysisData, AudioProcessingChain, PlaybackInfo, PlaybackStatus};
+use crate::audio::{
+    AudioAnalysisData, AudioDevice, AudioProcessingChain, PlaybackInfo, PlaybackStatus,
+};
 use crate::database::{Database, DbPlaybackState, DbPlaylist, DbSong, DbWatchedFolder};
 use crate::features::import::{CoverCache, FolderWatcher, ScanHandle, ScanProgress, ScanState};
 use crate::i18n::Locale;
@@ -27,22 +29,57 @@ use crate::ui::pages;
 use crate::ui::widgets::Toast;
 use crate::utils::Source;
 
+fn audio_output_device_options(devices: &[AudioDevice]) -> Vec<(String, String)> {
+    let mut duplicate_counts = std::collections::HashMap::new();
+    for device in devices {
+        *duplicate_counts
+            .entry(device.name.as_str())
+            .or_insert(0_usize) += 1;
+    }
+
+    devices
+        .iter()
+        .map(|device| {
+            let label = if duplicate_counts.get(device.name.as_str()) == Some(&1) {
+                device.name.clone()
+            } else {
+                format!("{} ({})", device.name, device.id)
+            };
+            (device.id.clone(), label)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Unified image-handle cache
 // ---------------------------------------------------------------------------
 
 use std::collections::HashMap as StateMap;
 
-/// Pre-loaded image data keyed by `(ImageKind, id)`.
+type ImageStateKey = (crate::image::ImageKind, u64, crate::image::ImageVariant);
+
+/// Pre-loaded image data keyed by `(ImageKind, id, ImageVariant)`.
 ///
 /// Populated by the unified image pipeline (`handle_image`) so that views
 /// never touch disk — they only borrow an `Option<&image::Handle>`.
 #[derive(Debug, Default)]
 pub struct ImageState {
-    pub entries: StateMap<(crate::image::ImageKind, u64), ImageEntry>,
-    pub inflight: StateMap<(crate::image::ImageKind, u64), ImageInFlight>,
+    pub failures: StateMap<ImageStateKey, std::time::Instant>,
+    pub song_lru: VecDeque<ImageStateKey>,
+    pub artwork_epoch: u64,
+    /// Completion identity is unique even when a source changes within one route.
+    next_image_request: u64,
+    pub entries: StateMap<ImageStateKey, ImageEntry>,
+    pub inflight: StateMap<ImageStateKey, ImageInFlight>,
     pub pending: VecDeque<ImageRequest>,
-    pub queued: std::collections::HashSet<(crate::image::ImageKind, u64)>,
+    pub queued: std::collections::HashSet<ImageStateKey>,
+    /// Latest remote source known for a logical resource. This survives the
+    /// transition from a remote model URL to a local cached Thumbnail path.
+    pub known_sources: StateMap<(crate::image::ImageKind, u64), String>,
+    /// Current-song metadata probes used only when persisted state retained a
+    /// local Thumbnail path but no remote source URL for a Hero request.
+    pub resolving_sources: std::collections::HashSet<(crate::image::ImageKind, u64)>,
+    pub source_resolution_attempts: std::collections::HashSet<(crate::image::ImageKind, u64)>,
     /// Monotonic generation for page-owned image work.
     pub generation: u64,
     /// Monotonic generation for the currently published virtual-list range.
@@ -53,16 +90,26 @@ pub struct ImageState {
 
 #[derive(Debug, Clone)]
 pub struct ImageEntry {
+    /// Actual file used for extraction; distinct from the stable render identity.
+    pub backing_file: Option<PathBuf>,
+    pub palette: Option<crate::utils::ColorPalette>,
+    pub artwork: Option<std::sync::Arc<image::DynamicImage>>,
     pub path: PathBuf,
     pub handle: iced::widget::image::Handle,
     pub playlist_footer_handle: Option<iced::widget::image::Handle>,
     pub dimensions: Option<(u32, u32)>,
+    /// Present for current remote derivatives. `None` marks a local or legacy
+    /// fallback that may remain visible while an exact remote variant loads.
+    pub source_url: Option<String>,
+    pub source_url_digest: Option<u64>,
+    pub processing_version: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImageRequest {
     pub kind: crate::image::ImageKind,
     pub id: u64,
+    pub variant: crate::image::ImageVariant,
     pub url: String,
     pub generation: u64,
     pub scope: ImageRequestScope,
@@ -84,20 +131,102 @@ pub struct ImageInFlight {
     /// Cancellation ownership may be promoted without changing the completion
     /// identity emitted by an already-running task.
     pub ownership: ImageRequestScope,
+    /// Remote source captured when the request started. Completion uses this
+    /// to install the exact cache identity without consulting mutable page
+    /// state.
+    pub source_url: String,
 }
 
 impl ImageState {
+    pub fn insert_prepared(
+        &mut self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+        mut entry: ImageEntry,
+    ) {
+        let key = (kind, id, variant);
+        // Identical content keeps its GPU handle and prepared background identity.
+        if matches!(
+            kind,
+            crate::image::ImageKind::SongCover | crate::image::ImageKind::LocalSongCover
+        ) && let Some(previous) = self
+            .entries
+            .get(&key)
+            .filter(|previous| previous.path == entry.path)
+        {
+            entry.handle = previous.handle.clone();
+            entry.artwork = previous.artwork.clone();
+            entry.palette = previous.palette.clone();
+        }
+        if matches!(
+            kind,
+            crate::image::ImageKind::SongCover | crate::image::ImageKind::LocalSongCover
+        ) {
+            if variant == crate::image::ImageVariant::Hero {
+                self.entries.retain(|candidate, _| {
+                    candidate.2 != crate::image::ImageVariant::Hero
+                        || !matches!(
+                            candidate.0,
+                            crate::image::ImageKind::SongCover
+                                | crate::image::ImageKind::LocalSongCover
+                        )
+                        || *candidate == key
+                });
+                self.song_lru.retain(|candidate| {
+                    candidate.2 != crate::image::ImageVariant::Hero || *candidate == key
+                });
+            }
+            self.song_lru.retain(|existing| *existing != key);
+            self.song_lru.push_back(key);
+            while self.song_lru.len() > 128 {
+                if let Some(old) = self.song_lru.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+        self.failures.remove(&key);
+        self.entries.insert(key, entry);
+    }
+
     pub fn get(
         &self,
         kind: crate::image::ImageKind,
         id: u64,
     ) -> Option<&iced::widget::image::Handle> {
-        self.entries.get(&(kind, id)).map(|entry| &entry.handle)
+        self.get_variant(kind, id, crate::image::ImageVariant::Thumbnail)
+    }
+
+    pub fn get_variant(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+    ) -> Option<&iced::widget::image::Handle> {
+        self.entries
+            .get(&(kind, id, variant))
+            .map(|entry| &entry.handle)
+    }
+
+    /// Read the requested role, falling back to Thumbnail while a larger
+    /// derivative is pending or unavailable.
+    pub fn get_with_fallback(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+    ) -> Option<&iced::widget::image::Handle> {
+        self.get_variant(kind, id, variant)
+            .or_else(|| self.get(kind, id))
     }
 
     pub fn get_playlist_footer(&self, id: u64) -> Option<&iced::widget::image::Handle> {
         self.entries
-            .get(&(crate::image::ImageKind::PlaylistCover, id))
+            .get(&(
+                crate::image::ImageKind::PlaylistCover,
+                id,
+                crate::image::ImageVariant::Thumbnail,
+            ))
             .and_then(|entry| entry.playlist_footer_handle.as_ref())
     }
 
@@ -106,16 +235,51 @@ impl ImageState {
         kind: crate::image::ImageKind,
         id: u64,
     ) -> Option<(&PathBuf, u32, u32)> {
-        self.entries.get(&(kind, id)).map(|entry| {
+        self.image_data_variant(kind, id, crate::image::ImageVariant::Thumbnail)
+    }
+
+    pub fn image_data_variant(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+    ) -> Option<(&PathBuf, u32, u32)> {
+        self.entries.get(&(kind, id, variant)).map(|entry| {
             let (width, height) = entry.dimensions.unwrap_or((0, 0));
             (&entry.path, width, height)
         })
     }
 
+    #[cfg(test)]
     pub fn insert_path(&mut self, kind: crate::image::ImageKind, id: u64, path: PathBuf) {
+        self.insert_variant_path(kind, id, crate::image::ImageVariant::Thumbnail, path);
+    }
+
+    #[cfg(test)]
+    pub fn insert_variant_path(
+        &mut self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+        path: PathBuf,
+    ) {
+        self.insert_path_variant(kind, id, variant, path, None);
+    }
+
+    #[cfg(test)]
+    fn insert_path_variant(
+        &mut self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+        path: PathBuf,
+        source_url: Option<String>,
+    ) {
         let dimensions = image_dimensions(&path);
         let handle = iced::widget::image::Handle::from_path(path.clone());
-        let playlist_footer_handle = if kind == crate::image::ImageKind::PlaylistCover {
+        let playlist_footer_handle = if kind == crate::image::ImageKind::PlaylistCover
+            && variant == crate::image::ImageVariant::Thumbnail
+        {
             image::open(&path).ok().map(|source| {
                 let processed =
                     crate::ui::effects::image_processing::process_image_for_playlist_footer(
@@ -131,22 +295,54 @@ impl ImageState {
             None
         };
         self.entries.insert(
-            (kind, id),
+            (kind, id, variant),
             ImageEntry {
+                backing_file: Some(path.clone()),
+                palette: None,
+                artwork: None,
                 path,
                 handle,
                 playlist_footer_handle,
                 dimensions,
+                source_url_digest: source_url.as_deref().map(crate::image::source_url_digest),
+                processing_version: source_url
+                    .as_ref()
+                    .map(|_| crate::image::IMAGE_PROCESSING_VERSION),
+                source_url,
             },
         );
-        if let Some(request) = self.inflight.remove(&(kind, id)) {
+        if let Some(request) = self.inflight.remove(&(kind, id, variant)) {
             request.handle.abort();
         }
-        self.queued.remove(&(kind, id));
+        self.queued.remove(&(kind, id, variant));
     }
 
-    pub fn clear_inflight(&mut self, kind: crate::image::ImageKind, id: u64) {
-        self.inflight.remove(&(kind, id));
+    pub fn clear_variant_inflight(
+        &mut self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+    ) -> bool {
+        let Some(request) = self.inflight.remove(&(kind, id, variant)) else {
+            return false;
+        };
+        self.queued.remove(&(kind, id, variant));
+        // Global promotion preserves running identity, but its latest source
+        // must be scheduled immediately after that older operation completes.
+        if request.ownership == ImageRequestScope::Global
+            && let Some(source) = self.known_sources.get(&(kind, id)).cloned()
+            && source != request.source_url
+        {
+            self.failures.remove(&(kind, id, variant));
+            return self.enqueue_variant_with_scope(
+                kind,
+                id,
+                variant,
+                source,
+                ImageRequestScope::Global,
+            );
+        }
+        false
     }
 
     /// Drop a cache entry and every request for a resource whose remote
@@ -154,16 +350,48 @@ impl ImageState {
     /// Daily Recommend playlist) reuse an application-level ID while their
     /// cover URL changes between refreshes.
     pub fn invalidate(&mut self, kind: crate::image::ImageKind, id: u64) {
-        let key = (kind, id);
-        self.entries.remove(&key);
-        if let Some(request) = self.inflight.remove(&key) {
-            request.handle.abort();
+        self.entries
+            .retain(|(entry_kind, entry_id, _), _| (*entry_kind, *entry_id) != (kind, id));
+        let mut retained = StateMap::default();
+        for (key, request) in self.inflight.drain() {
+            if (key.0, key.1) == (kind, id) {
+                request.handle.abort();
+            } else {
+                retained.insert(key, request);
+            }
         }
+        self.inflight = retained;
         self.pending
-            .retain(|request| (request.kind, request.id) != key);
-        self.queued.remove(&key);
+            .retain(|request| (request.kind, request.id) != (kind, id));
+        self.queued
+            .retain(|(entry_kind, entry_id, _)| (*entry_kind, *entry_id) != (kind, id));
+        self.failures.retain(|(k, i, _), _| (*k, *i) != (kind, id));
+        self.known_sources.remove(&(kind, id));
+        self.resolving_sources.remove(&(kind, id));
+        self.source_resolution_attempts.remove(&(kind, id));
     }
 
+    /// Keep the visible handle until a replacement succeeds. Pending work for
+    /// the previous content is cancelled, without evicting unrelated resources.
+    pub fn refresh_retaining_image(&mut self, kind: crate::image::ImageKind, id: u64) {
+        let retained: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| key.0 == kind && key.1 == id)
+            .map(|(key, entry)| (*key, entry.clone()))
+            .collect();
+        let source = self.known_sources.get(&(kind, id)).cloned();
+        self.invalidate(kind, id);
+        for (key, mut entry) in retained {
+            entry.processing_version = None;
+            self.entries.insert(key, entry);
+        }
+        if let Some(source) = source {
+            self.known_sources.insert((kind, id), source);
+        }
+    }
+
+    #[cfg(test)]
     pub fn is_current_inflight(
         &self,
         kind: crate::image::ImageKind,
@@ -171,18 +399,55 @@ impl ImageState {
         generation: u64,
         scope: ImageRequestScope,
     ) -> bool {
+        self.is_current_variant_inflight(
+            kind,
+            id,
+            crate::image::ImageVariant::Thumbnail,
+            generation,
+            scope,
+        )
+    }
+
+    pub fn is_current_variant_inflight(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+        generation: u64,
+        scope: ImageRequestScope,
+    ) -> bool {
         self.inflight
-            .get(&(kind, id))
+            .get(&(kind, id, variant))
             .is_some_and(|request| request.generation == generation && request.scope == scope)
     }
 
+    #[cfg(test)]
     pub fn is_inflight(&self, kind: crate::image::ImageKind, id: u64) -> bool {
-        self.inflight.contains_key(&(kind, id))
+        self.is_variant_inflight(kind, id, crate::image::ImageVariant::Thumbnail)
+    }
+
+    pub fn is_variant_inflight(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+    ) -> bool {
+        self.inflight.contains_key(&(kind, id, variant))
     }
 
     #[cfg(test)]
     pub fn is_queued(&self, kind: crate::image::ImageKind, id: u64) -> bool {
-        self.queued.contains(&(kind, id))
+        self.is_variant_queued(kind, id, crate::image::ImageVariant::Thumbnail)
+    }
+
+    #[cfg(test)]
+    pub fn is_variant_queued(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+    ) -> bool {
+        self.queued.contains(&(kind, id, variant))
     }
 
     #[cfg(test)]
@@ -190,6 +455,7 @@ impl ImageState {
         self.enqueue_with_scope(kind, id, url, ImageRequestScope::Page)
     }
 
+    #[cfg(test)]
     pub fn enqueue_with_scope(
         &mut self,
         kind: crate::image::ImageKind,
@@ -197,8 +463,37 @@ impl ImageState {
         url: String,
         scope: ImageRequestScope,
     ) -> bool {
-        let key = (kind, id);
-        if self.entries.contains_key(&key) || url.is_empty() {
+        self.enqueue_variant_with_scope(kind, id, crate::image::ImageVariant::Thumbnail, url, scope)
+    }
+
+    pub fn enqueue_variant_with_scope(
+        &mut self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+        url: String,
+        scope: ImageRequestScope,
+    ) -> bool {
+        let key = (kind, id, variant);
+        if url.is_empty() {
+            return false;
+        }
+        if self
+            .known_sources
+            .get(&(kind, id))
+            .is_some_and(|previous| previous != &url)
+        {
+            self.failures.remove(&key);
+        }
+        if self
+            .failures
+            .get(&key)
+            .is_some_and(|failed| failed.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return false;
+        }
+        self.known_sources.insert((kind, id), url.clone());
+        if self.has_current_remote_variant(kind, id, variant, &url) {
             return false;
         }
 
@@ -206,10 +501,9 @@ impl ImageState {
             if let Some(request) = self
                 .pending
                 .iter_mut()
-                .find(|request| (request.kind, request.id) == key)
+                .find(|request| (request.kind, request.id, request.variant) == key)
             {
                 request.url = url;
-                request.generation = 0;
                 request.scope = ImageRequestScope::Global;
                 return false;
             }
@@ -219,26 +513,92 @@ impl ImageState {
             }
         }
 
+        let mut effective_scope = scope;
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|request| (request.kind, request.id, request.variant) == key)
+        {
+            let request = &mut self.pending[index];
+            if request.url == url {
+                if scope == ImageRequestScope::Global {
+                    request.scope = ImageRequestScope::Global;
+                }
+                return false;
+            }
+
+            let replaced = self
+                .pending
+                .remove(index)
+                .expect("located pending image request must still exist");
+            self.queued.remove(&key);
+            if replaced.scope == ImageRequestScope::Global {
+                effective_scope = ImageRequestScope::Global;
+            }
+        }
+
+        if let Some(request) = self.inflight.get(&key)
+            && request.source_url == url
+        {
+            if scope == ImageRequestScope::Global
+                && let Some(request) = self.inflight.get_mut(&key)
+            {
+                request.ownership = ImageRequestScope::Global;
+            }
+            return false;
+        }
+
+        if let Some(request) = self.inflight.remove(&key) {
+            if request.ownership == ImageRequestScope::Global {
+                effective_scope = ImageRequestScope::Global;
+            }
+            request.handle.abort();
+        }
+
         if self.inflight.contains_key(&key) || self.queued.contains(&key) {
             return false;
         }
 
-        let generation = match scope {
-            ImageRequestScope::Global => 0,
-            ImageRequestScope::Page => self.generation,
-            ImageRequestScope::Viewport => self.viewport_generation,
-        };
+        let generation = self.next_image_request;
+        self.next_image_request = self.next_image_request.wrapping_add(1);
         self.pending.push_back(ImageRequest {
             kind,
             id,
+            variant,
             url,
             generation,
-            scope,
+            scope: effective_scope,
         });
         self.queued.insert(key);
         true
     }
 
+    pub fn has_current_remote_variant(
+        &self,
+        kind: crate::image::ImageKind,
+        id: u64,
+        variant: crate::image::ImageVariant,
+        source_url: &str,
+    ) -> bool {
+        self.entries.get(&(kind, id, variant)).is_some_and(|entry| {
+            entry.source_url_digest == Some(crate::image::source_url_digest(source_url))
+                && entry.processing_version == Some(crate::image::IMAGE_PROCESSING_VERSION)
+        })
+    }
+
+    pub fn begin_source_resolution(&mut self, kind: crate::image::ImageKind, id: u64) -> bool {
+        let key = (kind, id);
+        if !self.source_resolution_attempts.insert(key) {
+            return false;
+        }
+        self.resolving_sources.insert(key)
+    }
+
+    pub fn finish_source_resolution(&mut self, kind: crate::image::ImageKind, id: u64) {
+        self.resolving_sources.remove(&(kind, id));
+    }
+
+    #[cfg(test)]
     pub fn mark_inflight(
         &mut self,
         kind: crate::image::ImageKind,
@@ -247,14 +607,42 @@ impl ImageState {
         scope: ImageRequestScope,
         handle: iced::task::Handle,
     ) {
-        self.queued.remove(&(kind, id));
+        self.insert_inflight(
+            (kind, id, crate::image::ImageVariant::Thumbnail),
+            generation,
+            scope,
+            String::new(),
+            handle,
+        );
+    }
+
+    pub fn mark_request_inflight(&mut self, request: &ImageRequest, handle: iced::task::Handle) {
+        self.insert_inflight(
+            (request.kind, request.id, request.variant),
+            request.generation,
+            request.scope,
+            request.url.clone(),
+            handle,
+        );
+    }
+
+    fn insert_inflight(
+        &mut self,
+        key: ImageStateKey,
+        generation: u64,
+        scope: ImageRequestScope,
+        source_url: String,
+        handle: iced::task::Handle,
+    ) {
+        self.queued.remove(&key);
         self.inflight.insert(
-            (kind, id),
+            key,
             ImageInFlight {
                 generation,
                 handle,
                 scope,
                 ownership: scope,
+                source_url,
             },
         );
     }
@@ -271,7 +659,9 @@ impl ImageState {
     ) {
         let mut retained = StateMap::default();
         for (key, request) in self.inflight.drain() {
-            if request.ownership == ImageRequestScope::Viewport && !desired.contains(&key) {
+            if request.ownership == ImageRequestScope::Viewport
+                && !desired.contains(&(key.0, key.1))
+            {
                 request.handle.abort();
             } else {
                 retained.insert(key, request);
@@ -307,7 +697,8 @@ impl ImageState {
 
     pub fn pop_pending(&mut self) -> Option<ImageRequest> {
         let request = self.pending.pop_front()?;
-        self.queued.remove(&(request.kind, request.id));
+        self.queued
+            .remove(&(request.kind, request.id, request.variant));
         Some(request)
     }
 
@@ -316,7 +707,7 @@ impl ImageState {
         self.queued.extend(
             self.pending
                 .iter()
-                .map(|request| (request.kind, request.id)),
+                .map(|request| (request.kind, request.id, request.variant)),
         );
         self.queued.extend(self.inflight.keys().copied());
     }
@@ -325,6 +716,115 @@ impl ImageState {
 #[cfg(test)]
 mod image_state_tests {
     use super::*;
+
+    #[test]
+    fn promoted_request_schedules_latest_source_on_completion() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::SongCover;
+        let variant = crate::image::ImageVariant::Thumbnail;
+        assert!(state.enqueue_with_scope(kind, 42, "https://old".into(), ImageRequestScope::Page));
+        let old = state.pop_pending().unwrap();
+        let (_, handle) = iced::Task::<()>::none().abortable();
+        state.mark_request_inflight(&old, handle);
+        assert!(!state.enqueue_with_scope(
+            kind,
+            42,
+            "https://new".into(),
+            ImageRequestScope::Global
+        ));
+        state.cancel_pending_and_inflight();
+        assert!(state.is_current_variant_inflight(kind, 42, variant, old.generation, old.scope));
+        assert!(state.clear_variant_inflight(kind, 42, variant));
+        let replacement = state.pop_pending().unwrap();
+        assert_eq!(replacement.url, "https://new");
+        assert_eq!(replacement.scope, ImageRequestScope::Global);
+        assert_ne!(replacement.generation, old.generation);
+    }
+
+    #[test]
+    fn clearing_audio_sources_rejects_prior_global_artwork() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::SongCover;
+        assert!(state.enqueue_with_scope(
+            kind,
+            42,
+            "https://example.invalid/cover".into(),
+            ImageRequestScope::Global
+        ));
+        let old = state.pop_pending().unwrap();
+        state.artwork_epoch += 1;
+        state.invalidate(kind, 42);
+        assert!(state.enqueue_with_scope(
+            kind,
+            42,
+            "https://example.invalid/cover".into(),
+            ImageRequestScope::Global
+        ));
+        let new = state.pop_pending().unwrap();
+        let (_, handle) = iced::Task::perform(async {}, |_| ()).abortable();
+        state.mark_request_inflight(&new, handle);
+        assert!(!state.is_current_variant_inflight(
+            kind,
+            42,
+            old.variant,
+            old.generation,
+            old.scope
+        ));
+        assert!(state.is_current_variant_inflight(
+            kind,
+            42,
+            new.variant,
+            new.generation,
+            new.scope
+        ));
+    }
+
+    #[test]
+    fn failed_artwork_is_not_retried_on_every_ui_tick() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::LocalSongCover;
+        state.failures.insert(
+            (kind, 42, crate::image::ImageVariant::Thumbnail),
+            std::time::Instant::now(),
+        );
+        assert!(!state.enqueue_with_scope(
+            kind,
+            42,
+            "missing.mp3".into(),
+            ImageRequestScope::Global
+        ));
+        state.invalidate(kind, 42);
+        assert!(state.enqueue_with_scope(
+            kind,
+            42,
+            "missing.mp3".into(),
+            ImageRequestScope::Global
+        ));
+    }
+
+    #[test]
+    fn song_artwork_memory_is_bounded() {
+        let mut state = ImageState::default();
+        for id in 0..140 {
+            let entry = crate::image::artwork::prepare(
+                crate::image::ImageKind::SongCover,
+                crate::image::ImageVariant::Thumbnail,
+                PathBuf::from(format!("artwork://{id}")),
+                format!("https://example.invalid/{id}"),
+                image::DynamicImage::new_rgb8(1, 1),
+            );
+            state.insert_prepared(
+                crate::image::ImageKind::SongCover,
+                id,
+                crate::image::ImageVariant::Thumbnail,
+                entry,
+            );
+        }
+        assert_eq!(state.song_lru.len(), 128);
+        assert_eq!(state.entries.len(), 128);
+        assert!(state.get(crate::image::ImageKind::SongCover, 0).is_none());
+        assert!(state.get(crate::image::ImageKind::SongCover, 139).is_some());
+    }
 
     #[test]
     fn cancelling_image_work_aborts_active_task_and_advances_generation() {
@@ -481,12 +981,12 @@ mod image_state_tests {
             "https://example.invalid/row.jpg".to_string(),
             ImageRequestScope::Viewport,
         ));
-        assert_eq!(
+        assert_ne!(
             state
                 .pop_pending()
                 .expect("replacement viewport request")
                 .generation,
-            1
+            viewport_request.generation
         );
     }
 
@@ -641,8 +1141,173 @@ mod image_state_tests {
             ImageRequestScope::Viewport,
         ));
     }
+
+    #[test]
+    fn image_variants_coexist_and_larger_roles_fall_back_to_thumbnail() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::SongCover;
+        state.insert_path(kind, 30, PathBuf::from("thumbnail.jpg"));
+
+        assert!(
+            state
+                .get_with_fallback(kind, 30, crate::image::ImageVariant::Hero)
+                .is_some()
+        );
+        assert!(
+            state
+                .get_variant(kind, 30, crate::image::ImageVariant::Hero)
+                .is_none()
+        );
+
+        state.insert_variant_path(
+            kind,
+            30,
+            crate::image::ImageVariant::Hero,
+            PathBuf::from("hero.jpg"),
+        );
+
+        assert_eq!(state.entries.len(), 2);
+        assert!(
+            state
+                .get_variant(kind, 30, crate::image::ImageVariant::Thumbnail)
+                .is_some()
+        );
+        assert!(
+            state
+                .get_variant(kind, 30, crate::image::ImageVariant::Hero)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_thumbnail_does_not_satisfy_exact_remote_identity() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::PlaylistCover;
+        state.insert_path(kind, 31, PathBuf::from("legacy.jpg"));
+
+        assert!(state.enqueue_variant_with_scope(
+            kind,
+            31,
+            crate::image::ImageVariant::Thumbnail,
+            "https://example.invalid/current.jpg".to_string(),
+            ImageRequestScope::Page,
+        ));
+        assert!(state.is_variant_queued(kind, 31, crate::image::ImageVariant::Thumbnail));
+    }
+
+    #[test]
+    fn completion_identity_and_cancellation_are_variant_scoped() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::SongCover;
+        assert!(state.enqueue_variant_with_scope(
+            kind,
+            32,
+            crate::image::ImageVariant::Thumbnail,
+            "https://example.invalid/thumb.jpg".to_string(),
+            ImageRequestScope::Viewport,
+        ));
+        assert!(state.enqueue_variant_with_scope(
+            kind,
+            32,
+            crate::image::ImageVariant::Hero,
+            "https://example.invalid/hero.jpg".to_string(),
+            ImageRequestScope::Global,
+        ));
+
+        let thumbnail = state.pop_pending().expect("thumbnail request");
+        let hero = state.pop_pending().expect("hero request");
+        let (_thumbnail_task, thumbnail_handle) = iced::Task::perform(async {}, |_| ()).abortable();
+        let (_hero_task, hero_handle) = iced::Task::perform(async {}, |_| ()).abortable();
+        let thumbnail_observer = thumbnail_handle.clone();
+        let hero_observer = hero_handle.clone();
+        state.mark_request_inflight(&thumbnail, thumbnail_handle);
+        state.mark_request_inflight(&hero, hero_handle);
+
+        assert!(state.is_current_variant_inflight(
+            kind,
+            32,
+            crate::image::ImageVariant::Hero,
+            hero.generation,
+            ImageRequestScope::Global,
+        ));
+        assert!(!state.is_current_variant_inflight(
+            kind,
+            32,
+            crate::image::ImageVariant::Thumbnail,
+            0,
+            ImageRequestScope::Global,
+        ));
+
+        state.reconcile_viewport_requests(&HashSet::new());
+
+        assert!(thumbnail_observer.is_aborted());
+        assert!(!hero_observer.is_aborted());
+    }
+
+    #[test]
+    fn current_song_source_probe_is_bounded_per_resource() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::SongCover;
+
+        assert!(state.begin_source_resolution(kind, 33));
+        state.finish_source_resolution(kind, 33);
+        assert!(!state.begin_source_resolution(kind, 33));
+
+        state.invalidate(kind, 33);
+        assert!(state.begin_source_resolution(kind, 33));
+    }
+
+    #[test]
+    fn changed_source_replaces_pending_and_inflight_variant_work() {
+        let mut state = ImageState::default();
+        let kind = crate::image::ImageKind::PlaylistCover;
+        let variant = crate::image::ImageVariant::Detail;
+
+        assert!(state.enqueue_variant_with_scope(
+            kind,
+            34,
+            variant,
+            "https://example.invalid/old.jpg".to_string(),
+            ImageRequestScope::Page,
+        ));
+        assert!(state.enqueue_variant_with_scope(
+            kind,
+            34,
+            variant,
+            "https://example.invalid/new.jpg".to_string(),
+            ImageRequestScope::Page,
+        ));
+        let replacement = state.pop_pending().expect("replacement request");
+        assert_eq!(replacement.url, "https://example.invalid/new.jpg");
+
+        let (_, handle) = iced::Task::<()>::none().abortable();
+        state.mark_request_inflight(&replacement, handle);
+        assert!(state.enqueue_variant_with_scope(
+            kind,
+            34,
+            variant,
+            "https://example.invalid/latest.jpg".to_string(),
+            ImageRequestScope::Page,
+        ));
+        assert!(!state.is_variant_inflight(kind, 34, variant));
+        let latest = state.pop_pending().expect("latest request");
+        assert_eq!(latest.url, "https://example.invalid/latest.jpg");
+        assert_eq!(latest.scope, ImageRequestScope::Page);
+        assert_ne!(latest.generation, replacement.generation);
+        let (_, handle) = iced::Task::<()>::none().abortable();
+        state.mark_request_inflight(&latest, handle);
+        // A queued failure from the aborted source must not clear its replacement.
+        assert!(!state.is_current_variant_inflight(
+            kind,
+            34,
+            variant,
+            replacement.generation,
+            replacement.scope
+        ));
+    }
 }
 
+#[cfg(test)]
 fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
     image::ImageReader::open(path)
         .and_then(|reader| reader.with_guessed_format())
@@ -674,6 +1339,11 @@ pub struct CoreState {
     audio: Option<crate::audio::AudioHandle>,
     /// Audio processing chain (preamp, EQ, analyzer) - shared with AudioPlayer
     audio_chain: AudioProcessingChain,
+    /// Latest live output-device projection. Rendering must not enumerate
+    /// native devices on every frame.
+    pub audio_output_devices: Vec<AudioDevice>,
+    /// Manual selector awaiting a matching successful output recovery.
+    pub pending_audio_output_device: Option<Option<String>>,
     pub volume_before_mute: Option<f32>,
     pub settings: crate::features::Settings,
     pub locale: Locale,
@@ -736,6 +1406,8 @@ impl CoreState {
             audio_thread,
             audio,
             audio_chain,
+            audio_output_devices: Vec::new(),
+            pending_audio_output_device: None,
             volume_before_mute: None,
             settings,
             locale,
@@ -1320,32 +1992,24 @@ impl App {
         }
     }
 
-    pub(crate) fn switch_audio_output_device(&mut self, device_name: Option<String>) {
+    pub(crate) fn switch_audio_output_device(
+        &mut self,
+        device_name: Option<String>,
+    ) -> crate::audio::PlaybackResult<()> {
         self.clear_scheduled_transition_state();
-        if let Some(audio) = self.audio_handle()
-            && let Err(error) = audio.switch_device(device_name)
-        {
-            tracing::warn!("Failed to enqueue audio device switch: {error}");
-        }
+        self.require_audio_handle()?
+            .switch_device(device_name.clone())?;
+        self.core.pending_audio_output_device = Some(device_name);
+        Ok(())
     }
 
     pub(crate) fn audio_output_devices(&self) -> Vec<(String, String)> {
-        crate::audio::get_audio_devices()
-            .into_iter()
-            .map(|device| (device.name, device.description))
-            .collect()
+        audio_output_device_options(&self.core.audio_output_devices)
     }
 
     /// List all installed font families available for lyrics rendering.
     pub(crate) fn lyrics_font_families(&self) -> Vec<String> {
-        self.ui
-            .lyrics
-            .shared_font_system
-            .as_ref()
-            .map_or_else(Vec::new, |fs| {
-                let font_system = fs.lock();
-                crate::platform::theme::list_installed_font_families(font_system.db())
-            })
+        self.ui.lyrics.font_families.clone()
     }
 
     pub(crate) fn set_audio_analysis_enabled(&self, enabled: bool) {
@@ -1394,6 +2058,7 @@ impl UserInfo {
 /// Business Logic Data
 #[derive(Default)]
 pub struct LibraryState {
+    pub audio_index: crate::utils::audio_index::AudioIndexState,
     pub db_songs: Vec<DbSong>,
     pub playlists: Vec<DbPlaylist>,
     pub recently_played: Vec<DbSong>,
@@ -1856,6 +2521,7 @@ pub struct ContextMenuState {
 /// Song edit dialog state
 #[derive(Debug, Clone)]
 pub struct SongEditDialogState {
+    pub cover_handle: Option<iced::widget::image::Handle>,
     pub song_id: i64,
     pub title: String,
     pub artist: String,
@@ -1940,6 +2606,8 @@ impl UiState {
                 ncm_cache_baseline: None,
                 ncm_replace_songs_on_chunk: false,
                 ncm_load_generation: 0,
+                online_tracks: Vec::new(),
+                online_track_owner: None,
             },
 
             lyrics: LyricsState {
@@ -1963,6 +2631,8 @@ impl UiState {
                 cached_shaped_lines: None,
                 // FontSystem will be created asynchronously
                 shared_font_system: None,
+                font_families: Vec::new(),
+                display_font: iced::Font::DEFAULT,
                 // Conservative bootstrap values; the mounted renderer's
                 // Sensor supplies the actual viewport before shaping.
                 viewport_width: 800.0,
@@ -1971,11 +2641,6 @@ impl UiState {
                 pending_viewport_size: None,
                 shaped_content_width: 0.0,
                 shaped_font_size: 0.0,
-                shape_generation: 0,
-                pending_shape_song_id: None,
-                pending_shape_generation: 0,
-                pending_shape_content_width: 0.0,
-                pending_shape_font_size: 0.0,
                 is_loading: false,
                 load_error: None,
             },
@@ -2018,6 +2683,10 @@ impl UiState {
             || self.search.song_animations.is_animating()
             || self.search.card_animations.is_animating()
             || self.smooth_scroll.is_animating()
+            // The import card is rendered from live scan progress. Keep the
+            // frame subscription alive while it is present so progress and
+            // the completion affordance are painted immediately.
+            || self.importing_playlist.is_some()
     }
 
     /// Whether a visible UI layer owns pointer input instead of the main content.
@@ -2116,6 +2785,12 @@ mod smooth_scroll_animation_tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaylistTrackOwner {
+    pub page_id: i64,
+    pub generation: u64,
+}
+
 pub struct PlaylistPageState {
     pub current: Option<pages::PlaylistView>,
     pub viewing_recently_played: bool,
@@ -2148,10 +2823,14 @@ pub struct PlaylistPageState {
     pub ncm_cache_baseline: Option<crate::api::PlaylistDetail>,
     /// Replace cached songs when the first refreshed batch arrives.
     pub ncm_replace_songs_on_chunk: bool,
-    /// Monotonic token for NCM playlist requests. Every route entry gets a
-    /// new token so a request from an earlier visit cannot update the page
+    /// Monotonic token for online detail-page requests. Every route entry gets
+    /// a new token so a request from an earlier visit cannot update the page
     /// after the user has switched away and back.
     pub ncm_load_generation: u64,
+    /// Raw NCM tracks that produced the current detail-page rows.
+    online_tracks: Vec<Track>,
+    /// Exact page/generation allowed to read or mutate `online_tracks`.
+    online_track_owner: Option<PlaylistTrackOwner>,
 }
 
 impl Default for PlaylistPageState {
@@ -2178,11 +2857,96 @@ impl Default for PlaylistPageState {
             ncm_cache_baseline: None,
             ncm_replace_songs_on_chunk: false,
             ncm_load_generation: 0,
+            online_tracks: Vec::new(),
+            online_track_owner: None,
         }
     }
 }
 
 impl PlaylistPageState {
+    pub fn advance_load_generation(&mut self) -> u64 {
+        self.ncm_load_generation = self.ncm_load_generation.wrapping_add(1);
+        self.clear_online_tracks();
+        self.ncm_load_generation
+    }
+
+    pub fn begin_online_tracks(&mut self, page_id: i64, generation: u64) -> bool {
+        if generation != self.ncm_load_generation {
+            return false;
+        }
+        self.online_track_owner = Some(PlaylistTrackOwner {
+            page_id,
+            generation,
+        });
+        self.online_tracks.clear();
+        true
+    }
+
+    pub fn clear_online_tracks(&mut self) {
+        self.online_tracks.clear();
+        self.online_track_owner = None;
+    }
+
+    pub fn replace_online_tracks(
+        &mut self,
+        page_id: i64,
+        generation: u64,
+        tracks: Vec<Track>,
+    ) -> bool {
+        if !self.online_track_owner_matches(page_id, generation) {
+            return false;
+        }
+        self.online_tracks = tracks;
+        true
+    }
+
+    pub fn append_online_tracks(
+        &mut self,
+        page_id: i64,
+        generation: u64,
+        tracks: &[Track],
+    ) -> bool {
+        if !self.online_track_owner_matches(page_id, generation) {
+            return false;
+        }
+        self.online_tracks.extend_from_slice(tracks);
+        true
+    }
+
+    pub fn online_tracks_for(&self, page_id: i64, generation: u64) -> Option<&[Track]> {
+        self.online_track_owner_matches(page_id, generation)
+            .then_some(self.online_tracks.as_slice())
+    }
+
+    pub fn current_online_tracks(&self) -> Option<&[Track]> {
+        let page_id = self.current.as_ref()?.id;
+        self.online_tracks_for(page_id, self.ncm_load_generation)
+    }
+
+    pub fn current_online_track(&self, ncm_id: u64) -> Option<&Track> {
+        self.current_online_tracks()?
+            .iter()
+            .find(|track| track.id == ncm_id)
+    }
+
+    pub fn remove_current_online_track(&mut self, ncm_id: u64) {
+        let Some(page_id) = self.current.as_ref().map(|page| page.id) else {
+            return;
+        };
+        if self.online_track_owner_matches(page_id, self.ncm_load_generation) {
+            self.online_tracks.retain(|track| track.id != ncm_id);
+        }
+    }
+
+    fn online_track_owner_matches(&self, page_id: i64, generation: u64) -> bool {
+        self.online_track_owner
+            == Some(PlaylistTrackOwner {
+                page_id,
+                generation,
+            })
+            && generation == self.ncm_load_generation
+    }
+
     /// Synchronize the gradient fade with the current page palette.
     pub fn sync_gradient_animation(&mut self, power_saving: bool) {
         let target = self
@@ -2321,6 +3085,49 @@ mod detail_gradient_state_tests {
     }
 }
 
+#[cfg(test)]
+mod playlist_online_track_state_tests {
+    use super::PlaylistPageState;
+    use crate::api::Track;
+
+    fn track(id: u64) -> Track {
+        Track {
+            id,
+            title: format!("track-{id}"),
+            ..Track::default()
+        }
+    }
+
+    #[test]
+    fn owned_tracks_replace_append_and_reject_stale_generations() {
+        let mut state = PlaylistPageState::default();
+        let generation = state.advance_load_generation();
+        assert!(state.begin_online_tracks(-10, generation));
+        assert!(state.replace_online_tracks(-10, generation, vec![track(1), track(2)]));
+        assert!(state.append_online_tracks(-10, generation, &[track(3)]));
+        assert_eq!(
+            state
+                .online_tracks_for(-10, generation)
+                .expect("current tracks")
+                .iter()
+                .map(|track| track.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        assert!(!state.append_online_tracks(-11, generation, &[track(4)]));
+        let next_generation = state.advance_load_generation();
+        assert!(state.online_tracks_for(-10, generation).is_none());
+        assert!(!state.replace_online_tracks(-10, generation, vec![track(5)]));
+        assert!(state.begin_online_tracks(-10, next_generation));
+        assert!(state.replace_online_tracks(-10, next_generation, vec![track(6)]));
+        assert_eq!(
+            state.online_tracks_for(-10, next_generation).unwrap()[0].id,
+            6
+        );
+    }
+}
+
 /// Presentation selected inside the full-screen player.
 ///
 /// This state is intentionally independent from the displayed song and lyrics
@@ -2371,6 +3178,9 @@ pub struct LyricsState {
         Option<std::sync::Arc<Vec<crate::features::lyrics::engine::CachedShapedLine>>>,
     /// Shared font system for async text shaping (created asynchronously at app startup)
     pub shared_font_system: Option<crate::features::lyrics::engine::SharedFontSystem>,
+    /// Resolved once on initialization or selection, shared by all text modes.
+    pub display_font: iced::Font,
+    pub font_families: Vec<String>,
 
     // Viewport info for line height calculations
     /// Last known viewport width (in logical pixels)
@@ -2385,14 +3195,6 @@ pub struct LyricsState {
     pub shaped_content_width: f32,
     /// Main font size used by the latest accepted shaped lines.
     pub shaped_font_size: f32,
-    /// Monotonic generation for async lyrics shaping requests.
-    pub shape_generation: u64,
-    /// Current in-flight shaping request for the displayed song.
-    pub pending_shape_song_id: Option<i64>,
-    pub pending_shape_generation: u64,
-    pub pending_shape_content_width: f32,
-    pub pending_shape_font_size: f32,
-
     // Display loading state
     /// Whether lyrics for the current display target are currently being loaded.
     pub is_loading: bool,
@@ -2568,4 +3370,39 @@ pub struct HomePageState {
     pub user_playlists: Vec<PlaylistSummary>,
     /// Current NCM playlist songs (for playback)
     pub current_ncm_playlist_songs: Vec<Track>,
+}
+
+#[cfg(test)]
+mod audio_output_device_option_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_names_keep_unique_stable_id_labels_and_values() {
+        let devices = [
+            AudioDevice {
+                id: "wasapi:device-a".to_string(),
+                name: "Speakers".to_string(),
+                is_default: true,
+            },
+            AudioDevice {
+                id: "wasapi:device-b".to_string(),
+                name: "Speakers".to_string(),
+                is_default: false,
+            },
+        ];
+
+        assert_eq!(
+            audio_output_device_options(&devices),
+            vec![
+                (
+                    "wasapi:device-a".to_string(),
+                    "Speakers (wasapi:device-a)".to_string(),
+                ),
+                (
+                    "wasapi:device-b".to_string(),
+                    "Speakers (wasapi:device-b)".to_string(),
+                ),
+            ]
+        );
+    }
 }

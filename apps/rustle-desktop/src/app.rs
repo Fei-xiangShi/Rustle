@@ -14,6 +14,7 @@ use crate::i18n::{Language, Locale};
 pub use message::{
     ContextMenuAction, IconId, Message, PlaylistViewPayload, SettingsSection, SidebarId,
 };
+pub(crate) use state::ImageEntry;
 pub use state::{
     App, ContextMenuState, CoreState, DiscoverPageState, DiscoverViewMode, DownloadTab, ImageState,
     LibraryState, LyricsDisplayMode, PlaybackSessionState, Route, SearchPageState, SearchTab,
@@ -201,11 +202,7 @@ impl App {
     /// Application theme for a specific window
     pub fn theme(&self, _window_id: iced::window::Id) -> Theme {
         // Access settings via core state
-        if self.core.settings.display.dark_mode {
-            Theme::Dark
-        } else {
-            Theme::Light
-        }
+        rustle_ui::theme::application(self.core.settings.display.dark_mode)
     }
 
     /// Dynamic window title based on current playback state
@@ -271,16 +268,21 @@ impl App {
         let window_throttled = subscription_logic::window_should_throttle(window_hidden);
 
         // 7. Animation subscription
-        let animation_sub = if subscription_logic::animation_subscription_enabled(
-            window_throttled,
-            has_animations,
-            lyrics_needs_frames,
-            audio_engine_needs_frames,
-        ) {
-            iced::window::frames().map(Message::AnimationTick)
-        } else {
-            iced::Subscription::none()
-        };
+        // Import finalization must advance even when decorative animations are
+        // disabled. Use a lower frame rate in power saving mode.
+        let animation_sub =
+            if power_saving && !window_throttled && self.ui.importing_playlist.is_some() {
+                iced::time::every(Duration::from_millis(33)).map(Message::AnimationTick)
+            } else if subscription_logic::animation_subscription_enabled(
+                window_throttled,
+                has_animations,
+                lyrics_needs_frames,
+                audio_engine_needs_frames,
+            ) {
+                iced::window::frames().map(Message::AnimationTick)
+            } else {
+                iced::Subscription::none()
+            };
 
         // 8. Playback monitoring
         let playback_sub = if let Some(interval) = subscription_logic::playback_tick_interval_ms(
@@ -324,6 +326,7 @@ impl App {
 
         // Batch all subscriptions
         iced::Subscription::batch([
+            update::audio_index::subscription(self.core.settings.storage.effective_download_dir()),
             keyboard_sub,
             close_request_sub,
             animation_sub, // Animation updates (vsync rate)

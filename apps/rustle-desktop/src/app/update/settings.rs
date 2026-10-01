@@ -246,9 +246,17 @@ impl App {
 }
 
 impl App {
-    pub(super) fn refresh_cache_stats(&mut self) {
-        let stats = cache::calculate_cache_stats();
-        self.ui.cache_stats = Some(stats);
+    pub(super) fn refresh_cache_stats(&self) -> Task<Message> {
+        Task::perform(
+            async { tokio::task::spawn_blocking(cache::calculate_cache_stats).await },
+            |result| match result {
+                Ok(stats) => Message::CacheStatsReady(stats),
+                Err(error) => {
+                    tracing::warn!(%error, "Cache statistics worker failed");
+                    Message::Noop
+                }
+            },
+        )
     }
 
     /// Handle settings-related messages
@@ -342,19 +350,11 @@ impl App {
                     self.core.settings.lyrics.lyrics_font_family.as_deref() != family.as_deref();
                 if changed {
                     self.core.settings.lyrics.lyrics_font_family = family.clone();
+                    self.refresh_lyrics_display_font();
 
-                    // Update engine's text shaper so synchronous shaping uses the new font
-                    if let Some(engine_cell) = &self.ui.lyrics.engine
-                        && let Some(font_system) = &self.ui.lyrics.shared_font_system
-                    {
-                        let mut engine = engine_cell.borrow_mut();
-                        engine.set_font_family(family.clone(), font_system.clone());
-                    }
-
-                    // Invalidate all caches and trigger re-shape
+                    // Keep parsed lines; cancel old font jobs before scheduling replacements.
                     self.ui.lyrics.cached_shaped_lines = None;
-                    self.playback.lyrics_render_manager =
-                        crate::app::update::lyrics_render_manager::LyricsRenderManager::default();
+                    self.playback.lyrics_render_manager.invalidate_shaping();
                     let reshape_task = self.request_lyrics_shaping_for_current_viewport();
 
                     tracing::info!("Lyrics font family changed to {:?}", family);
@@ -378,12 +378,13 @@ impl App {
                 };
 
                 let lyrics_viewport_task = if *enabled {
+                    self.playback.lyrics_render_manager.invalidate_shaping();
                     if self.ui.lyrics.is_open {
                         self.ui.lyrics.animation.settle_at(1.0);
                     }
                     self.flush_pending_lyrics_viewport_after_animation()
                 } else {
-                    Task::none()
+                    self.request_lyrics_shaping_for_current_viewport()
                 };
 
                 Some(Task::batch([
@@ -430,11 +431,48 @@ impl App {
                     files,
                     bytes / (1024 * 1024)
                 );
-                // Recalculate cache stats after clearing
-                Some(Task::perform(async { Message::RefreshCacheStats }, |m| m))
+                // Disk cache removal invalidates every in-memory image handle and
+                // forces the discovery page to fetch its data and images again.
+                self.ui.image_state.cancel_pending_and_inflight();
+                self.ui.image_state.entries.clear();
+                self.ui.image_state.failures.clear();
+                self.ui.image_state.resolving_sources.clear();
+                self.ui.image_state.source_resolution_attempts.clear();
+                self.ui.image_state.artwork_epoch =
+                    self.ui.image_state.artwork_epoch.wrapping_add(1);
+                for (_, request) in self.ui.image_state.inflight.drain() {
+                    request.handle.abort();
+                }
+                self.ui.image_state.pending.clear();
+                self.ui.image_state.queued.clear();
+                self.ui.image_state.known_sources.clear();
+                self.ui.discover.data_loaded = false;
+                self.ui.discover.load_generation = self.ui.discover.load_generation.wrapping_add(1);
+                self.ui.discover.recommended_playlists.clear();
+                self.ui.discover.hot_playlists.clear();
+                self.ui.discover.official_playlists.clear();
+                self.ui.discover.daily_recommend_preview = None;
+                self.ui.discover.private_radar = None;
+                self.ui.discover.personal_fm_preview = None;
+                let mut tasks = vec![Task::perform(async { Message::RefreshCacheStats }, |m| m)];
+                if matches!(self.ui.current_route, Route::Discover(_)) {
+                    tasks.push(self.load_discover_data());
+                }
+                if let Some(db) = &self.core.db {
+                    tasks.push(Task::perform(
+                        crate::app::helpers::load_songs(db.clone()),
+                        Message::SongsLoaded,
+                    ));
+                    tasks.push(Task::perform(
+                        crate::app::helpers::load_playlists(db.clone()),
+                        Message::PlaylistsLoaded,
+                    ));
+                }
+                Some(Task::batch(tasks))
             }
-            Message::RefreshCacheStats => {
-                self.refresh_cache_stats();
+            Message::RefreshCacheStats => Some(self.refresh_cache_stats()),
+            Message::CacheStatsReady(stats) => {
+                self.ui.cache_stats = Some(stats.clone());
                 Some(Task::none())
             }
             Message::EnforceCacheLimit => {
@@ -455,9 +493,14 @@ impl App {
                 ))
             }
             Message::UpdateAudioOutputDevice(device) => {
-                self.core.settings.system.audio_output_device = device.clone();
-                self.switch_audio_output_device(device.clone());
-                Some(Task::perform(async { Message::SaveSettings }, |m| m))
+                if let Err(error) = self.switch_audio_output_device(device.clone()) {
+                    tracing::warn!(%error, "Failed to enqueue audio output recovery");
+                    let safe_summary = crate::error::AppError::from(error)
+                        .user_summary()
+                        .to_owned();
+                    return Some(Self::toast_error(safe_summary));
+                }
+                Some(Task::none())
             }
             Message::UpdateDiscordEnabled(enabled) => {
                 self.core.settings.system.discord_enabled = *enabled;
@@ -528,20 +571,15 @@ impl App {
                 if let Some(client) = &mut self.core.ncm_client {
                     if let Some(proxy_url) = self.core.settings.network.proxy_url() {
                         match client.set_proxy(proxy_url.clone()) {
-                            Ok(()) => tracing::info!("Proxy applied: {}", proxy_url),
-                            Err(e) => tracing::error!("Failed to apply proxy: {}", e),
+                            Ok(()) => tracing::info!("ncm_proxy_applied"),
+                            Err(error) => tracing::error!(
+                                error_code = %error.code().as_str(),
+                                "ncm_proxy_apply_failed"
+                            ),
                         }
                     } else {
-                        tracing::info!("Proxy disabled");
-                        // When proxy is disabled, recreate client without proxy
-                        // and sync quality setting
-                        let quality = self.core.settings.playback.music_quality.to_api_rate();
-                        if let Some(cookie) = crate::api::NcmClient::load_cookie_from_file() {
-                            *client = crate::api::NcmClient::from_cookie(cookie);
-                        } else {
-                            *client = crate::api::NcmClient::new();
-                        }
-                        client.set_quality(quality);
+                        tracing::info!("ncm_proxy_disabled");
+                        client.clear_proxy();
                     }
                 }
                 Some(Task::none())

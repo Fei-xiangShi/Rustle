@@ -2,7 +2,7 @@
 //! An invisible draggable area at the right edge of sidebar
 
 use iced::widget::{container, mouse_area};
-use iced::{Color, Element, Fill, Length};
+use iced::{Element, Fill, Length};
 
 use crate::app::Message;
 use crate::ui::responsive::{ChromeRole, ResponsiveContext};
@@ -22,7 +22,7 @@ pub fn view(context: ResponsiveContext, is_dragging: bool) -> Element<'static, M
             // Use sidebar background, with subtle highlight when dragging
             let bg = if is_dragging {
                 // Slightly lighter when dragging
-                Color::from_rgba(1.0, 1.0, 1.0, 0.05)
+                rustle_ui::theme::white(0.05)
             } else {
                 theme::sidebar_bg(t)
             };

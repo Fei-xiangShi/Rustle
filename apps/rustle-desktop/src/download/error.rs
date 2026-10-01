@@ -6,6 +6,8 @@ pub type DownloadResult<T> = Result<T, DownloadError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
+    #[error("audio metadata could not be embedded")]
+    Metadata(#[from] rustle_media::error::MediaError),
     #[error("download request failed")]
     Request(#[from] reqwest::Error),
     #[error("download returned HTTP status {0}")]
@@ -40,6 +42,7 @@ impl DownloadError {
 
     pub fn code(&self) -> ErrorCode {
         match self {
+            Self::Metadata(error) => error.code(),
             Self::Request(error) if error.is_timeout() => ErrorCode::NetworkTimeout,
             Self::Request(_) | Self::HttpStatus(_) => ErrorCode::NetworkRequestFailed,
             Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied => {

@@ -94,6 +94,9 @@ pub struct PlaylistViewPayload {
 pub enum Message {
     /// No-op message for event interception (modal backdrop clicks)
     Noop,
+    AudioIndexReady(Option<Arc<crate::utils::audio_index::AudioIndex>>),
+    AudioIndexRefresh,
+    AudioFilesChanged(Arc<[PathBuf]>),
 
     // ============ Navigation ============
     /// Navigation menu item selected
@@ -106,8 +109,6 @@ pub enum Message {
     LibrarySelect(LibraryItem),
     /// Search query changed
     SearchChanged(String),
-    /// Play hero banner playlist
-    PlayHero,
     /// Import local playlist
     ImportLocalPlaylist,
     /// Folder selected from dialog
@@ -174,6 +175,7 @@ pub enum Message {
     CacheCleared(usize, u64),
     /// Refresh cache statistics
     RefreshCacheStats,
+    CacheStatsReady(crate::cache::CacheStats),
     /// Enforce cache size limit
     EnforceCacheLimit,
     /// Update system settings
@@ -260,8 +262,8 @@ pub enum Message {
     ShowErrorToast(String),
     /// Hide toast notification
     HideToast,
-    /// Clear importing playlist from sidebar
-    ClearImportingPlaylist,
+    /// Local import playlist has been created and scanning can begin.
+    ImportPlaylistPrepared(Result<(std::path::PathBuf, i64), String>),
 
     // ============ Playlist page ============
     /// Navigate to playlist detail page
@@ -275,7 +277,7 @@ pub enum Message {
     /// Playlist view loaded from database
     PlaylistViewLoaded(PlaylistViewPayload),
     /// NCM playlist songs converted for display.
-    NcmPlaylistSongsReady(i64, Vec<crate::ui::pages::PlaylistSongView>),
+    NcmPlaylistSongsReady(u64, i64, Vec<crate::ui::pages::PlaylistSongView>),
     /// A batch of NCM playlist songs converted for display.
     /// The boolean marks the final batch so the page can become ready without
     /// waiting for the entire list to be converted in one UI update.
@@ -342,6 +344,8 @@ pub enum Message {
     CloseLyricsPage,
     /// Scroll lyrics manually (delta in pixels)
     LyricsScroll(f32),
+    /// Seek to a clicked lyric line's start time in milliseconds
+    LyricsSeek(u64),
     /// Real rendered lyrics viewport resized
     LyricsViewportResized(iced::Size),
     /// Window resized (for lyrics viewport calculation)
@@ -365,21 +369,13 @@ pub enum Message {
         i64,
         std::sync::Arc<Vec<crate::features::lyrics::engine::LyricLineData>>,
     ),
-    /// 异步预计算的 shaped lines (song_id, shaped_lines, pre_generated_sdf_bitmaps)
-    /// 文本布局的唯一数据源，在后台线程计算
-    /// 包含预生成的 SDF 位图，避免首次渲染时阻塞主线程
+    /// Prepared layout; SDF results are already published to the shared cache.
     LyricsShapedLinesReady(
         i64,
         u64,
         std::sync::Arc<Vec<crate::features::lyrics::engine::CachedShapedLine>>,
-        std::collections::HashMap<
-            cosmic_text::CacheKey,
-            crate::features::lyrics::engine::sdf_generator::SdfBitmap,
-        >,
-        f32,
-        f32,
-        Option<String>,
     ),
+    LyricsShapingFailed(i64, u64),
     /// Background colors extracted asynchronously (song_id, cover_path, primary, secondary, tertiary)
     LyricsBackgroundReady(i64, String, [f32; 4], [f32; 4], [f32; 4]),
     /// Album cover image loaded asynchronously for lyrics background (song_id, cover_path, image_data, width, height)
@@ -540,7 +536,9 @@ pub enum Message {
     /// Try to auto-login with saved cookies
     TryAutoLogin(u8),
     /// Auto login result
-    AutoLoginResult(Option<LoginInfo>, u8),
+    AutoLoginResult(Result<LoginInfo, AppError>, u8),
+    /// Anonymous session bootstrap completed; public discovery may continue.
+    AnonymousSessionReady(Result<(), AppError>),
     /// Request QR code for login
     RequestQrCode,
     /// QR code generated
@@ -553,6 +551,8 @@ pub enum Message {
     LoginSuccess(LoginInfo),
     /// Logout
     Logout,
+    /// Remote logout and local session sanitization completed.
+    LogoutCompleted(Result<(), AppError>),
     /// User info loaded
     UserInfoLoaded(UserInfo),
     /// Toggle login popup visibility
@@ -595,34 +595,38 @@ pub enum Message {
     /// from changing a page that has since been opened again.
     NcmPlaylistLoadFailed(u64, i64, AppError),
     /// Artist detail loaded
-    ArtistDetailLoaded(ArtistDetail),
+    ArtistDetailLoaded(u64, ArtistDetail),
     /// Album detail loaded
-    AlbumDetailLoaded(AlbumDetail),
+    AlbumDetailLoaded(u64, AlbumDetail),
     /// Artist albums loaded for artist page
     ArtistAlbumsLoaded(i64, Vec<AlbumSummary>),
     /// User page detail loaded
-    UserPageDetailLoaded(i64, UserDetail),
+    UserPageDetailLoaded(u64, i64, UserDetail),
     /// User playlists loaded for user page
     UserPagePlaylistsLoaded(i64, Vec<PlaylistSummary>),
     /// Artist detail loaded for a user page
-    UserArtistDetailLoaded(i64, ArtistDetail),
+    UserArtistDetailLoaded(u64, i64, ArtistDetail),
 
     // ============ Unified Image Pipeline ============
-    /// Image download completed and cached locally (generation, scope, kind, id, local_path)
+    /// Image download completed and cached locally.
     ImageDownloadReady(
         u64,
         crate::app::state::ImageRequestScope,
         crate::image::ImageKind,
         u64,
-        PathBuf,
+        crate::image::ImageVariant,
+        Arc<crate::app::state::ImageEntry>,
     ),
-    /// Image download failed and should be eligible for retry (generation, scope, kind, id)
+    /// Image download failed and should be eligible for retry.
     ImageDownloadFailed(
         u64,
         crate::app::state::ImageRequestScope,
         crate::image::ImageKind,
         u64,
+        crate::image::ImageVariant,
     ),
+    /// Remote artwork source recovered for the current persisted NCM song.
+    CurrentSongImageSourceResolved(i64, u64, Option<String>),
     /// Image references entering a virtual list's visible/overscan range.
     ImageViewportChanged(u64, Vec<(crate::image::ImageKind, u64, String)>),
 
@@ -711,6 +715,12 @@ pub enum Message {
     AddToNcmPlaylist(u64, u64),
     /// Result of adding song to NCM playlist
     NcmPlaylistAddResult(u64, u64, Result<(), AppError>),
+    /// Result of removing a song from an NCM playlist
+    NcmPlaylistRemoveResult(
+        u64,
+        u64,
+        Result<crate::api::PlaylistTrackMutation, AppError>,
+    ),
 
     // ============ Overlay System (Unified) ============
     /// Dismiss the topmost dismissible overlay
@@ -724,7 +734,7 @@ pub enum Message {
         Box<(
             crate::database::DbSong,
             crate::metadata::SongMetadata,
-            Option<PathBuf>,
+            Option<iced::widget::image::Handle>,
         )>,
     ),
     /// Song edit field changed
@@ -887,8 +897,18 @@ impl std::fmt::Debug for Message {
                 id,
                 generation
             ),
-            Self::ArtistDetailLoaded(d) => simple!("ArtistDetailLoaded", "id={}", d.id),
-            Self::AlbumDetailLoaded(d) => simple!("AlbumDetailLoaded", "id={}", d.id),
+            Self::ArtistDetailLoaded(generation, d) => simple!(
+                "ArtistDetailLoaded",
+                "id={}, generation={}",
+                d.id,
+                generation
+            ),
+            Self::AlbumDetailLoaded(generation, d) => simple!(
+                "AlbumDetailLoaded",
+                "id={}, generation={}",
+                d.id,
+                generation
+            ),
             Self::ArtistAlbumsLoaded(id, albums) => {
                 simple!(
                     "ArtistAlbumsLoaded",
@@ -897,12 +917,13 @@ impl std::fmt::Debug for Message {
                     albums.len()
                 )
             }
-            Self::UserPageDetailLoaded(id, d) => {
+            Self::UserPageDetailLoaded(generation, id, d) => {
                 simple!(
                     "UserPageDetailLoaded",
-                    "page_id={}, user_id={}",
+                    "page_id={}, user_id={}, generation={}",
                     id,
-                    d.user_id
+                    d.user_id,
+                    generation
                 )
             }
             Self::UserPagePlaylistsLoaded(id, playlists) => {
@@ -913,19 +934,26 @@ impl std::fmt::Debug for Message {
                     playlists.len()
                 )
             }
-            Self::UserArtistDetailLoaded(id, d) => {
+            Self::UserArtistDetailLoaded(generation, id, d) => {
                 simple!(
                     "UserArtistDetailLoaded",
-                    "page_id={}, artist_id={}",
+                    "page_id={}, artist_id={}, generation={}",
                     id,
-                    d.id
+                    d.id,
+                    generation
                 )
             }
             Self::PlaylistViewLoaded(payload) => {
                 simple!("PlaylistViewLoaded", "id={}", payload.view.id)
             }
-            Self::NcmPlaylistSongsReady(id, songs) => {
-                simple!("NcmPlaylistSongsReady", "id={}, {} songs", id, songs.len())
+            Self::NcmPlaylistSongsReady(generation, id, songs) => {
+                simple!(
+                    "NcmPlaylistSongsReady",
+                    "id={}, {} songs, generation={}",
+                    id,
+                    songs.len(),
+                    generation
+                )
             }
             Self::NcmPlaylistSongsChunk(generation, id, tracks, songs, last) => simple!(
                 "NcmPlaylistSongsChunk",
@@ -943,12 +971,15 @@ impl std::fmt::Debug for Message {
             }
             Self::LoginSuccess(_) => simple!("LoginSuccess"),
             Self::UserInfoLoaded(_) => simple!("UserInfoLoaded"),
-            Self::AutoLoginResult(r, retry) => simple!(
-                "AutoLoginResult",
-                "success={}, retry={}",
-                r.is_some(),
-                retry
-            ),
+            Self::AutoLoginResult(r, retry) => {
+                simple!("AutoLoginResult", "success={}, retry={}", r.is_ok(), retry)
+            }
+            Self::AnonymousSessionReady(result) => {
+                simple!("AnonymousSessionReady", "success={}", result.is_ok())
+            }
+            Self::LogoutCompleted(result) => {
+                simple!("LogoutCompleted", "success={}", result.is_ok())
+            }
             Self::PlayNcmSong(s) => simple!("PlayNcmSong", "id={}", s.id),
 
             // Navigation
@@ -957,7 +988,6 @@ impl std::fmt::Debug for Message {
             Self::NavigateForward => simple!("NavigateForward"),
             Self::LibrarySelect(item) => simple!("LibrarySelect", "{:?}", item),
             Self::SearchChanged(_) => simple!("SearchChanged"),
-            Self::PlayHero => simple!("PlayHero"),
             Self::ImportLocalPlaylist => simple!("ImportLocalPlaylist"),
             Self::FolderSelected(p) => simple!("FolderSelected", "{:?}", p.as_ref().map(|_| "...")),
 
@@ -999,7 +1029,11 @@ impl std::fmt::Debug for Message {
             Self::UpdateDownloadDir(d) => simple!("UpdateDownloadDir", "{:?}", d),
             Self::UpdateDownloadDirDialog => simple!("UpdateDownloadDirDialog"),
             Self::ClearCache => simple!("ClearCache"),
+            Self::AudioIndexReady(_) => simple!("AudioIndexReady"),
+            Self::AudioIndexRefresh => simple!("AudioIndexRefresh"),
+            Self::AudioFilesChanged(_) => simple!("AudioFilesChanged"),
             Self::CacheCleared(n, b) => simple!("CacheCleared", "{} files, {} bytes", n, b),
+            Self::CacheStatsReady(_) => simple!("CacheStatsReady"),
             Self::RefreshCacheStats => simple!("RefreshCacheStats"),
             Self::EnforceCacheLimit => simple!("EnforceCacheLimit"),
             Self::UpdateAudioOutputDevice(_) => simple!("UpdateAudioOutputDevice"),
@@ -1041,7 +1075,9 @@ impl std::fmt::Debug for Message {
             Self::ShowWarningToast(_) => simple!("ShowWarningToast"),
             Self::ShowErrorToast(_) => simple!("ShowErrorToast"),
             Self::HideToast => simple!("HideToast"),
-            Self::ClearImportingPlaylist => simple!("ClearImportingPlaylist"),
+            Self::ImportPlaylistPrepared(result) => {
+                simple!("ImportPlaylistPrepared", "success={}", result.is_ok())
+            }
 
             // Playlist page
             Self::OpenPlaylist(id) => simple!("OpenPlaylist", "{}", id),
@@ -1080,6 +1116,7 @@ impl std::fmt::Debug for Message {
             Self::ShowLyricsArtwork => simple!("ShowLyricsArtwork"),
             Self::CloseLyricsPage => simple!("CloseLyricsPage"),
             Self::LyricsScroll(d) => simple!("LyricsScroll", "{:.1}", d),
+            Self::LyricsSeek(time_ms) => simple!("LyricsSeek", "{} ms", time_ms),
             Self::LyricsViewportResized(size) => {
                 simple!("LyricsViewportResized", "{}x{}", size.width, size.height)
             }
@@ -1103,14 +1140,16 @@ impl std::fmt::Debug for Message {
             Self::LyricsEngineLinesReady(id, lines) => {
                 simple!("LyricsEngineLinesReady", "id={}, {} lines", id, lines.len())
             }
-            Self::LyricsShapedLinesReady(id, generation, lines, bitmaps, _, _, _) => simple!(
+            Self::LyricsShapedLinesReady(id, generation, lines) => simple!(
                 "LyricsShapedLinesReady",
-                "id={}, gen={}, {} lines, {} bitmaps",
+                "id={}, gen={}, {} lines",
                 id,
                 generation,
-                lines.len(),
-                bitmaps.len()
+                lines.len()
             ),
+            Self::LyricsShapingFailed(id, generation) => {
+                simple!("LyricsShapingFailed", "id={}, gen={}", id, generation)
+            }
             Self::LyricsBackgroundReady(id, _, _, _, _) => {
                 simple!("LyricsBackgroundReady", "id={}", id)
             }
@@ -1206,26 +1245,35 @@ impl std::fmt::Debug for Message {
             Self::OpenArtistByName(name) => simple!("OpenArtistByName", "{}", name),
 
             // Cloud Playlist
-            Self::ImageDownloadReady(generation, scope, kind, id, _path) => {
+            Self::ImageDownloadReady(generation, scope, kind, id, variant, _path) => {
                 simple!(
                     "ImageDownloadReady",
-                    "generation={}, {:?}, {:?}, {}",
+                    "generation={}, {:?}, {:?}, {}, {:?}",
                     generation,
                     scope,
                     kind,
-                    id
+                    id,
+                    variant
                 )
             }
-            Self::ImageDownloadFailed(generation, scope, kind, id) => {
+            Self::ImageDownloadFailed(generation, scope, kind, id, variant) => {
                 simple!(
                     "ImageDownloadFailed",
-                    "generation={}, {:?}, {:?}, {}",
+                    "generation={}, {:?}, {:?}, {}, {:?}",
                     generation,
                     scope,
                     kind,
-                    id
+                    id,
+                    variant
                 )
             }
+            Self::CurrentSongImageSourceResolved(song_id, ncm_id, url) => simple!(
+                "CurrentSongImageSourceResolved",
+                "song_id={}, ncm_id={}, found={}",
+                song_id,
+                ncm_id,
+                url.is_some()
+            ),
             Self::ImageViewportChanged(generation, images) => {
                 simple!(
                     "ImageViewportChanged",
@@ -1359,6 +1407,15 @@ impl std::fmt::Debug for Message {
             Self::NcmPlaylistAddResult(song_id, playlist_id, result) => {
                 simple!(
                     "NcmPlaylistAddResult",
+                    "song={}, playlist={}, ok={}",
+                    song_id,
+                    playlist_id,
+                    result.is_ok()
+                )
+            }
+            Self::NcmPlaylistRemoveResult(song_id, playlist_id, result) => {
+                simple!(
+                    "NcmPlaylistRemoveResult",
                     "song={}, playlist={}, ok={}",
                     song_id,
                     playlist_id,

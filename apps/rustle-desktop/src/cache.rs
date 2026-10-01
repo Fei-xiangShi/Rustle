@@ -1,9 +1,12 @@
 //! Root compatibility facade for storage-owned cache behavior and NCM snapshots.
 
+mod audio;
+pub use audio::{prepare_song_tags, tagged_audio_cache_store};
+
 pub use rustle_storage::cache::{
-    CacheStats, ClearResult, audio_cache_store, cache_publisher, calculate_cache_stats,
-    cleanup_temp_file, clear_all_cache, enforce_cache_limit, is_audio_cache_complete,
-    playlists_cache_dir, publish_or_reuse, publish_replace, remove_audio_cache, unique_temp_path,
+    CacheStats, ClearResult, cache_publisher, calculate_cache_stats, cleanup_temp_file,
+    clear_all_cache, enforce_cache_limit, is_audio_cache_complete, playlists_cache_dir,
+    publish_or_reuse, publish_replace, unique_temp_path,
 };
 
 /// Load a cached NCM playlist snapshot.

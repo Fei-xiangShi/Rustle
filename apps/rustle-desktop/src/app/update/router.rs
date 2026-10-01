@@ -33,6 +33,7 @@ impl App {
 
     fn clear_playlist_route_markers(&mut self) {
         self.ui.playlist_page.current = None;
+        self.ui.playlist_page.clear_online_tracks();
         self.ui.playlist_page.viewing_recently_played = false;
     }
 
@@ -98,6 +99,7 @@ impl App {
             Route::RecentlyPlayed => {
                 self.ui.search.keyword.clear();
                 self.ui.playlist_page.current = None;
+                self.ui.playlist_page.clear_online_tracks();
                 self.ui.playlist_page.viewing_recently_played = true;
                 self.ui.playlist_page.scroll_state.borrow_mut().jump_to(0.0);
             }
@@ -155,7 +157,7 @@ impl App {
                 iced::widget::scrollable::RelativeOffset { x: 0.0, y: 0.0 },
             ),
             Route::Settings(section) => {
-                self.refresh_cache_stats();
+                let stats_task = self.refresh_cache_stats();
                 let target_y = self.section_scroll_position(*section);
                 let scroll = iced::widget::operation::scroll_to(
                     iced::widget::Id::new("settings_scroll"),
@@ -165,9 +167,12 @@ impl App {
                     },
                 );
                 // Always re-measure on entry in case content changed (login state, etc.)
-                scroll
-                    .chain(self.settings_scroll_offset_task())
-                    .chain(Task::done(Message::MeasureSectionPositions))
+                Task::batch([
+                    stats_task,
+                    scroll
+                        .chain(self.settings_scroll_offset_task())
+                        .chain(Task::done(Message::MeasureSectionPositions)),
+                ])
             }
             Route::AudioEngine => iced::widget::operation::snap_to(
                 iced::widget::Id::new("audio_engine_scroll"),

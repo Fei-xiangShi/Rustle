@@ -84,11 +84,16 @@ impl App {
         }
 
         match event {
-            AudioEvent::Started { .. } | AudioEvent::Resumed { .. } => {
-                Some(Task::done(Message::DiscordUpdatePresence))
-            }
+            AudioEvent::Started { .. }
+            | AudioEvent::Resumed { .. }
+            | AudioEvent::OutputRecovered {
+                intent: crate::audio::OutputRecoveryIntent::Playing,
+                ..
+            } => Some(Task::done(Message::DiscordUpdatePresence)),
             AudioEvent::Paused { .. }
             | AudioEvent::Stopped { .. }
+            | AudioEvent::OutputRecoveryStarted { .. }
+            | AudioEvent::OutputRecoveryFailed { .. }
             | AudioEvent::Finished { .. } => Some(Task::done(Message::DiscordClearPresence)),
             AudioEvent::SeekComplete { .. } => Some(Task::done(Message::DiscordUpdatePresence)),
             _ => None,
@@ -131,9 +136,11 @@ impl App {
 
     fn loaded_ncm_cover_url(&self, ncm_id: u64) -> Option<String> {
         self.ui
-            .home
-            .current_ncm_playlist_songs
-            .iter()
+            .playlist_page
+            .current_online_tracks()
+            .into_iter()
+            .flatten()
+            .chain(self.ui.home.current_ncm_playlist_songs.iter())
             .chain(self.ui.search.tracks.iter())
             .find(|song| song.id == ncm_id && crate::image::is_remote_url(song.cover_url()))
             .map(|song| song.cover_url().to_string())

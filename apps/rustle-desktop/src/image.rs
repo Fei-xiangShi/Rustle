@@ -4,7 +4,43 @@
 //! pipeline defined here.  UI widgets (cover_image, avatar_image) and the
 //! update handler (app::update::images) both depend on this module.
 
+pub mod artwork;
+
 use std::path::PathBuf;
+
+/// Cache processing policy version. Bump this when derivative encoding or
+/// sizing semantics change so old files cannot masquerade as current output.
+pub const IMAGE_PROCESSING_VERSION: u8 = 2;
+
+/// Stable display roles for image derivatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ImageVariant {
+    /// Compact cards, rows, sidebars, dialogs, and player chrome.
+    #[default]
+    Thumbnail,
+    /// Collection and identity detail headers.
+    Detail,
+    /// Full-screen artwork.
+    Hero,
+}
+
+impl ImageVariant {
+    pub const fn edge(self) -> u16 {
+        match self {
+            Self::Thumbnail => 300,
+            Self::Detail => 600,
+            Self::Hero => 1024,
+        }
+    }
+
+    const fn cache_tag(self) -> &'static str {
+        match self {
+            Self::Thumbnail => "thumb",
+            Self::Detail => "detail",
+            Self::Hero => "hero",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Image category
@@ -67,6 +103,68 @@ impl ImageKind {
             Self::VipBadge => format!("vip_{}", id),
         }
     }
+
+    /// Requested CDN derivative for a display role. Membership badges keep
+    /// their original non-square composition.
+    pub const fn requested_resize(self, variant: ImageVariant) -> Option<(u16, u16)> {
+        if matches!(self, Self::VipBadge) {
+            None
+        } else {
+            let edge = variant.edge();
+            Some((edge, edge))
+        }
+    }
+
+    /// Whether a decoded derivative is large enough for the requested role.
+    /// Square artwork must meet the edge on both axes; video covers preserve
+    /// their source aspect ratio, so their long edge carries the role size.
+    #[cfg(test)]
+    pub const fn cached_dimensions_satisfy(
+        self,
+        variant: ImageVariant,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+
+        let edge = variant.edge() as u32;
+        match self {
+            Self::VipBadge => true,
+            Self::VideoCover => width >= edge || height >= edge,
+            _ => width >= edge && height >= edge,
+        }
+    }
+}
+
+/// Deterministic, non-reversible source identity used in cache filenames.
+/// FNV-1a is sufficient here because this is cache invalidation, not a
+/// security boundary.
+pub fn source_url_digest(url: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// File stem for a current remote derivative. Variant, source identity, and
+/// processing policy are all explicit so independent display roles coexist.
+pub fn remote_file_stem(
+    kind: ImageKind,
+    id: u64,
+    variant: ImageVariant,
+    source_url: &str,
+) -> String {
+    format!(
+        "{}__{}_v{}_{:016x}",
+        kind.file_stem(id),
+        variant.cache_tag(),
+        IMAGE_PROCESSING_VERSION,
+        source_url_digest(source_url)
+    )
 }
 
 /// Return the NCM resource ID carried by an application song identity.
@@ -120,9 +218,62 @@ pub fn vip_badge_key(user_id: u64, tier: crate::api::VipTier, icon_url: &str) ->
     hash
 }
 
+/// Resolve a current remote derivative for the exact role and source.
+///
+/// The requested edge is a CDN target, not a promise: user-uploaded artwork
+/// can have a smaller natural maximum (for example 320 px even when Detail
+/// requests 600 px). A role/source-specific file is therefore reusable when
+/// it fully decodes. Song artwork bypasses persistent image caches entirely;
+/// this resolver is for collection art and other remote identity images.
+pub fn resolve_remote_cached(
+    cache_dir: &std::path::Path,
+    kind: ImageKind,
+    id: u64,
+    variant: ImageVariant,
+    source_url: &str,
+) -> Option<PathBuf> {
+    let stem = remote_file_stem(kind, id, variant, source_url);
+    let path = crate::utils::find_cached_image(cache_dir, &stem)?;
+    if remote_variant_file_is_usable(&path) {
+        Some(path)
+    } else {
+        // An exact identity with corrupt bytes would otherwise short-circuit
+        // `download_img` forever. Only the invalid derivative is discarded;
+        // legacy ID-only fallbacks remain untouched.
+        crate::utils::remove_cached_image(cache_dir, &stem);
+        None
+    }
+}
+
+fn remote_variant_file_is_usable(path: &std::path::Path) -> bool {
+    ::image::open(path)
+        .ok()
+        .is_some_and(|image| image.width() > 0 && image.height() > 0)
+}
+
+/// True when a string points at a remote HTTP(S) image source.
+pub fn is_remote_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// True when a string field (`cover_path` / `cover_img_url`) holds a valid
+/// local path rather than an http(s) URL.
+pub fn is_valid_local_path(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if is_remote_url(s) {
+        return false;
+    }
+    std::path::Path::new(s).exists()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ImageKind, song_cover_key_for_source, vip_badge_key};
+    use super::{
+        IMAGE_PROCESSING_VERSION, ImageKind, ImageVariant, remote_file_stem,
+        remote_variant_file_is_usable, song_cover_key_for_source, source_url_digest, vip_badge_key,
+    };
     use crate::api::VipTier;
 
     #[test]
@@ -152,41 +303,87 @@ mod tests {
             vip_badge_key(42, VipTier::Svip, "https://vip/svip-b.png")
         );
     }
-}
 
-/// The result of a successful async download.
-#[derive(Debug, Clone)]
-pub struct ImageResult {
-    pub kind: ImageKind,
-    pub id: u64,
-    pub path: PathBuf,
-}
-
-// ---------------------------------------------------------------------------
-// Pure cache-resolver (no side effects)
-// ---------------------------------------------------------------------------
-
-/// Synchronous cache probe — returns `Some(path)` if a file for this
-/// `(kind, id)` already exists on disk, `None` otherwise.
-///
-/// Pure function: no queue push, no state mutation, no download trigger.
-pub fn resolve_cached(kind: ImageKind, id: u64) -> Option<PathBuf> {
-    crate::utils::find_cached_image(&kind.cache_dir(), &kind.file_stem(id))
-}
-
-/// True when a string points at a remote HTTP(S) image source.
-pub fn is_remote_url(s: &str) -> bool {
-    s.starts_with("http://") || s.starts_with("https://")
-}
-
-/// True when a string field (`cover_path` / `cover_img_url`) holds a valid
-/// local path rather than an http(s) URL.
-pub fn is_valid_local_path(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
+    #[test]
+    fn image_variants_have_role_appropriate_dimensions() {
+        assert_eq!(ImageVariant::Thumbnail.edge(), 300);
+        assert_eq!(ImageVariant::Detail.edge(), 600);
+        assert_eq!(ImageVariant::Hero.edge(), 1024);
+        assert_eq!(
+            ImageKind::SongCover.requested_resize(ImageVariant::Hero),
+            Some((1024, 1024))
+        );
+        assert_eq!(
+            ImageKind::VipBadge.requested_resize(ImageVariant::Thumbnail),
+            None
+        );
+        assert!(ImageKind::PlaylistCover.cached_dimensions_satisfy(ImageVariant::Detail, 600, 600));
+        assert!(!ImageKind::PlaylistCover.cached_dimensions_satisfy(
+            ImageVariant::Detail,
+            599,
+            600
+        ));
+        assert!(ImageKind::VideoCover.cached_dimensions_satisfy(ImageVariant::Thumbnail, 300, 169));
+        assert!(!ImageKind::VideoCover.cached_dimensions_satisfy(
+            ImageVariant::Thumbnail,
+            299,
+            168
+        ));
     }
-    if is_remote_url(s) {
-        return false;
+
+    #[test]
+    fn remote_cache_identity_includes_variant_source_and_processing_version() {
+        let thumbnail = remote_file_stem(
+            ImageKind::PlaylistCover,
+            42,
+            ImageVariant::Thumbnail,
+            "https://example.invalid/a.jpg",
+        );
+        let detail = remote_file_stem(
+            ImageKind::PlaylistCover,
+            42,
+            ImageVariant::Detail,
+            "https://example.invalid/a.jpg",
+        );
+        let changed_source = remote_file_stem(
+            ImageKind::PlaylistCover,
+            42,
+            ImageVariant::Thumbnail,
+            "https://example.invalid/b.jpg",
+        );
+
+        assert_ne!(thumbnail, detail);
+        assert_ne!(thumbnail, changed_source);
+        assert!(thumbnail.contains(&format!("_v{IMAGE_PROCESSING_VERSION}_")));
+        assert_eq!(
+            source_url_digest("https://example.invalid/a.jpg"),
+            source_url_digest("https://example.invalid/a.jpg")
+        );
     }
-    std::path::Path::new(s).exists()
+
+    #[test]
+    fn source_limited_exact_variant_is_best_available_but_corrupt_bytes_are_not() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustle-image-variant-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let best_available = root.join("detail.png");
+        let corrupt = root.join("corrupt.jpg");
+        ::image::DynamicImage::new_rgb8(320, 320)
+            .save_with_format(&best_available, ::image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&corrupt, b"<html>not an image</html>").unwrap();
+
+        assert!(!ImageKind::PlaylistCover.cached_dimensions_satisfy(
+            ImageVariant::Detail,
+            320,
+            320
+        ));
+        assert!(remote_variant_file_is_usable(&best_available));
+        assert!(!remote_variant_file_is_usable(&corrupt));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

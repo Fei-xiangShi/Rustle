@@ -9,12 +9,11 @@ use anyhow::{Context, Result};
 use iced::Task;
 
 use crate::app::helpers::{
-    create_playlist_from_import, load_playlist_view, load_playlists, load_songs,
-    load_watched_folders, sync_playlist_from_import,
+    load_playlist_view, load_playlists, load_songs, load_watched_folders, sync_playlist_from_import,
 };
 use crate::app::message::Message;
 use crate::app::state::App;
-use crate::database::{Database, NewSong, NewWatchedFolder};
+use crate::database::{Database, NewPlaylist, NewSong, NewWatchedFolder};
 use crate::features::import::{
     CoverCache, FolderWatcher, ScanConfig, ScanHandle, ScanProgress, ScanResult, ScanState,
     WatchEvent, is_audio_file, progress_channel, scan_and_import, scan_audio_file,
@@ -138,12 +137,31 @@ impl App {
 
             Message::StartScan(path) => Some(self.start_scan(path.clone())),
 
+            Message::ImportPlaylistPrepared(result) => match result {
+                Ok((path, playlist_id)) => {
+                    if let Some(playlist) = &mut self.ui.importing_playlist
+                        && !playlist.attach_prepared(*playlist_id)
+                    {
+                        return Some(self.discard_importing_playlist());
+                    }
+                    Some(self.begin_scan(path.clone(), *playlist_id))
+                }
+                Err(error) => {
+                    self.ui.importing_playlist = None;
+                    Some(Self::toast_error(format!("创建导入歌单失败：{}", error)))
+                }
+            },
+
             Message::CancelScan => {
+                if let Some(playlist) = &mut self.ui.importing_playlist
+                    && !playlist.completed
+                {
+                    // Creation is asynchronous too: retain cancellation until
+                    // its provisional database ID arrives for cleanup.
+                    playlist.begin_cancelling();
+                }
                 if let Some(handle) = &self.library.scan_handle {
                     handle.cancel();
-                    if let Some(playlist) = &mut self.ui.importing_playlist {
-                        playlist.begin_cancelling();
-                    }
                 }
                 Some(Task::none())
             }
@@ -156,12 +174,31 @@ impl App {
                 Ok(playlist_id) => {
                     if let Some(playlist) = &mut self.ui.importing_playlist {
                         playlist.playlist_id = Some(*playlist_id);
+                        playlist.finalized = true;
                     }
+
+                    let toast = self
+                        .ui
+                        .importing_playlist
+                        .as_ref()
+                        .map(|playlist| {
+                            let status = playlist
+                                .status_text
+                                .clone()
+                                .unwrap_or_else(|| "导入完成".to_string());
+                            if playlist.errors > 0 || playlist.skipped > 0 {
+                                Self::toast_warning(status)
+                            } else {
+                                Self::toast_success(status)
+                            }
+                        })
+                        .unwrap_or_else(Task::none);
 
                     if let Some(db) = &self.core.db {
                         let db_for_playlists = db.clone();
                         let db_for_watched = db.clone();
                         return Some(Task::batch([
+                            toast,
                             Task::perform(
                                 load_playlists(db_for_playlists),
                                 Message::PlaylistsLoaded,
@@ -174,7 +211,10 @@ impl App {
                     }
                     Some(Task::none())
                 }
-                Err(err) => Some(Self::toast_error(format!("创建本地媒体库失败：{}", err))),
+                Err(err) => Some(Task::batch([
+                    self.discard_importing_playlist(),
+                    Self::toast_error(format!("创建本地媒体库失败：{}", err)),
+                ])),
             },
 
             Message::WatchedFoldersLoaded(folders) => {
@@ -226,27 +266,75 @@ impl App {
                 Some(self.sync_folder_watcher())
             }
 
-            Message::ClearImportingPlaylist => {
-                self.ui.importing_playlist = None;
-                Some(Task::none())
-            }
-
             _ => None,
         }
     }
 
+    /// Remove the provisional playlist on cancellation, empty input or failure.
+    fn discard_importing_playlist(&mut self) -> Task<Message> {
+        let id = self
+            .ui
+            .importing_playlist
+            .take()
+            .and_then(|playlist| playlist.playlist_id);
+        if let (Some(db), Some(id)) = (&self.core.db, id) {
+            self.library.playlists.retain(|playlist| playlist.id != id);
+            let db = db.clone();
+            return Task::perform(
+                async move {
+                    if let Err(error) = db.delete_playlist(id).await {
+                        tracing::warn!(%error, id, "Failed to remove provisional import playlist");
+                    }
+                },
+                |_| Message::Noop,
+            );
+        }
+        Task::none()
+    }
+
     /// Start a folder scan for importing music
     fn start_scan(&mut self, path: PathBuf) -> Task<Message> {
-        if let (Some(db), Some(cache)) = (&self.core.db, &self.core.cover_cache) {
+        if self.ui.importing_playlist.is_some() {
+            return Self::toast_warning("请等待当前导入完成".to_string());
+        }
+        if self.core.cover_cache.is_none() {
+            return Self::toast_warning("媒体库正在初始化，请稍后再试".to_string());
+        }
+        if let Some(db) = &self.core.db {
             let root_path = path.canonicalize().unwrap_or(path);
             let folder_name = root_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("导入的歌单")
                 .to_string();
-            self.ui.importing_playlist =
-                Some(ImportingPlaylist::new(folder_name, root_path.clone()));
+            self.ui.importing_playlist = Some(ImportingPlaylist::new(
+                folder_name.clone(),
+                root_path.clone(),
+            ));
 
+            let db = db.clone();
+            let playlist_name = folder_name;
+            return Task::perform(
+                async move {
+                    db.create_playlist(NewPlaylist {
+                        name: playlist_name,
+                        description: None,
+                        cover_path: None,
+                        is_smart: false,
+                    })
+                    .await
+                    .map(|playlist_id| (root_path, playlist_id))
+                    .map_err(|error| error.to_string())
+                },
+                Message::ImportPlaylistPrepared,
+            );
+        }
+        Task::none()
+    }
+
+    fn begin_scan(&mut self, path: PathBuf, _playlist_id: i64) -> Task<Message> {
+        if let (Some(db), Some(cache)) = (&self.core.db, &self.core.cover_cache) {
+            let root_path = path.canonicalize().unwrap_or(path);
             let db = db.clone();
             let cache = cache.clone();
             let state = Arc::new(ScanState::new());
@@ -500,8 +588,7 @@ impl App {
                 file_name,
             } => {
                 if let Some(playlist) = &mut self.ui.importing_playlist {
-                    playlist.current = *current;
-                    playlist.total = *total;
+                    playlist.update_progress(*current, *total);
                     playlist.set_status(format!("正在处理 {}", file_name));
                 }
             }
@@ -544,10 +631,10 @@ impl App {
                 tracing::error!("Scan error: {}", err);
                 self.library.scan_state = None;
                 self.library.scan_handle = None;
-                if let Some(playlist) = &mut self.ui.importing_playlist {
-                    playlist.set_status("导入失败");
-                }
-                return Self::toast_error(format!("导入失败：{}", err));
+                return Task::batch([
+                    self.discard_importing_playlist(),
+                    Self::toast_error(format!("导入失败：{}", err)),
+                ]);
             }
             ScanProgress::Completed {
                 imported,
@@ -575,33 +662,20 @@ impl App {
 
                 let is_success = *imported > 0;
                 let total_processed = *imported + *skipped + *errors;
-                let (toast_task, clear_delay_secs) = if total_processed == 0 {
-                    self.ui.importing_playlist = None;
-                    (
-                        Self::toast_error("导入失败：未找到任何音频文件".to_string()),
-                        None,
-                    )
+                let toast_task = if total_processed == 0 {
+                    Self::toast_error("导入失败：未找到任何音频文件".to_string())
                 } else if *errors == 0 && *skipped == 0 {
-                    (
-                        Self::toast_success(format!("导入完成！成功导入 {} 首歌曲", imported)),
-                        Some(4),
-                    )
+                    Self::toast_success(format!("导入完成！成功导入 {} 首歌曲", imported))
                 } else if *errors == 0 {
-                    (
-                        Self::toast_warning(format!(
-                            "导入完成：{} 首成功，{} 个跳过",
-                            imported, skipped
-                        )),
-                        Some(6),
-                    )
+                    Self::toast_warning(format!(
+                        "导入完成：{} 首成功，{} 个跳过",
+                        imported, skipped
+                    ))
                 } else {
-                    (
-                        Self::toast_warning(format!(
-                            "导入完成：{} 首成功，{} 个跳过，{} 个错误",
-                            imported, skipped, errors
-                        )),
-                        Some(6),
-                    )
+                    Self::toast_warning(format!(
+                        "导入完成：{} 首成功，{} 个跳过，{} 个错误",
+                        imported, skipped, errors
+                    ))
                 };
 
                 if let Some(playlist) = &mut self.ui.importing_playlist
@@ -618,9 +692,9 @@ impl App {
                     let name = playlist.name.clone();
                     let cover_path = playlist.cover_path.clone();
                     let root_path = playlist.root_path.clone();
+                    let playlist_id = playlist.playlist_id;
 
-                    let mut tasks = vec![
-                        toast_task,
+                    let tasks = vec![
                         Task::perform(
                             async move {
                                 let create_result = async {
@@ -628,28 +702,16 @@ impl App {
                                         root_path.canonicalize().unwrap_or(root_path);
                                     let watched_path_str =
                                         watched_path.to_string_lossy().to_string();
-                                    let playlist_id = if let Some(existing) = db_for_library
-                                        .get_watched_folder_by_path(&watched_path_str)
-                                        .await?
-                                        .and_then(|folder| folder.playlist_id)
-                                    {
-                                        sync_playlist_from_import(
-                                            db_for_library.clone(),
-                                            existing,
-                                            name,
-                                            cover_path,
-                                            scanned_paths,
-                                        )
-                                        .await?
-                                    } else {
-                                        create_playlist_from_import(
-                                            db_for_library.clone(),
-                                            name,
-                                            cover_path,
-                                            scanned_paths,
-                                        )
-                                        .await?
-                                    };
+                                    let playlist_id = playlist_id
+                                        .ok_or_else(|| anyhow::anyhow!("导入歌单缺少 ID"))?;
+                                    sync_playlist_from_import(
+                                        db_for_library.clone(),
+                                        playlist_id,
+                                        name,
+                                        cover_path,
+                                        scanned_paths,
+                                    )
+                                    .await?;
                                     db_for_library
                                         .upsert_watched_folder(NewWatchedFolder {
                                             path: watched_path_str,
@@ -668,39 +730,19 @@ impl App {
                         Task::perform(load_songs(db_for_songs), Message::SongsLoaded),
                     ];
 
-                    if let Some(secs) = clear_delay_secs {
-                        tasks.push(Task::perform(
-                            async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                            },
-                            |_| Message::ClearImportingPlaylist,
-                        ));
-                    }
-
                     return Task::batch(tasks);
                 }
 
-                if let Some(secs) = clear_delay_secs {
-                    return Task::batch(vec![
-                        toast_task,
-                        Task::perform(
-                            async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                            },
-                            |_| Message::ClearImportingPlaylist,
-                        ),
-                    ]);
-                }
-
-                return toast_task;
+                return Task::batch([self.discard_importing_playlist(), toast_task]);
             }
             ScanProgress::Cancelled => {
                 tracing::info!("Scan cancelled");
                 self.library.scan_state = None;
                 self.library.scan_handle = None;
-                self.ui.importing_playlist = None;
-
-                return Self::toast_warning("导入已取消".to_string());
+                return Task::batch([
+                    self.discard_importing_playlist(),
+                    Self::toast_warning("导入已取消".to_string()),
+                ]);
             }
         }
 

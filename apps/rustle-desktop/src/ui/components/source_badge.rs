@@ -3,26 +3,20 @@
 //! Renders a small colored badge with icon and label before the artist name.
 
 use iced::widget::{container, row, svg, text};
-use iced::{Color, Element, Padding};
+use iced::{Element, Padding};
+use rustle_ui::theme::decoration::{self, Tone};
 
 use crate::app::Message;
 use crate::ui::responsive::{TextRole, UiTokens};
 use crate::utils::Source;
 
-/// Colors for source badges
-const EMERALD_400: Color = Color::from_rgb(52.0 / 255.0, 211.0 / 255.0, 153.0 / 255.0);
-const PURPLE_400: Color = Color::from_rgb(192.0 / 255.0, 132.0 / 255.0, 252.0 / 255.0);
-
 /// Build a source badge element (icon + label)
 pub fn source_badge(source: Source, tokens: UiTokens) -> Element<'static, Message> {
-    let (icon_data, label, color) = match source {
-        Source::Local => (crate::ui::icons::HARD_DRIVE, "本地", EMERALD_400),
-        Source::Online => (crate::ui::icons::CLOUD, "在线", PURPLE_400),
+    let (icon_data, label, tone) = match source {
+        Source::Local => (crate::ui::icons::HARD_DRIVE, "本地", Tone::Green),
+        Source::Cached => (crate::ui::icons::DOWNLOAD, "缓存", Tone::Blue),
+        Source::Online => (crate::ui::icons::CLOUD, "在线", Tone::Violet),
     };
-
-    let r = color.r;
-    let g = color.g;
-    let b = color.b;
 
     container(
         row![
@@ -30,9 +24,13 @@ pub fn source_badge(source: Source, tokens: UiTokens) -> Element<'static, Messag
                 .width(tokens.size(10.0))
                 .height(tokens.size(10.0))
                 .style(move |_theme, _status| svg::Style {
-                    color: Some(Color::from_rgb(r, g, b)),
+                    color: Some(decoration::ink(tone, _theme)),
                 }),
-            text(label).size(tokens.text(TextRole::Micro)).color(color),
+            text(label)
+                .size(tokens.text(TextRole::Micro))
+                .style(move |theme| text::Style {
+                    color: Some(decoration::ink(tone, theme))
+                }),
         ]
         .align_y(iced::Alignment::Center)
         .spacing(tokens.space(4.0)),
@@ -43,9 +41,11 @@ pub fn source_badge(source: Source, tokens: UiTokens) -> Element<'static, Messag
             .right(tokens.space(6.0)),
     )
     .style(move |_theme| container::Style {
-        background: Some(iced::Background::Color(Color::from_rgba(r, g, b, 0.2))),
+        background: Some(iced::Background::Color(
+            decoration::ink(tone, _theme).scale_alpha(0.2),
+        )),
         border: iced::Border {
-            color: Color::from_rgba(r, g, b, 0.2),
+            color: decoration::ink(tone, _theme).scale_alpha(0.2),
             width: tokens.size(1.0),
             radius: tokens.size(4.0).into(),
         },

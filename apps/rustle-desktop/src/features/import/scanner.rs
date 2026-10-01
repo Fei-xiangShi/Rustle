@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use futures_util::{StreamExt, stream};
 
 use super::cover::CoverCache;
 use super::progress::{ProgressSender, ScanProgress, ScanState, SkipReason};
@@ -16,6 +17,7 @@ pub use rustle_media::scan::{
 };
 
 struct PendingImport {
+    sequence: usize,
     path: PathBuf,
     file_name: String,
     title: String,
@@ -70,18 +72,23 @@ pub async fn scan_and_import(
             return Ok(());
         }
 
-        let batch = batch.to_vec();
-        let config = config.clone();
-        let cover_cache = Arc::clone(&cover_cache);
-        let results = tokio::task::spawn_blocking(move || {
-            rustle_media::scan::inspect_audio_files(&batch, &config, Some(&cover_cache))
-        })
-        .await?;
-
+        // Yield each inspection as it finishes instead of waiting for all 100
+        // files. Bound blocking workers while retaining batched database writes.
+        let mut results = stream::iter(batch.iter().cloned().enumerate())
+            .map(|(sequence, path)| {
+                let config = config.clone();
+                let cover_cache = Arc::clone(&cover_cache);
+                tokio::task::spawn_blocking(move || {
+                    let result = scan_audio_file(&path, &config, Some(&cover_cache));
+                    (sequence, path, result)
+                })
+            })
+            .buffer_unordered(8);
         let mut pending_imports = Vec::new();
         let mut pending_songs = Vec::new();
 
-        for (path, result) in results {
+        while let Some(result) = results.next().await {
+            let (sequence, path, result) = result?;
             if state.is_cancelled() {
                 let _ = progress_tx.send(ScanProgress::Cancelled);
                 return Ok(());
@@ -123,6 +130,7 @@ pub async fn scan_and_import(
                         normalization_gain: scan_result.normalization_gain,
                     });
                     pending_imports.push(PendingImport {
+                        sequence,
                         path,
                         file_name,
                         title: scan_result.metadata.title,
@@ -151,6 +159,8 @@ pub async fn scan_and_import(
             return Ok(());
         }
 
+        // Completion order must not change the final playlist's song order.
+        pending_imports.sort_by_key(|pending| pending.sequence);
         match db.upsert_local_songs(pending_songs).await {
             Ok(ids) if ids.len() == pending_imports.len() => {
                 for pending in pending_imports {

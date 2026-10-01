@@ -66,7 +66,7 @@ pub fn view(search_query: &str, locale: Locale, style: SearchBarStyle) -> Elemen
             border: iced::Border::default(),
             placeholder: theme::text_muted(theme),
             value: theme::text_primary(theme),
-            selection: theme::ACCENT_PINK,
+            selection: theme::accent(theme),
         });
 
     let content = row![

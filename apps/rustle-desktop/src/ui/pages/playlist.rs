@@ -261,53 +261,23 @@ fn detail_gradient_colors(
     snapshot: DetailGradientSnapshot,
     bottom: Color,
 ) -> DetailGradientColors {
-    match snapshot.kind {
-        DetailPageKind::Playlist | DetailPageKind::Album => {
-            let primary = snapshot.primary;
-            let top = Color::from_rgb(
-                (primary.r * 1.1 + 0.05).min(1.0),
-                (primary.g * 1.05 + 0.03).min(1.0),
-                (primary.b * 1.08 + 0.04).min(1.0),
-            );
-            let top = if theme::is_dark_theme(iced_theme) {
-                top
-            } else {
-                let average = (top.r + top.g + top.b) / 3.0;
-                let desaturation = 0.4;
-                let lighten = 0.3;
-                Color::from_rgb(
-                    ((top.r * (1.0 - desaturation) + average * desaturation) + lighten).min(1.0),
-                    ((top.g * (1.0 - desaturation) + average * desaturation) + lighten).min(1.0),
-                    ((top.b * (1.0 - desaturation) + average * desaturation) + lighten).min(1.0),
-                )
-            };
-
-            DetailGradientColors {
-                top,
-                middle: Color::from_rgb(
-                    top.r * 0.6 + bottom.r * 0.4,
-                    top.g * 0.55 + bottom.g * 0.4,
-                    top.b * 0.58 + bottom.b * 0.4,
-                ),
-                middle_stop: 0.55,
-            }
-        }
-        DetailPageKind::User | DetailPageKind::Artist => {
-            let primary = snapshot.primary;
-            DetailGradientColors {
-                top: Color::from_rgb(
-                    (primary.r * 1.08 + 0.04).min(1.0),
-                    (primary.g * 1.06 + 0.03).min(1.0),
-                    (primary.b * 1.08 + 0.04).min(1.0),
-                ),
-                middle: Color::from_rgb(
-                    primary.r * 0.58 + bottom.r * 0.42,
-                    primary.g * 0.58 + bottom.g * 0.42,
-                    primary.b * 0.58 + bottom.b * 0.42,
-                ),
-                middle_stop: 0.58,
-            }
-        }
+    let source = rustle_ui::color::Oklcha::from_color(snapshot.primary);
+    let dark = theme::is_dark_theme(iced_theme);
+    let top = source
+        .with_lightness(if dark {
+            0.36 + source.lightness() * 0.16
+        } else {
+            0.90
+        })
+        .with_chroma(source.chroma().min(if dark { 0.085 } else { 0.035 }))
+        .to_color();
+    DetailGradientColors {
+        top,
+        middle: theme::lerp_color(top, bottom, 0.55),
+        middle_stop: match snapshot.kind {
+            DetailPageKind::Playlist | DetailPageKind::Album => 0.55,
+            DetailPageKind::User | DetailPageKind::Artist => 0.58,
+        },
     }
 }
 
@@ -317,23 +287,18 @@ fn gradient_container_style(
 ) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(iced::Background::Gradient(iced::Gradient::Linear(
-            iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI))
-                .add_stop(0.0, colors.top)
-                .add_stop(colors.middle_stop, colors.middle)
-                .add_stop(1.0, bottom),
+            rustle_ui::color::gradient_three(
+                iced::Radians(std::f32::consts::PI),
+                [colors.top, colors.middle, bottom],
+                colors.middle_stop,
+            ),
         ))),
         ..Default::default()
     }
 }
 
 pub(crate) fn fade_gradient_color(target: Color, source: Color, progress: f32) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-    Color::from_rgba(
-        source.r + (target.r - source.r) * progress,
-        source.g + (target.g - source.g) * progress,
-        source.b + (target.b - source.b) * progress,
-        source.a + (target.a - source.a) * progress,
-    )
+    theme::lerp_color(source, target, progress)
 }
 
 #[cfg(test)]
@@ -357,7 +322,7 @@ mod gradient_tests {
         assert_color_close(fade_gradient_color(target, background, 1.0), target);
         assert_color_close(
             fade_gradient_color(target, background, 0.5),
-            Color::from_rgb(0.4, 0.4, 0.4),
+            Color::from_rgb(0.390_845_4, 0.395_980_92, 0.406_927_62),
         );
     }
 
@@ -714,20 +679,42 @@ fn playlist_page_cover_handle<'a>(
             .id
             .checked_neg()
             .and_then(|id| u64::try_from(id).ok())
-            .and_then(|id| image_state.get(crate::image::ImageKind::PlaylistCover, id)),
+            .and_then(|id| {
+                image_state.get_with_fallback(
+                    crate::image::ImageKind::PlaylistCover,
+                    id,
+                    crate::image::ImageVariant::Detail,
+                )
+            }),
         DetailPageKind::Album => playlist
             .id
             .checked_sub(i64::MIN / 4)
             .and_then(|id| u64::try_from(id).ok())
-            .and_then(|id| image_state.get(crate::image::ImageKind::AlbumCover, id)),
+            .and_then(|id| {
+                image_state.get_with_fallback(
+                    crate::image::ImageKind::AlbumCover,
+                    id,
+                    crate::image::ImageVariant::Detail,
+                )
+            }),
         DetailPageKind::Artist => playlist
             .id
             .checked_sub(i64::MIN)
             .and_then(|id| u64::try_from(id).ok())
-            .and_then(|id| image_state.get(crate::image::ImageKind::ArtistCover, id)),
-        DetailPageKind::User => playlist
-            .owner_artist_id
-            .and_then(|id| image_state.get(crate::image::ImageKind::ArtistCover, id)),
+            .and_then(|id| {
+                image_state.get_with_fallback(
+                    crate::image::ImageKind::ArtistCover,
+                    id,
+                    crate::image::ImageVariant::Detail,
+                )
+            }),
+        DetailPageKind::User => playlist.owner_artist_id.and_then(|id| {
+            image_state.get_with_fallback(
+                crate::image::ImageKind::ArtistCover,
+                id,
+                crate::image::ImageVariant::Detail,
+            )
+        }),
     }
 }
 
@@ -788,9 +775,9 @@ fn capsule_action_button(action: CapsuleAction) -> Element<'static, Message> {
         .height(icon_size)
         .style(move |theme, _status| svg::Style {
             color: Some(if emphasized {
-                theme::BLACK
+                theme::black(1.0)
             } else if selected {
-                theme::ACCENT_PINK
+                theme::accent(theme)
             } else {
                 theme::lerp_color(
                     theme::text_secondary(theme),
@@ -807,7 +794,7 @@ fn capsule_action_button(action: CapsuleAction) -> Element<'static, Message> {
         .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT))
         .style(move |theme| text::Style {
             color: Some(if emphasized {
-                theme::BLACK
+                theme::black(1.0)
             } else {
                 theme::lerp_color(
                     theme::text_secondary(theme),
@@ -868,11 +855,11 @@ fn capsule_action_button(action: CapsuleAction) -> Element<'static, Message> {
 
 fn emphasized_capsule_background(hover_progress: f32, pressed: bool) -> Color {
     if pressed {
-        Color::from_rgb(0.86, 0.86, 0.86)
+        theme::decoration::capsule(true)
     } else {
         theme::lerp_color(
             Color::WHITE,
-            Color::from_rgb(0.92, 0.92, 0.92),
+            theme::decoration::capsule(false),
             hover_progress,
         )
     }
@@ -913,13 +900,8 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
     let is_own_playlist = current_user_id == Some(playlist.creator_id);
     let is_subscribed = playlist.is_subscribed;
 
-    // Helper to get icon color based on animation (using gray levels instead of opacity)
-    let get_icon_color = |icon_id: IconId| -> Color {
-        let base = 0.5_f32; // Default dimmed (gray)
-        let bright = 1.0_f32; // Hover bright (white)
-        let value = icon_animations.interpolate_f32(&icon_id, base, bright);
-        Color::from_rgb(value, value, value)
-    };
+    let get_icon_progress =
+        |icon_id: IconId| -> f32 { icon_animations.interpolate_f32(&icon_id, 0.0, 1.0) };
 
     let action_height = tokens.target(TargetRole::Control);
     let play_btn = capsule_action_button(CapsuleAction {
@@ -940,14 +922,18 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
         // Artist page keeps only play and search controls.
     } else if is_local && playlist_id != -1 {
         // For local playlists (but not recently played), show edit button with animated color
-        let edit_color = get_icon_color(IconId::Edit);
+        let edit_color = get_icon_progress(IconId::Edit);
         let edit_btn = mouse_area(
             button(crate::ui::widgets::centered_button_content(
                 svg(svg::Handle::from_memory(icons::EDIT.as_bytes()))
                     .width(tokens.icon(IconRole::Medium))
                     .height(tokens.icon(IconRole::Medium))
                     .style(move |_theme, _status| svg::Style {
-                        color: Some(edit_color),
+                        color: Some(theme::lerp_color(
+                            theme::text_muted(_theme),
+                            theme::text_primary(_theme),
+                            edit_color,
+                        )),
                     }),
                 action_height,
             ))
@@ -963,14 +949,18 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
         action_items.push(edit_btn.into());
 
         // Delete button for local playlists
-        let delete_color = get_icon_color(IconId::Delete);
+        let delete_color = get_icon_progress(IconId::Delete);
         let delete_btn = mouse_area(
             button(crate::ui::widgets::centered_button_content(
                 svg(svg::Handle::from_memory(icons::TRASH.as_bytes()))
                     .width(tokens.icon(IconRole::Medium))
                     .height(tokens.icon(IconRole::Medium))
                     .style(move |_theme, _status| svg::Style {
-                        color: Some(delete_color),
+                        color: Some(theme::lerp_color(
+                            theme::text_muted(_theme),
+                            theme::text_primary(_theme),
+                            delete_color,
+                        )),
                     }),
                 action_height,
             ))
@@ -1031,7 +1021,7 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
 
     // Animated search component - expands from right to left
     let search_progress = search_animation.progress();
-    let search_color = get_icon_color(IconId::Search);
+    let search_color = get_icon_progress(IconId::Search);
     let search_target_size = action_height;
     let search_icon_size = tokens.icon(IconRole::Medium);
 
@@ -1052,7 +1042,11 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
                 .width(search_icon_size)
                 .height(search_icon_size)
                 .style(move |_theme, _status| svg::Style {
-                    color: Some(search_color),
+                    color: Some(theme::lerp_color(
+                        theme::text_muted(_theme),
+                        theme::text_primary(_theme),
+                        search_color,
+                    )),
                 }),
             search_target_size,
         ))
@@ -1078,9 +1072,9 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
                 .style(move |_theme, _status| text_input::Style {
                     background: iced::Background::Color(Color::TRANSPARENT),
                     border: iced::Border::default(),
-                    placeholder: Color::from_rgba(1.0, 1.0, 1.0, 0.5 * input_opacity),
-                    value: Color::from_rgba(1.0, 1.0, 1.0, input_opacity),
-                    selection: theme::ACCENT_PINK,
+                    placeholder: theme::text_muted(_theme).scale_alpha(input_opacity),
+                    value: theme::text_primary(_theme).scale_alpha(input_opacity),
+                    selection: theme::accent(_theme),
                 })
                 .into()
         } else {
@@ -1106,8 +1100,8 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
             )
             .center_y(search_target_size)
             .style(move |_theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(Color::from_rgba(
-                    1.0, 1.0, 1.0, bg_alpha,
+                background: Some(iced::Background::Color(theme::hover_bg_alpha(
+                    _theme, bg_alpha,
                 ))),
                 border: iced::Border {
                     radius: tokens.radius(RadiusRole::Pill).into(),
@@ -1128,7 +1122,11 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
                     .width(search_icon_size)
                     .height(search_icon_size)
                     .style(move |_theme, _status| svg::Style {
-                        color: Some(search_color),
+                        color: Some(theme::lerp_color(
+                            theme::text_muted(_theme),
+                            theme::text_primary(_theme),
+                            search_color,
+                        )),
                     }),
                 search_target_size,
             ))
@@ -1205,7 +1203,7 @@ mod control_bar_tests {
     }
 }
 
-/// Build owner avatar placeholder (first letter on pink background)
+/// Build owner avatar placeholder using the current accent.
 fn build_owner_avatar_placeholder(
     owner_name: &str,
     tokens: crate::ui::responsive::UiTokens,
@@ -1215,7 +1213,7 @@ fn build_owner_avatar_placeholder(
     container(
         text(first_char.to_string())
             .size(tokens.text(TextRole::Micro))
-            .color(theme::BLACK)
+            .color(theme::black(1.0))
             .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT)),
     )
     .width(size)
@@ -1223,7 +1221,7 @@ fn build_owner_avatar_placeholder(
     .center_x(size)
     .center_y(size)
     .style(move |_theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(theme::ACCENT_PINK_HOVER)),
+        background: Some(iced::Background::Color(theme::accent_hover(_theme))),
         border: iced::Border {
             radius: (size / 2.0).into(),
             ..Default::default()

@@ -94,7 +94,6 @@ impl App {
                         let db = Arc::clone(db);
                         let old_path = format!("ncm://{}", ncm_id);
                         let new_path = path_buf.to_string_lossy().to_string();
-                        let new_path_for_cover = path_buf.clone();
                         let title = track_title.clone();
                         let artist = self
                             .core
@@ -110,23 +109,9 @@ impl App {
                         let song_id_val = *song_id;
                         Task::perform(
                             async move {
-                                // Extract cover from downloaded file into cache
-                                let cover_path =
-                                    crate::features::import::extract_metadata(&new_path_for_cover)
-                                        .ok()
-                                        .and_then(|m| m.cover_data)
-                                        .map(|data| {
-                                            let dir = crate::utils::covers_cache_dir();
-                                            let _ = std::fs::create_dir_all(&dir);
-                                            let path =
-                                                dir.join(format!("song_{}.jpg", song_id_val));
-                                            let _ = std::fs::write(&path, &data);
-                                            path.to_string_lossy().to_string()
-                                        });
+                                // Artwork is embedded in the downloaded audio file by
+                                // download_song. Do not create a second sidecar cover file.
                                 let _ = db.update_song_path(&old_path, &new_path).await;
-                                if let Some(ref cp) = cover_path {
-                                    let _ = db.update_song_cover(song_id_val, cp).await;
-                                }
                                 let _ = db
                                     .insert_download(crate::database::NewDownload {
                                         song_id: song_id_val,
@@ -155,7 +140,7 @@ impl App {
                 if let Some(ref mut playlist) = self.ui.playlist_page.current {
                     for item in &mut playlist.songs {
                         item.source = crate::utils::compute_source(
-                            if item.id == *song_id { &new_path } else { "" },
+                            if item.id == -*song_id { &new_path } else { "" },
                             item.id,
                             Some(&item.artist),
                             Some(&item.title),
@@ -222,11 +207,17 @@ impl App {
         };
         let song_info = self
             .ui
-            .home
-            .current_ncm_playlist_songs
-            .iter()
-            .find(|s| s.id == ncm_id)
+            .playlist_page
+            .current_online_track(ncm_id)
             .cloned()
+            .or_else(|| {
+                self.ui
+                    .home
+                    .current_ncm_playlist_songs
+                    .iter()
+                    .find(|s| s.id == ncm_id)
+                    .cloned()
+            })
             .or_else(|| {
                 self.ui
                     .search
@@ -313,13 +304,16 @@ impl App {
         }
     }
 
-    fn download_playlist(&mut self, _playlist_id: i64) -> Option<Task<crate::app::Message>> {
-        let tracks: Vec<&crate::api::Track> = if !self.ui.home.current_ncm_playlist_songs.is_empty()
-        {
-            self.ui.home.current_ncm_playlist_songs.iter().collect()
-        } else {
+    fn download_playlist(&mut self, playlist_id: i64) -> Option<Task<crate::app::Message>> {
+        let tracks = self
+            .ui
+            .playlist_page
+            .online_tracks_for(playlist_id, self.ui.playlist_page.ncm_load_generation)
+            .filter(|tracks| !tracks.is_empty())
+            .unwrap_or(&self.ui.home.current_ncm_playlist_songs);
+        if tracks.is_empty() {
             return Some(Self::toast_error("无可下载的歌曲"));
-        };
+        }
 
         let client = self.core.ncm_client.clone()?;
         let quality = crate::api::NcmQualityLevel::from_api_rate(
@@ -329,7 +323,7 @@ impl App {
         let all_ids: Vec<u64> = tracks.iter().map(|s| s.id).collect();
         let song_data: Vec<(i64, u64, SongMetadata)> = tracks
             .iter()
-            .map(|s| (-(s.id as i64), s.id, SongMetadata::from(*s)))
+            .map(|s| (-(s.id as i64), s.id, SongMetadata::from(s)))
             .collect();
 
         Some(Task::perform(
@@ -381,15 +375,39 @@ impl App {
             let song_id = task.song_id;
             let song_url = task.song_url.clone();
             let meta = task.metadata.clone();
+            let lyrics_client = self.core.ncm_client.clone();
 
             let (tx, mut rx) = mpsc::unbounded_channel();
             let (download_task, handle) = Task::perform(
                 async move {
+                    let lyrics = if let Some(client) = lyrics_client {
+                        let lyric_meta = crate::features::lyrics::OnlineLyricsMetadata {
+                            title: meta.title.clone(),
+                            artist: meta.artist.clone(),
+                            album: meta.album.clone(),
+                            duration_ms: meta.duration.as_millis() as u64,
+                        };
+                        crate::features::lyrics::fetch_lyrics(&client, ncm_id, lyric_meta, None)
+                            .await
+                            .ok()
+                            .map(|lines| {
+                                lines
+                                    .into_iter()
+                                    .map(|line| {
+                                        line.words.into_iter().map(|w| w.word).collect::<String>()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                    } else {
+                        None
+                    };
                     task::download_song(
                         ncm_id,
                         &song_url,
                         &download_dir,
                         &meta,
+                        lyrics,
                         |downloaded, total| {
                             let _ = tx.send(crate::app::Message::DownloadProgress(
                                 song_id, downloaded, total,

@@ -224,7 +224,7 @@ fn build_queue_item(
             .width(tokens.icon(IconRole::Small))
             .height(tokens.icon(IconRole::Small))
             .style(|_theme, _status| svg::Style {
-                color: Some(theme::ACCENT_PINK),
+                color: Some(theme::accent(_theme)),
             })
             .into()
     } else {
@@ -245,7 +245,7 @@ fn build_queue_item(
         .size(tokens.text(TextRole::Label))
         .style(move |theme| text::Style {
             color: Some(if is_current {
-                theme::ACCENT_PINK
+                theme::accent(theme)
             } else {
                 theme::text_primary(theme)
             }),
@@ -260,12 +260,7 @@ fn build_queue_item(
         .size(tokens.text(TextRole::Caption))
         .style(move |theme| text::Style {
             color: Some(if is_current {
-                Color::from_rgba(
-                    theme::ACCENT_PINK.r,
-                    theme::ACCENT_PINK.g,
-                    theme::ACCENT_PINK.b,
-                    0.7,
-                )
+                theme::accent(theme)
             } else {
                 theme::text_muted(theme)
             }),

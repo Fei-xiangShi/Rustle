@@ -188,7 +188,7 @@ fn empty_placeholder(msg: String, context: ResponsiveContext) -> Element<'static
     .into()
 }
 
-// ── Tabs (matches settings ACCENT_PINK style) ────────────────────────────────
+// ── Tabs (matches settings brand accent style) ────────────────────────────────
 
 fn make_tab_button(
     label: String,
@@ -201,7 +201,7 @@ fn make_tab_button(
         container(Space::new().height(tokens.size(2.0)))
             .width(Length::Fill)
             .style(|_theme: &iced::Theme| container::Style {
-                background: Some(Background::Color(theme::ACCENT_PINK)),
+                background: Some(Background::Color(theme::accent(_theme))),
                 ..Default::default()
             })
             .into()
@@ -214,7 +214,7 @@ fn make_tab_button(
                 .size(tokens.text(TextRole::Body))
                 .style(move |theme| text::Style {
                     color: Some(if active {
-                        theme::ACCENT_PINK
+                        theme::accent(theme)
                     } else {
                         theme::text_muted(theme)
                     }),
@@ -224,7 +224,7 @@ fn make_tab_button(
         .padding([tokens.space(12.0), 0.0])
         .style(|_theme, status| {
             let bg = if status == button::Status::Hovered {
-                Background::Color(Color::from_rgba(1.0, 0.08, 0.55, 0.05))
+                Background::Color(theme::accent_subtle(_theme))
             } else {
                 Background::Color(Color::TRANSPARENT)
             };
@@ -294,7 +294,7 @@ fn build_active_card(
             container(Space::new().height(tokens.size(4.0)))
                 .width(Length::FillPortion(fill_portion))
                 .style(|_theme| container::Style {
-                    background: Some(Background::Color(theme::ACCENT_PINK)),
+                    background: Some(Background::Color(theme::accent(_theme))),
                     ..Default::default()
                 }),
             Space::new().width(Length::FillPortion(empty_portion)),
@@ -302,7 +302,7 @@ fn build_active_card(
         .width(Length::Fill),
     )
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.06))),
+        background: Some(Background::Color(rustle_ui::theme::white(0.06))),
         border: iced::Border {
             radius: tokens.radius(RadiusRole::Small).into(),
             ..Default::default()
@@ -428,7 +428,7 @@ fn build_pending_card(
                 }),
             quality_badge_el(
                 task.quality.display_name(),
-                quality_color(task.quality),
+                quality_tone(task.quality),
                 tokens
             ),
         ]
@@ -486,7 +486,7 @@ fn build_completed_card(
             .style(|theme| text::Style {
                 color: Some(theme::text_primary(theme))
             }),
-        quality_badge_el(quality.display_name(), quality_color(quality), tokens),
+        quality_badge_el(quality.display_name(), quality_tone(quality), tokens),
     ]
     .spacing(tokens.space(8.0))
     .align_y(Alignment::Center);
@@ -625,7 +625,7 @@ fn build_failed_card(
                 }),
             quality_badge_el(
                 task.quality.display_name(),
-                quality_color(task.quality),
+                quality_tone(task.quality),
                 tokens
             ),
         ]
@@ -648,7 +648,7 @@ fn build_failed_card(
             text(locale.get(Key::DownloadFailed))
                 .size(tokens.text(TextRole::Caption))
                 .style(|_theme| text::Style {
-                    color: Some(Color::from_rgb(0.94, 0.34, 0.34))
+                    color: Some(theme::danger(_theme))
                 }),
         ]
         .spacing(tokens.space(8.0))
@@ -685,19 +685,19 @@ fn build_failed_card(
     .into()
 }
 
-fn quality_color(quality: crate::features::settings::MusicQuality) -> Color {
+fn quality_tone(
+    quality: crate::features::settings::MusicQuality,
+) -> rustle_ui::theme::decoration::Tone {
+    use crate::features::settings::MusicQuality;
+    use rustle_ui::theme::decoration::Tone;
     match quality {
-        crate::features::settings::MusicQuality::Standard => Color::from_rgb(0.55, 0.61, 0.67),
-        crate::features::settings::MusicQuality::Higher => Color::from_rgb(0.23, 0.64, 0.78),
-        crate::features::settings::MusicQuality::High => Color::from_rgb(0.22, 0.74, 0.46),
-        crate::features::settings::MusicQuality::Lossless => {
-            Color::from_rgb(168.0 / 255.0, 85.0 / 255.0, 247.0 / 255.0)
-        }
-        crate::features::settings::MusicQuality::HiRes => Color::from_rgb(1.0, 0.76, 0.03),
-        crate::features::settings::MusicQuality::JvEffect => Color::from_rgb(0.70, 0.38, 0.96),
-        crate::features::settings::MusicQuality::Sky => Color::from_rgb(0.31, 0.57, 0.96),
-        crate::features::settings::MusicQuality::Dolby => Color::from_rgb(0.22, 0.76, 0.85),
-        crate::features::settings::MusicQuality::JyMaster => Color::from_rgb(0.95, 0.48, 0.22),
+        MusicQuality::Standard => Tone::Slate,
+        MusicQuality::Higher | MusicQuality::Dolby => Tone::Cyan,
+        MusicQuality::High => Tone::Green,
+        MusicQuality::Lossless | MusicQuality::JvEffect => Tone::Violet,
+        MusicQuality::HiRes => Tone::Gold,
+        MusicQuality::Sky => Tone::Blue,
+        MusicQuality::JyMaster => Tone::Orange,
     }
 }
 
@@ -717,26 +717,33 @@ fn download_cover(
 
 fn quality_badge_el(
     label: &'static str,
-    color: Color,
+    tone: rustle_ui::theme::decoration::Tone,
     tokens: crate::ui::responsive::UiTokens,
 ) -> Element<'static, Message> {
-    let (r, g, b) = (color.r, color.g, color.b);
-    container(text(label).size(tokens.text(TextRole::Micro)).color(color))
-        .padding(
-            Padding::new(tokens.space(1.0))
-                .left(tokens.space(6.0))
-                .right(tokens.space(6.0)),
-        )
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(r, g, b, 0.15))),
-            border: iced::Border {
-                radius: tokens.radius(RadiusRole::Small).into(),
-                width: tokens.size(1.0),
-                color: Color::from_rgba(r, g, b, 0.25),
-            },
-            ..Default::default()
-        })
-        .into()
+    container(
+        text(label)
+            .size(tokens.text(TextRole::Micro))
+            .style(move |theme| text::Style {
+                color: Some(rustle_ui::theme::decoration::ink(tone, theme)),
+            }),
+    )
+    .padding(
+        Padding::new(tokens.space(1.0))
+            .left(tokens.space(6.0))
+            .right(tokens.space(6.0)),
+    )
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(
+            rustle_ui::theme::decoration::ink(tone, _theme).scale_alpha(0.15),
+        )),
+        border: iced::Border {
+            radius: tokens.radius(RadiusRole::Small).into(),
+            width: tokens.size(1.0),
+            color: rustle_ui::theme::decoration::ink(tone, _theme).scale_alpha(0.25),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 fn format_size(bytes: u64) -> String {
@@ -796,7 +803,7 @@ fn icon_danger_btn(
             .height(tokens.icon(crate::ui::responsive::IconRole::Small))
             .style(|theme, status| svg::Style {
                 color: Some(if status == svg::Status::Hovered {
-                    Color::from_rgb(0.94, 0.34, 0.34)
+                    theme::danger(theme)
                 } else {
                     theme::text_muted(theme)
                 }),
@@ -808,7 +815,7 @@ fn icon_danger_btn(
     .padding(0)
     .style(move |_theme, status| {
         let bg = if status == button::Status::Hovered {
-            Background::Color(Color::from_rgba(0.94, 0.34, 0.34, 0.1))
+            Background::Color(theme::danger(_theme).scale_alpha(0.1))
         } else {
             Background::Color(Color::TRANSPARENT)
         };

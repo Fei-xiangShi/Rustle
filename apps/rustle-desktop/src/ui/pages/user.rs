@@ -70,7 +70,11 @@ fn build_header(
     let header_metrics = detail_header_metrics(context);
     let avatar_size = header_metrics.artwork_size;
     let avatar = circular_avatar(
-        image_state.get(ImageKind::UserAvatar, user.creator_id),
+        image_state.get_with_fallback(
+            ImageKind::UserAvatar,
+            user.creator_id,
+            crate::image::ImageVariant::Detail,
+        ),
         &user.name,
         avatar_size,
         tokens,

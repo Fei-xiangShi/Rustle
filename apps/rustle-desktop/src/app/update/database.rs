@@ -315,6 +315,12 @@ impl App {
                 tracing::info!("Loaded {} playlists from database", playlists.len());
                 self.store_local_playlist_cover_paths(playlists);
                 self.library.playlists = playlists.clone();
+                if let Some(importing) = &mut self.ui.importing_playlist
+                    && let Some(id) = importing.playlist_id
+                    && playlists.iter().any(|playlist| playlist.id == id)
+                {
+                    importing.ready();
+                }
                 Some(Task::none())
             }
 
@@ -448,7 +454,19 @@ impl App {
                                     song.id,
                                     &song.file_path,
                                 ),
-                                cover_url: None,
+                                // Recently played rows may be online NCM entries. Keep
+                                // the persisted remote cover URL on the virtual-list
+                                // item so its viewport loader can populate the cache.
+                                cover_url: song
+                                    .cover_path
+                                    .as_deref()
+                                    .filter(|path| crate::image::is_remote_url(path))
+                                    .map(str::to_owned)
+                                    .or_else(|| {
+                                        std::path::Path::new(&song.file_path)
+                                            .is_absolute()
+                                            .then(|| song.file_path.clone())
+                                    }),
                                 index: i + 1,
                                 title: meta.title.clone(),
                                 artist: meta.artist.clone(),
@@ -490,9 +508,7 @@ impl App {
                         .filter(|path| crate::image::is_valid_local_path(path))
                         .map(str::to_owned)
                 });
-                let palette = cover_path.as_deref().and_then(|path| {
-                    crate::utils::ColorPalette::from_image_path(std::path::Path::new(path))
-                });
+                let palette = None;
 
                 // Create playlist view with special ID for recently played
                 let playlist_view = pages::PlaylistView {

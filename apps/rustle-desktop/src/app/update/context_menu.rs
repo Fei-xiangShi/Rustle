@@ -1,7 +1,5 @@
 //! Context menu and song info/edit dialog handlers
 
-use std::path::Path;
-
 use iced::Task;
 
 use super::super::App;
@@ -67,7 +65,8 @@ impl App {
                     track_number: meta.track_number,
                     year: meta.year,
                     genre: meta.genre.clone().unwrap_or_default(),
-                    cover_path: cover.clone(),
+                    cover_path: None,
+                    cover_handle: cover.clone(),
                 };
                 self.ui.song_edit_dialog = Some(edit_state.clone());
                 use crate::ui::overlay::{ModalConfig, ModalKind, OverlayEntry, OverlayKind};
@@ -156,22 +155,26 @@ impl App {
                 Some(Task::none())
             }
             Message::SongEditsSaved(song_id) => {
-                // Refresh DB cache from the updated file
-                let task = if let Some(ref db) = self.core.db {
-                    if let Some(song) = self.find_song_anywhere(*song_id) {
-                        let meta = crate::metadata::SongMetadata::resolve(&song);
-                        let db = std::sync::Arc::clone(db);
-                        let mut updated = song.clone();
-                        meta.merge_into(&mut updated);
-                        Some(Task::perform(
-                            async move {
-                                let _ = db.refresh_song_metadata(&updated).await;
-                            },
-                            |_| Message::Noop,
-                        ))
-                    } else {
-                        None
-                    }
+                let task = if let (Some(db), Some(song)) =
+                    (self.core.db.clone(), self.find_song_anywhere(*song_id))
+                {
+                    Some(Task::perform(
+                        async move {
+                            let updated = tokio::task::spawn_blocking(move || {
+                                let mut updated = song;
+                                let meta = crate::metadata::SongMetadata::resolve(&updated);
+                                meta.merge_into(&mut updated);
+                                updated
+                            })
+                            .await;
+                            if let Ok(updated) = updated
+                                && let Err(error) = db.refresh_song_metadata(&updated).await
+                            {
+                                tracing::warn!(%error, "Cannot refresh edited song metadata");
+                            }
+                        },
+                        |_| Message::Noop,
+                    ))
                 } else {
                     None
                 };
@@ -185,6 +188,32 @@ impl App {
                 self.core.locale.get(Key::SongEditFailed),
                 error
             ))),
+            Message::NcmPlaylistRemoveResult(ncm_id, playlist_id, result) => match result {
+                Ok(mutation) => {
+                    if self.ui.current_route == crate::app::Route::NcmPlaylist(*playlist_id) {
+                        if let Ok(song_id) = i64::try_from(*ncm_id) {
+                            let song_id = -song_id;
+                            if let Some(playlist) = self.ui.playlist_page.current.as_mut() {
+                                playlist.songs.retain(|song| song.id != song_id);
+                            }
+                        }
+                        self.ui
+                            .home
+                            .current_ncm_playlist_songs
+                            .retain(|track| track.id != *ncm_id);
+                        self.ui.playlist_page.remove_current_online_track(*ncm_id);
+                    }
+                    tracing::debug!(
+                        ncm_song_id = ncm_id,
+                        ncm_playlist_id = playlist_id,
+                        changed_count = mutation.changed_count,
+                        retried_after_code_512 = mutation.retried_after_code_512,
+                        "ncm_playlist_track_removed"
+                    );
+                    Some(Self::toast_success("已从歌单中删除".to_string()))
+                }
+                Err(error) => Some(Self::toast_error(format!("删除失败: {error}"))),
+            },
             _ => None,
         }
     }
@@ -227,15 +256,22 @@ impl App {
 
     // ── Helpers ──────────────────────────────────────
 
+    pub(super) fn current_ncm_track(&self, ncm_id: u64) -> Option<&crate::api::Track> {
+        self.ui
+            .playlist_page
+            .current_online_track(ncm_id)
+            .or_else(|| {
+                self.ui
+                    .home
+                    .current_ncm_playlist_songs
+                    .iter()
+                    .find(|track| track.id == ncm_id)
+            })
+    }
+
     fn insert_next_in_queue(&mut self, song_id: i64) -> Task<Message> {
         if song_id < 0
-            && let Some(track) = self
-                .ui
-                .home
-                .current_ncm_playlist_songs
-                .iter()
-                .find(|track| track.id == (-song_id) as u64)
-                .cloned()
+            && let Some(track) = self.current_ncm_track((-song_id) as u64).cloned()
         {
             self.extend_queue_artist_metadata(std::slice::from_ref(&track));
         }
@@ -265,11 +301,7 @@ impl App {
         // Search NCM playlist songs for artist info
         if let Some(id) = ncm_id {
             let artist_id = self
-                .ui
-                .home
-                .current_ncm_playlist_songs
-                .iter()
-                .find(|s| s.id == id)
+                .current_ncm_track(id)
                 .and_then(|s| s.primary_artist().map(|artist| artist.id));
             if let Some(aid) = artist_id {
                 return Some(Task::done(Message::OpenArtist(aid)));
@@ -293,11 +325,7 @@ impl App {
         };
         if let Some(id) = ncm_id {
             let album_id = self
-                .ui
-                .home
-                .current_ncm_playlist_songs
-                .iter()
-                .find(|s| s.id == id)
+                .current_ncm_track(id)
                 .and_then(|s| (s.album.id != 0).then_some(s.album.id));
             if let Some(aid) = album_id {
                 return Some(Task::done(Message::OpenAlbum(aid)));
@@ -355,27 +383,21 @@ impl App {
                 removed = true;
             }
             crate::app::Route::NcmPlaylist(playlist_id) => {
-                // Remove from in-memory view
-                if let Some(p) = self.ui.playlist_page.current.as_mut() {
-                    p.songs.retain(|s| s.id != song_id);
-                }
-                self.ui
-                    .home
-                    .current_ncm_playlist_songs
-                    .retain(|s| s.id != (-song_id) as u64);
                 if let Some(ref client) = self.core.ncm_client {
                     let client = client.clone();
                     let ncm_id = (-song_id) as u64;
                     return Some(Task::perform(
                         async move {
                             client
-                                .playlist_add_tracks(playlist_id, &ncm_id.to_string(), "del")
+                                .mutate_playlist_tracks(
+                                    playlist_id,
+                                    &[ncm_id],
+                                    crate::api::PlaylistTrackOperation::Delete,
+                                )
                                 .await
+                                .map_err(crate::error::AppError::from)
                         },
-                        move |result| match result {
-                            Ok(()) => Message::ShowSuccessToast("已从歌单中删除".to_string()),
-                            Err(e) => Message::ShowErrorToast(format!("删除失败: {}", e)),
-                        },
+                        move |result| Message::NcmPlaylistRemoveResult(ncm_id, playlist_id, result),
                     ));
                 }
                 return Some(Self::toast_error("未登录网易云账号".to_string()));
@@ -409,7 +431,7 @@ impl App {
         }
     }
 
-    fn find_song_anywhere(&self, song_id: i64) -> Option<DbSong> {
+    pub(super) fn find_song_anywhere(&self, song_id: i64) -> Option<DbSong> {
         if let Some(s) = self.library.db_songs.iter().find(|s| s.id == song_id) {
             return Some(s.clone());
         }
@@ -421,29 +443,15 @@ impl App {
         }
         if song_id < 0 {
             let ncm_id = (-song_id) as u64;
-            if let Some(info) = self
-                .ui
-                .home
-                .current_ncm_playlist_songs
-                .iter()
-                .find(|s| s.id == ncm_id)
-            {
+            if let Some(info) = self.current_ncm_track(ncm_id) {
                 let mut song = Self::ncm_track_to_db_song(info);
-                // Only downloaded files are treated as local paths. The
-                // quality-scoped streaming cache is not a stable file source.
-                let dl =
-                    crate::features::settings::StorageSettings::default().effective_download_dir();
-                let stem = format!(
-                    "{} - {}",
-                    crate::utils::sanitize_filename(&song.artist),
-                    crate::utils::sanitize_filename(&song.title),
-                );
-                if let Some(p) = crate::utils::AUDIO_EXTENSIONS
-                    .iter()
-                    .map(|e| dl.join(format!("{}.{}", stem, e)))
-                    .find(|p| p.exists())
-                {
-                    song.file_path = p.to_string_lossy().to_string();
+                if let Some(file) = crate::utils::audio_index::snapshot().locate(
+                    &song.file_path,
+                    song.id,
+                    Some(&song.artist),
+                    Some(&song.title),
+                ) {
+                    song.file_path = file.path.to_string_lossy().into_owned();
                 }
                 return Some(song);
             }
@@ -455,18 +463,35 @@ impl App {
         let song = self.find_song_anywhere(song_id);
         Task::perform(
             async move {
-                let file_path = song
-                    .as_ref()
-                    .map(|s| s.file_path.clone())
-                    .unwrap_or_default();
-                if !file_path.is_empty() {
-                    crate::platform::open_in_file_manager(std::path::Path::new(&file_path));
-                    Message::Noop
-                } else {
-                    Message::ShowErrorToast("无法找到文件".to_string())
-                }
+                tokio::task::spawn_blocking(move || {
+                    let Some(song) = song else {
+                        return Message::ShowErrorToast("无法找到文件".into());
+                    };
+                    let index = crate::utils::audio_index::snapshot();
+                    let path = index
+                        .locate(
+                            &song.file_path,
+                            song.id,
+                            Some(&song.artist),
+                            Some(&song.title),
+                        )
+                        .map(|file| file.path.clone())
+                        .unwrap_or_else(|| song.file_path.into());
+                    if !path.is_absolute() || !path.is_file() {
+                        return Message::ShowErrorToast("无法找到文件，可能已被移动或清理".into());
+                    }
+                    match crate::platform::open_in_file_manager(&path) {
+                        Ok(()) => Message::Noop,
+                        Err(error) => {
+                            tracing::warn!(%error, "Cannot reveal audio file");
+                            Message::ShowErrorToast("无法在文件管理器中定位文件".into())
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| Message::ShowErrorToast("打开文件位置失败".into()))
             },
-            |msg| msg,
+            |message| message,
         )
     }
 
@@ -474,13 +499,24 @@ impl App {
         let song = self.find_song_anywhere(song_id);
         Task::perform(
             async move {
-                let s = match song {
-                    Some(s) => s,
-                    None => return Message::ShowErrorToast("歌曲未找到".to_string()),
-                };
-                let meta = crate::metadata::SongMetadata::resolve(&s);
-                let cover = meta.resolve_cover(Some(&s.file_path), s.id);
-                Message::OpenSongEditDialog(Box::new((s, meta, cover)))
+                tokio::task::spawn_blocking(move || {
+                    let Some(mut s) = song else {
+                        return Message::ShowErrorToast("歌曲未找到".into());
+                    };
+                    if let Some(file) = crate::utils::audio_index::snapshot().locate(
+                        &s.file_path,
+                        s.id,
+                        Some(&s.artist),
+                        Some(&s.title),
+                    ) {
+                        s.file_path = file.path.to_string_lossy().into_owned();
+                    }
+                    let meta = crate::metadata::SongMetadata::resolve(&s);
+                    let cover = meta.cover_handle(&s.file_path);
+                    Message::OpenSongEditDialog(Box::new((s, meta, cover)))
+                })
+                .await
+                .unwrap_or_else(|_| Message::ShowErrorToast("读取歌曲信息失败".into()))
             },
             |msg| msg,
         )
@@ -489,36 +525,65 @@ impl App {
     fn save_song_edits(&mut self, song_id: i64) -> Option<Task<Message>> {
         let edit = self.ui.song_edit_dialog.take()?;
         let song = self.find_song_anywhere(song_id);
-        let path = song.as_ref().and_then(|s| {
-            if s.file_path.is_empty() {
-                None
-            } else {
-                Some(Path::new(&s.file_path).to_path_buf())
-            }
-        })?;
+        let song = song?;
+        let path = crate::utils::audio_index::snapshot()
+            .locate(
+                &song.file_path,
+                song.id,
+                Some(&song.artist),
+                Some(&song.title),
+            )
+            .map(|file| file.path.clone())
+            .unwrap_or_else(|| song.file_path.into());
         Some(Task::perform(
             async move {
-                match crate::features::import::save_metadata(
-                    &path,
-                    &crate::features::import::MetadataEdits {
-                        title: Some(edit.title),
-                        artist: Some(edit.artist),
-                        album: Some(edit.album),
-                        track_number: edit.track_number,
-                        year: edit.year,
-                        genre: Some(edit.genre),
-                        cover_data: None,
-                        cover_mime: None,
-                    },
-                ) {
-                    Ok(()) => Message::SongEditsSaved(song_id),
-                    Err(error) => Message::SongEditsFailed {
+                let result = tokio::task::spawn_blocking(move || {
+                    let cover_data = edit
+                        .cover_path
+                        .as_ref()
+                        .map(std::fs::read)
+                        .transpose()
+                        .map_err(|error| {
+                            rustle_media::error::MediaError::io("read replacement cover", error)
+                        })?;
+                    let cover_mime = cover_data.as_ref().map(|data| {
+                        match crate::utils::detect_image_format(data) {
+                            "png" => "image/png",
+                            "webp" => "image/webp",
+                            "gif" => "image/gif",
+                            _ => "image/jpeg",
+                        }
+                        .to_owned()
+                    });
+                    crate::features::import::save_metadata(
+                        &path,
+                        &crate::features::import::MetadataEdits {
+                            title: Some(edit.title),
+                            artist: Some(edit.artist),
+                            album: Some(edit.album),
+                            track_number: edit.track_number,
+                            year: edit.year,
+                            genre: Some(edit.genre),
+                            cover_data,
+                            cover_mime,
+                            lyrics: None,
+                        },
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => Message::SongEditsSaved(song_id),
+                    Ok(Err(error)) => Message::SongEditsFailed {
                         song_id,
-                        error: crate::error::AppError::from(error),
+                        error: error.into(),
                     },
+                    Err(error) => {
+                        tracing::warn!(%error, "Song edit worker failed");
+                        Message::ShowErrorToast("保存歌曲信息失败".into())
+                    }
                 }
             },
-            |m| m,
+            |message| message,
         ))
     }
 }

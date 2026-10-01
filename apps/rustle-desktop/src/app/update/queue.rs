@@ -53,7 +53,12 @@ impl App {
 
                 // For NCM playlists (negative ID), use the cached NCM playlist songs
                 if id <= 0 {
-                    let ncm_songs = &self.ui.home.current_ncm_playlist_songs;
+                    let ncm_songs = self
+                        .ui
+                        .playlist_page
+                        .online_tracks_for(id, self.ui.playlist_page.ncm_load_generation)
+                        .filter(|tracks| !tracks.is_empty())
+                        .unwrap_or(&self.ui.home.current_ncm_playlist_songs);
                     if !ncm_songs.is_empty() {
                         let source_id = if self.is_fm_mode() {
                             None
@@ -61,12 +66,19 @@ impl App {
                             self.current_route_ncm_scrobble_source()
                         };
                         return Some(Task::done(Message::AddNcmPlaylistWithSource(
-                            ncm_songs.clone(),
+                            ncm_songs.to_vec(),
                             true,
                             source_id,
                         )));
                     }
-                    return Some(Task::none());
+                    tracing::warn!(
+                        page_id = id,
+                        generation = self.ui.playlist_page.ncm_load_generation,
+                        "playlist_queue_source_unavailable"
+                    );
+                    return Some(Self::toast_warning(
+                        "当前页面的歌曲数据尚未就绪，请稍后重试".to_string(),
+                    ));
                 }
 
                 // For local playlists, load from database

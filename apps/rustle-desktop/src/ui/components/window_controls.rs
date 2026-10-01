@@ -66,7 +66,7 @@ pub fn view<'a>(view: TopBarView<'a>) -> Element<'a, Message> {
                 color: Some(if can_go_back {
                     theme::text_secondary(theme)
                 } else {
-                    theme::opaque_color(theme::TEXT_DISABLED)
+                    theme::opaque_color(theme::disabled(theme))
                 }),
             })
             .opacity(back_icon_opacity),
@@ -96,7 +96,7 @@ pub fn view<'a>(view: TopBarView<'a>) -> Element<'a, Message> {
                 color: Some(if can_go_forward {
                     theme::text_secondary(theme)
                 } else {
-                    theme::opaque_color(theme::TEXT_DISABLED)
+                    theme::opaque_color(theme::disabled(theme))
                 }),
             })
             .opacity(forward_icon_opacity),
@@ -454,7 +454,7 @@ fn nav_button_style(
         text_color: if enabled {
             theme::text_secondary(theme)
         } else {
-            theme::TEXT_DISABLED
+            theme::disabled(theme)
         },
         border: iced::Border {
             radius: radius.into(),

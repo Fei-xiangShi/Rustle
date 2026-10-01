@@ -206,6 +206,8 @@ pub struct LyricsGpuPipeline {
 
     // State
     index_count: u32,
+    vertex_scratch: Vec<LyricGlyphVertex>,
+    index_scratch: Vec<u32>,
 
     // Cached uniforms for per-line offscreen rendering
     cached_global_uniform: RwLock<Option<GlobalUniform>>,
@@ -442,6 +444,8 @@ impl LyricsGpuPipeline {
             font_config,
             per_line_blur: RwLock::new(PerLineBlurRenderer::new(device, format)),
             index_count: 0,
+            vertex_scratch: Vec::new(),
+            index_scratch: Vec::new(),
             cached_global_uniform: RwLock::new(None),
             cached_line_uniforms: RwLock::new(Vec::new()),
             cached_line_render_info: RwLock::new(Vec::new()),
@@ -573,29 +577,32 @@ impl LyricsGpuPipeline {
         queue.write_buffer(&self.global_uniform_buffer, 0, bytemuck::bytes_of(&globals));
 
         // Update line uniforms
-        let line_uniforms: Vec<LineUniform> = line_styles
-            .iter()
-            .enumerate()
-            .take(MAX_LINES)
-            .map(|(idx, style)| {
-                let actual_height = line_heights
-                    .get(idx)
-                    .map(|height| height * scale)
-                    .unwrap_or(font_size * 1.4);
-                LineUniform {
-                    y_position: style.y_position,
-                    scale: style.scale,
-                    blur: style.blur,
-                    opacity: style.opacity,
-                    glow: style.glow,
-                    is_active: if style.is_active { 1 } else { 0 },
-                    line_height: actual_height,
-                    bright_mask_alpha: style.bright_mask_alpha,
-                    dark_mask_alpha: style.dark_mask_alpha,
-                    _padding: [0.0; 3],
-                }
-            })
-            .collect();
+        let mut line_uniforms = std::mem::take(self.cached_line_uniforms.get_mut());
+        line_uniforms.clear();
+        line_uniforms.extend(
+            line_styles
+                .iter()
+                .enumerate()
+                .take(MAX_LINES)
+                .map(|(idx, style)| {
+                    let actual_height = line_heights
+                        .get(idx)
+                        .map(|height| height * scale)
+                        .unwrap_or(font_size * 1.4);
+                    LineUniform {
+                        y_position: style.y_position,
+                        scale: style.scale,
+                        blur: style.blur,
+                        opacity: style.opacity,
+                        glow: style.glow,
+                        is_active: if style.is_active { 1 } else { 0 },
+                        line_height: actual_height,
+                        bright_mask_alpha: style.bright_mask_alpha,
+                        dark_mask_alpha: style.dark_mask_alpha,
+                        _padding: [0.0; 3],
+                    }
+                }),
+        );
 
         if !line_uniforms.is_empty() {
             queue.write_buffer(
@@ -604,7 +611,7 @@ impl LyricsGpuPipeline {
                 bytemuck::cast_slice(&line_uniforms),
             );
         }
-        *self.cached_line_uniforms.write() = line_uniforms.clone();
+        *self.cached_line_uniforms.get_mut() = line_uniforms;
 
         // Build geometry from pre-shaped lines (Single Source of Truth)
         // No more duplicate shape_line calls!
@@ -632,6 +639,9 @@ impl LyricsGpuPipeline {
         if !indices.is_empty() {
             queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         }
+
+        self.vertex_scratch = vertices;
+        self.index_scratch = indices;
 
         // Update bind group
         self.update_bind_group(device);
@@ -671,9 +681,12 @@ impl LyricsGpuPipeline {
         _trans_ratio: f32,
         _roman_ratio: f32,
     ) -> (Vec<LyricGlyphVertex>, Vec<u32>) {
-        let mut all_vertices = Vec::with_capacity(MAX_GLYPHS * 4);
-        let mut all_indices = Vec::with_capacity(MAX_GLYPHS * 6);
-        let mut line_render_info = Vec::with_capacity(lines.len());
+        let mut all_vertices = std::mem::take(&mut self.vertex_scratch);
+        let mut all_indices = std::mem::take(&mut self.index_scratch);
+        let mut line_render_info = std::mem::take(self.cached_line_render_info.get_mut());
+        all_vertices.clear();
+        all_indices.clear();
+        line_render_info.clear();
 
         let has_duet_line = line_traits.has_duet_line;
         let is_non_dynamic = line_traits.is_non_dynamic;
@@ -681,7 +694,7 @@ impl LyricsGpuPipeline {
         // SDF base size for scaling
         let sdf_base_size = 64.0_f32;
 
-        for (line_idx, line) in lines.iter().enumerate() {
+        for (line_idx, line) in lines.iter().enumerate().take(MAX_LINES) {
             let style = line_styles.get(line_idx).cloned().unwrap_or_default();
             let mut glow_bounds = None;
 
@@ -748,6 +761,9 @@ impl LyricsGpuPipeline {
 
                 // Add glyphs for main text using pre-shaped data
                 for glyph in &cached.main.glyphs {
+                    if all_vertices.len() / 4 >= MAX_GLYPHS {
+                        break;
+                    }
                     let glyph_info = match self.sdf_cache.get_glyph(queue, glyph.cache_key) {
                         Some(info) => info,
                         None => continue,
@@ -1019,6 +1035,9 @@ impl LyricsGpuPipeline {
         scale: f32,     // Logical to physical scale factor
     ) {
         for glyph in &shaped.glyphs {
+            if vertices.len() / 4 >= MAX_GLYPHS {
+                break;
+            }
             let glyph_info = match self.sdf_cache.get_glyph(queue, glyph.cache_key) {
                 Some(info) => info,
                 None => continue,
@@ -1090,6 +1109,10 @@ impl LyricsGpuPipeline {
 
     /// Update bind group with current atlas
     fn update_bind_group(&mut self, device: &Device) {
+        // Atlas contents change in-place; the texture and bound buffers do not.
+        if self.bind_group.is_some() {
+            return;
+        }
         let atlas_view = self.sdf_cache.atlas_view();
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1218,13 +1241,13 @@ impl LyricsGpuPipeline {
     }
 
     /// Prepare blur rendering resources
-    pub fn prepare_blur(&mut self, device: &Device, _viewport_width: u32, _viewport_height: u32) {
-        let line_render_info = self.cached_line_render_info.read().clone();
+    pub fn prepare_blur(&mut self, device: &Device, queue: &Queue) {
+        let line_render_info = self.cached_line_render_info.read();
         let Some(globals) = *self.cached_global_uniform.read() else {
             self.per_line_blur.write().clear_prepared();
             return;
         };
-        let line_uniforms = self.cached_line_uniforms.read().clone();
+        let line_uniforms = self.cached_line_uniforms.read();
 
         if line_render_info.is_empty() || line_uniforms.is_empty() {
             self.per_line_blur.write().clear_prepared();
@@ -1232,14 +1255,17 @@ impl LyricsGpuPipeline {
         }
 
         let atlas_view = self.sdf_cache.atlas_view();
-        self.per_line_blur.write().prepare_lines(
-            device,
-            &self.bind_group_layout,
-            &atlas_view,
-            &line_render_info,
-            &globals,
-            &line_uniforms,
-        );
+        self.per_line_blur
+            .write()
+            .prepare_lines(super::per_line_blur::LinePreparationInput {
+                device,
+                queue,
+                lyrics_bind_group_layout: &self.bind_group_layout,
+                atlas_view: &atlas_view,
+                lines: &line_render_info,
+                globals: &globals,
+                line_uniforms: &line_uniforms,
+            });
     }
 
     /// Render with per-line blur effect

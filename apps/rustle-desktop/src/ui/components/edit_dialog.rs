@@ -50,8 +50,8 @@ pub fn view_body<'a>(props: PlaylistEditorView<'a>) -> Element<'a, Message> {
             svg(svg::Handle::from_memory(icons::MUSIC.as_bytes()))
                 .width(tokens.size(40.0))
                 .height(tokens.size(40.0))
-                .style(|_theme, _status| svg::Style {
-                    color: Some(theme::opaque_color(theme::icon_muted(&iced::Theme::Dark))),
+                .style(|theme, _status| svg::Style {
+                    color: Some(theme::opaque_color(theme::icon_muted(theme))),
                 })
                 .opacity(0.4_f32),
         )
@@ -106,7 +106,7 @@ pub fn view_body<'a>(props: PlaylistEditorView<'a>) -> Element<'a, Message> {
                 border: iced::Border {
                     radius: cover_radius.into(),
                     width: tokens.size(1.0),
-                    color: Color::from_rgba(1.0, 1.0, 1.0, 0.06)
+                    color: rustle_ui::theme::white(0.06)
                 },
                 ..Default::default()
             }),
@@ -138,7 +138,7 @@ pub fn view_body<'a>(props: PlaylistEditorView<'a>) -> Element<'a, Message> {
         },
         placeholder: theme::text_muted(theme),
         value: theme::text_primary(theme),
-        selection: theme::ACCENT_PINK,
+        selection: theme::accent(theme),
     });
     let desc_label = text(locale.get(Key::EditPlaylistDesc).to_string())
         .size(tokens.text(TextRole::Body))
@@ -162,7 +162,7 @@ pub fn view_body<'a>(props: PlaylistEditorView<'a>) -> Element<'a, Message> {
         },
         placeholder: theme::text_muted(theme),
         value: theme::text_primary(theme),
-        selection: theme::ACCENT_PINK,
+        selection: theme::accent(theme),
     });
 
     let watch_section: Element<'a, Message> = if watch_available {

@@ -45,6 +45,16 @@ pub(super) struct PreparedRenderInput<'a> {
     pub index_buffer: &'a wgpu::Buffer,
 }
 
+pub(super) struct LinePreparationInput<'a> {
+    pub device: &'a Device,
+    pub queue: &'a wgpu::Queue,
+    pub lyrics_bind_group_layout: &'a wgpu::BindGroupLayout,
+    pub atlas_view: &'a wgpu::TextureView,
+    pub lines: &'a [LineRenderInfo],
+    pub globals: &'a GlobalUniform,
+    pub line_uniforms: &'a [LineUniform],
+}
+
 fn lyrics_plus_lighter_blend() -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -154,6 +164,21 @@ struct PreparedLine {
     _composite_uniform: wgpu::Buffer,
     composite_bind_group: wgpu::BindGroup,
     glow: Option<PreparedGlow>,
+}
+
+fn can_reuse_plain_line(
+    prepared: &PreparedLine,
+    line: &LineRenderInfo,
+    texture_size: (u32, u32),
+    uniform_bytes: u64,
+) -> bool {
+    line.visible
+        && line.index_range.1 > 0
+        && prepared.glow.is_none()
+        && !(line.glow_blur_level >= 0.5 && line.glow_bounds.is_some())
+        && prepared.texture_size == texture_size
+        && prepared._text_line_buffer.size() == uniform_bytes
+        && prepared._blur_horizontal_uniform.is_some() == (line.blur_level >= 0.5)
 }
 
 struct PreparedGlow {
@@ -568,18 +593,36 @@ impl PerLineBlurRenderer {
         )
     }
 
-    pub fn prepare_lines(
-        &mut self,
-        device: &Device,
-        lyrics_bind_group_layout: &wgpu::BindGroupLayout,
-        atlas_view: &wgpu::TextureView,
-        lines: &[LineRenderInfo],
-        globals: &GlobalUniform,
-        line_uniforms: &[LineUniform],
-    ) {
-        self.clear_prepared();
-
+    pub(super) fn prepare_lines(&mut self, input: LinePreparationInput<'_>) {
+        let LinePreparationInput {
+            device,
+            queue,
+            lyrics_bind_group_layout,
+            atlas_view,
+            lines,
+            globals,
+            line_uniforms,
+        } = input;
+        let mut reusable = std::mem::take(&mut self.prepared_lines);
+        self.release_all_textures();
         let line_texture_width = globals.bounds_size[0].max(1.0).ceil() as u32;
+        let uniform_bytes = std::mem::size_of_val(line_uniforms) as u64;
+        // Reserve all reusable textures before any acquisition can replace a
+        // pool slot. Each retained binding must still point at its owned view.
+        reusable.retain(|prepared| {
+            let Some(line) = lines.get(prepared.info.line_index) else {
+                return false;
+            };
+            let margin = ((line.blur_level.max(0.0) * 3.0) + 6.0).ceil();
+            let height = (line.height + margin * 2.0).max(1.0).ceil() as u32;
+            let compatible =
+                can_reuse_plain_line(prepared, line, (line_texture_width, height), uniform_bytes);
+            if compatible {
+                self.texture_pool[prepared.source_texture].in_use = true;
+                self.texture_pool[prepared.scratch_texture].in_use = true;
+            }
+            compatible
+        });
         for line in lines {
             if !line.visible || line.index_range.1 == 0 || line.line_index >= line_uniforms.len() {
                 continue;
@@ -587,6 +630,70 @@ impl PerLineBlurRenderer {
 
             let text_blur_margin = ((line.blur_level.max(0.0) * 3.0) + 6.0).ceil();
             let line_texture_height = (line.height + text_blur_margin * 2.0).max(1.0).ceil() as u32;
+            if let Some(index) = reusable
+                .iter()
+                .position(|prepared| prepared.info.line_index == line.line_index)
+            {
+                let mut prepared = reusable.swap_remove(index);
+                let mut local_globals = *globals;
+                local_globals.viewport_size = [globals.bounds_size[0], line_texture_height as f32];
+                local_globals.bounds_offset = [0.0, 0.0];
+                local_globals.bounds_size = local_globals.viewport_size;
+                queue.write_buffer(
+                    &prepared._text_global_buffer,
+                    0,
+                    bytemuck::bytes_of(&local_globals),
+                );
+                queue.write_buffer(
+                    &prepared._text_line_buffer,
+                    0,
+                    bytemuck::cast_slice(line_uniforms),
+                );
+                let mut uniform = line_uniforms[line.line_index];
+                uniform.y_position = text_blur_margin;
+                uniform.blur = 0.0;
+                queue.write_buffer(
+                    &prepared._text_line_buffer,
+                    (line.line_index * std::mem::size_of::<LineUniform>()) as u64,
+                    bytemuck::bytes_of(&uniform),
+                );
+                for (buffer, direction) in [
+                    (&prepared._blur_horizontal_uniform, [1.0, 0.0]),
+                    (&prepared._blur_vertical_uniform, [0.0, 1.0]),
+                ] {
+                    if let Some(buffer) = buffer {
+                        let uniform = BlurPassUniform {
+                            texture_size_and_direction: [
+                                line_texture_width as f32,
+                                line_texture_height as f32,
+                                direction[0],
+                                direction[1],
+                            ],
+                            radius_and_padding: [line.blur_level, 0.0, 0.0, 0.0],
+                        };
+                        queue.write_buffer(buffer, 0, bytemuck::bytes_of(&uniform));
+                    }
+                }
+                let composite = LineCompositeUniform {
+                    target_size: globals.viewport_size,
+                    dest_origin: [
+                        globals.bounds_offset[0],
+                        globals.bounds_offset[1] + line.y_position - text_blur_margin,
+                    ],
+                    dest_size: [globals.bounds_size[0], line_texture_height as f32],
+                    src_uv_min: [0.0, 0.0],
+                    src_uv_max: [1.0, 1.0],
+                    _padding: [0.0, 0.0],
+                };
+                queue.write_buffer(
+                    &prepared._composite_uniform,
+                    0,
+                    bytemuck::bytes_of(&composite),
+                );
+                prepared.info = line.clone();
+                self.prepared_lines.push(prepared);
+                continue;
+            }
             let source_texture = Self::acquire_texture(
                 &mut self.texture_pool,
                 device,
@@ -1163,5 +1270,145 @@ impl PerLineBlurRenderer {
             composite_pass.draw(0..6, 0..1);
             drop(composite_pass);
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    /// Run explicitly on a machine with a graphics adapter. Exercises real wgpu
+    /// resources, shader validation, pool ownership and size invalidation.
+    #[tokio::test]
+    #[ignore = "requires a local graphics adapter"]
+    async fn stable_frames_reuse_resources_and_resize_rebuilds() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .unwrap();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _pipeline = super::super::gpu_pipeline::LyricsGpuPipeline::new(
+            &device,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lyrics resource regression"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let atlas = LineTexture::new(
+            &device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8Unorm,
+            "test atlas",
+        );
+        let mut renderer = PerLineBlurRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut lines: Vec<_> = (0..8)
+            .map(|line_index| LineRenderInfo {
+                line_index,
+                blur_level: 2.0,
+                glow_blur_level: 0.0,
+                glow_bounds: None,
+                y_position: line_index as f32 * 70.0,
+                height: 60.0,
+                visible: true,
+                index_range: (0, 6),
+            })
+            .collect();
+        let mut globals = GlobalUniform {
+            viewport_size: [800.0, 800.0],
+            bounds_size: [600.0, 800.0],
+            ..Default::default()
+        };
+        let uniforms = vec![LineUniform::default(); lines.len()];
+        let prepare = |renderer: &mut PerLineBlurRenderer,
+                       lines: &[LineRenderInfo],
+                       globals: &GlobalUniform| {
+            renderer.prepare_lines(LinePreparationInput {
+                device: &device,
+                queue: &queue,
+                lyrics_bind_group_layout: &layout,
+                atlas_view: &atlas.view,
+                lines,
+                globals,
+                line_uniforms: &uniforms,
+            });
+        };
+        prepare(&mut renderer, &lines, &globals);
+        let first_buffer = renderer.prepared_lines[0]._text_global_buffer.clone();
+        let first_bind = renderer.prepared_lines[0].text_bind_group.clone();
+        let started = std::time::Instant::now();
+        for frame in 0..120 {
+            globals.current_time_ms = frame as f32 * 16.0;
+            lines[0].y_position = frame as f32;
+            prepare(&mut renderer, &lines, &globals);
+            assert_eq!(renderer.prepared_lines[0]._text_global_buffer, first_buffer);
+            assert_eq!(renderer.prepared_lines[0].text_bind_group, first_bind);
+            queue.submit([]);
+        }
+        let reused_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // An earlier changed row must not steal a later row's retained texture.
+        let later_buffer = renderer.prepared_lines[1]._text_global_buffer.clone();
+        let later_source = renderer.prepared_lines[1].source_texture;
+        let later_texture = renderer.texture_pool[later_source]._texture.clone();
+        lines[0].height += 50.0;
+        prepare(&mut renderer, &lines, &globals);
+        assert_ne!(renderer.prepared_lines[0]._text_global_buffer, first_buffer);
+        assert_eq!(renderer.prepared_lines[1]._text_global_buffer, later_buffer);
+        assert_eq!(renderer.texture_pool[later_source]._texture, later_texture);
+        let started = std::time::Instant::now();
+        for _ in 0..120 {
+            renderer.clear_prepared();
+            prepare(&mut renderer, &lines, &globals);
+            queue.submit([]);
+        }
+        let rebuilt_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "adapter={} frames=120 lines=8 reuse_ms={reused_ms:.2} recreate_ms={rebuilt_ms:.2}",
+            adapter.get_info().name
+        );
+        assert!(errors.pop().await.is_none());
     }
 }

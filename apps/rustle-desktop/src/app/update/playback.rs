@@ -9,6 +9,35 @@ use crate::app::message::Message;
 use crate::app::state::App;
 use crate::audio::AudioEvent;
 
+fn resolve_online_track<'a>(
+    current_page_tracks: Option<&'a [crate::api::Track]>,
+    legacy_tracks: &'a [crate::api::Track],
+    ncm_id: u64,
+) -> Option<&'a crate::api::Track> {
+    current_page_tracks
+        .into_iter()
+        .flatten()
+        .chain(legacy_tracks)
+        .find(|track| track.id == ncm_id)
+}
+
+fn initial_output_needs_migration(
+    configured: &Option<String>,
+    requested: &Option<String>,
+    resolved: &Option<String>,
+) -> bool {
+    requested.is_some() && resolved.is_some() && configured == requested && requested != resolved
+}
+
+fn manual_output_request_matches(
+    pending: &Option<Option<String>>,
+    reason: crate::audio::OutputRecoveryReason,
+    requested: &Option<String>,
+) -> bool {
+    reason == crate::audio::OutputRecoveryReason::ManualSelection
+        && pending.as_ref() == Some(requested)
+}
+
 impl App {
     /// Handle playback-related messages
     pub fn handle_playback(&mut self, message: &Message) -> Option<Task<Message>> {
@@ -31,14 +60,19 @@ impl App {
 
                 // Try NCM playlist songs
                 if *id < 0 {
-                    let ncm_id = (-*id) as u64;
-                    if let Some(song_info) = self
-                        .ui
-                        .home
-                        .current_ncm_playlist_songs
-                        .iter()
-                        .find(|s| s.id == ncm_id)
-                        .cloned()
+                    let Some(ncm_id) = id.checked_neg().and_then(|value| u64::try_from(value).ok())
+                    else {
+                        tracing::warn!(song_id = *id, "playlist_song_id_invalid");
+                        return Some(Self::toast_warning(
+                            "无法识别这首歌曲，请刷新页面后重试".to_string(),
+                        ));
+                    };
+                    if let Some(song_info) = resolve_online_track(
+                        self.ui.playlist_page.current_online_tracks(),
+                        &self.ui.home.current_ncm_playlist_songs,
+                        ncm_id,
+                    )
+                    .cloned()
                     {
                         self.set_ncm_scrobble_source(self.current_route_ncm_scrobble_source());
                         self.extend_queue_artist_metadata(std::slice::from_ref(&song_info));
@@ -49,6 +83,24 @@ impl App {
                         let idx = self.playback.queue.len() - 1;
                         return Some(self.play_song_at_index(idx));
                     }
+
+                    let page_id = self.ui.playlist_page.current.as_ref().map(|page| page.id);
+                    let owned_track_count = self
+                        .ui
+                        .playlist_page
+                        .current_online_tracks()
+                        .map_or(0, <[crate::api::Track]>::len);
+                    tracing::warn!(
+                        song_id = *id,
+                        ncm_id,
+                        page_id = ?page_id,
+                        generation = self.ui.playlist_page.ncm_load_generation,
+                        owned_track_count,
+                        "playlist_song_resolution_failed"
+                    );
+                    return Some(Self::toast_warning(
+                        "当前页面的歌曲数据尚未就绪，请稍后重试".to_string(),
+                    ));
                 }
 
                 Some(Task::none())
@@ -270,6 +322,37 @@ impl App {
         );
 
         match event {
+            AudioEvent::OutputReady {
+                requested_selection,
+                resolved_selection,
+                active_device,
+                output_generation,
+            } => {
+                tracing::info!(
+                    output_generation = output_generation.0,
+                    device_id = %active_device.id,
+                    "Initial audio output is ready"
+                );
+                if initial_output_needs_migration(
+                    &self.core.settings.system.audio_output_device,
+                    &requested_selection,
+                    &resolved_selection,
+                ) {
+                    self.core.settings.system.audio_output_device = resolved_selection;
+                    return Task::done(Message::SaveSettings);
+                }
+            }
+            AudioEvent::DevicesChanged {
+                devices,
+                default_device_id,
+            } => {
+                tracing::debug!(
+                    device_count = devices.len(),
+                    default_device_id = default_device_id.as_deref().unwrap_or("-"),
+                    "Audio output device projection refreshed"
+                );
+                self.core.audio_output_devices = devices;
+            }
             AudioEvent::Started {
                 request_id, path, ..
             } => {
@@ -363,12 +446,95 @@ impl App {
             AudioEvent::PreloadFailed { .. } => {
                 unreachable!("preload failures are handled before current-event filtering")
             }
-            AudioEvent::DeviceSwitched { restore_state } => {
-                tracing::info!("Audio device switched: {:?}", restore_state);
+            AudioEvent::OutputRecoveryStarted {
+                recovery_id,
+                reason,
+                position,
+                ..
+            } => {
+                tracing::info!(
+                    recovery_id = recovery_id.0,
+                    ?reason,
+                    position_ms = position.as_millis(),
+                    "Audio output recovery started"
+                );
+                self.clear_scheduled_transition_state();
+                let released = self.playback.audio_preload_manager.reset();
+                self.release_preload_requests(released);
             }
-            AudioEvent::DeviceSwitchFailed { error } => {
-                tracing::error!("Device switch failed: {}", error);
-                return Self::toast_error(format!("切换音频设备失败: {}", error));
+            AudioEvent::OutputRecoveryRetryScheduled {
+                recovery_id,
+                reason,
+                error,
+                ..
+            } => {
+                tracing::warn!(
+                    recovery_id = recovery_id.0,
+                    ?reason,
+                    %error,
+                    "Audio output recovery will retry once"
+                );
+            }
+            AudioEvent::OutputRecovered {
+                recovery_id,
+                output_generation,
+                reason,
+                requested_selection,
+                resolved_selection,
+                position,
+                intent,
+                ..
+            } => {
+                tracing::info!(
+                    recovery_id = recovery_id.0,
+                    output_generation = output_generation.0,
+                    ?reason,
+                    position_ms = position.as_millis(),
+                    ?intent,
+                    "Audio output recovery committed"
+                );
+                let mut tasks = Vec::new();
+                if manual_output_request_matches(
+                    &self.core.pending_audio_output_device,
+                    reason,
+                    &requested_selection,
+                ) {
+                    self.core.settings.system.audio_output_device = resolved_selection;
+                    self.core.pending_audio_output_device = None;
+                    tasks.push(Task::done(Message::SaveSettings));
+                }
+                self.refresh_playback_runtime();
+                self.update_tray_and_mpris_current(
+                    intent == crate::audio::OutputRecoveryIntent::Playing,
+                );
+                self.refresh_preload_window();
+                tasks.push(self.preload_adjacent_tracks_with_ncm());
+                return Task::batch(tasks);
+            }
+            AudioEvent::OutputRecoveryFailed {
+                recovery_id,
+                reason,
+                requested_selection,
+                error,
+                ..
+            } => {
+                tracing::error!(
+                    recovery_id = recovery_id.0,
+                    ?reason,
+                    %error,
+                    "Audio output recovery failed"
+                );
+                let safe_summary = crate::error::AppError::from(error)
+                    .user_summary()
+                    .to_owned();
+                if manual_output_request_matches(
+                    &self.core.pending_audio_output_device,
+                    reason,
+                    &requested_selection,
+                ) {
+                    self.core.pending_audio_output_device = None;
+                }
+                return Self::toast_error(safe_summary);
             }
             AudioEvent::Finished { .. } => {
                 tracing::info!("Song finished (AudioEvent::Finished)");
@@ -396,7 +562,14 @@ impl App {
     }
     pub(super) fn audio_event_is_current(&self, event: &AudioEvent) -> bool {
         match event {
-            AudioEvent::DeviceSwitched { .. } | AudioEvent::DeviceSwitchFailed { .. } => true,
+            AudioEvent::OutputReady { .. }
+            | AudioEvent::DevicesChanged { .. }
+            | AudioEvent::OutputRecoveryRetryScheduled { .. } => true,
+            AudioEvent::OutputRecoveryStarted { context, .. }
+            | AudioEvent::OutputRecovered { context, .. }
+            | AudioEvent::OutputRecoveryFailed { context, .. } => context
+                .as_ref()
+                .is_none_or(|context| self.accepts_audio_context(context)),
             AudioEvent::PreloadReady { identity, .. }
             | AudioEvent::PreloadFailed { identity, .. } => self.accepts_preload_identity(identity),
             AudioEvent::SeekComplete { context, nonce, .. }
@@ -442,11 +615,11 @@ impl App {
                 tracing::info!("Streaming download and cache publication complete")
             }
             StreamingEventKind::CacheFinalized(path) => {
-                tracing::info!("Streaming cache finalized at {:?}", path)
+                tracing::info!("Streaming cache finalized at {:?}", path);
             }
             StreamingEventKind::CacheFinalizationFailed(err) => {
                 tracing::warn!(
-                    "Streaming cache finalization failed; continuing with ring: {}",
+                    "Streaming cache finalization failed; continuing with retained audio: {}",
                     err
                 )
             }
@@ -459,5 +632,82 @@ impl App {
             }
         }
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod playlist_track_resolution_tests {
+    use super::resolve_online_track;
+    use crate::api::Track;
+
+    fn track(id: u64, title: &str) -> Track {
+        Track {
+            id,
+            title: title.to_string(),
+            ..Track::default()
+        }
+    }
+
+    #[test]
+    fn current_page_tracks_win_over_unrelated_or_stale_global_cache() {
+        let page = [track(42, "page")];
+        let legacy = [track(7, "other"), track(42, "stale")];
+
+        let resolved = resolve_online_track(Some(&page), &legacy, 42).expect("page track");
+        assert_eq!(resolved.title, "page");
+        assert_eq!(
+            resolve_online_track(Some(&page), &[], 42)
+                .expect("page track without global cache")
+                .title,
+            "page"
+        );
+        assert!(resolve_online_track(Some(&page), &legacy, 99).is_none());
+    }
+}
+
+#[cfg(test)]
+mod output_device_tests {
+    use super::*;
+
+    #[test]
+    fn settings_commit_only_for_matching_manual_recovery() {
+        let pending = Some(Some("device-b".to_string()));
+        assert!(manual_output_request_matches(
+            &pending,
+            crate::audio::OutputRecoveryReason::ManualSelection,
+            &Some("device-b".to_string()),
+        ));
+        assert!(!manual_output_request_matches(
+            &pending,
+            crate::audio::OutputRecoveryReason::ManualSelection,
+            &Some("device-a".to_string()),
+        ));
+        assert!(!manual_output_request_matches(
+            &pending,
+            crate::audio::OutputRecoveryReason::StreamFailed,
+            &Some("device-b".to_string()),
+        ));
+    }
+
+    #[test]
+    fn legacy_name_migrates_only_when_it_is_the_configured_request() {
+        let configured = Some("Speakers".to_string());
+        let resolved = Some("wasapi:stable-id".to_string());
+        assert!(initial_output_needs_migration(
+            &configured,
+            &configured,
+            &resolved,
+        ));
+        assert!(!initial_output_needs_migration(
+            &resolved,
+            &configured,
+            &resolved,
+        ));
+        assert!(!initial_output_needs_migration(&None, &None, &None));
+        assert!(!initial_output_needs_migration(
+            &configured,
+            &configured,
+            &None,
+        ));
     }
 }

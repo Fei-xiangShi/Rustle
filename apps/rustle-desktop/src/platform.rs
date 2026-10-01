@@ -30,12 +30,9 @@ pub fn init() {
     rustle_platform::init();
 }
 
-/// Open a path in the system file manager while keeping legacy callers
-/// fire-and-forget at the desktop compatibility edge.
-pub fn open_in_file_manager(path: &std::path::Path) {
-    if let Err(error) = rustle_platform::open_in_file_manager(path) {
-        tracing::warn!(%error, "Failed to open path in the system file manager");
-    }
+/// Reveal a file through the platform adapter, preserving its failure result.
+pub fn open_in_file_manager(path: &std::path::Path) -> Result<(), rustle_platform::PlatformError> {
+    rustle_platform::open_in_file_manager(path)
 }
 
 fn guarded_platform_worker(

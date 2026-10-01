@@ -7,17 +7,30 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::download::{DownloadError, DownloadResult as Result};
 use crate::utils::{detect_audio_format, sanitize_filename};
+
+/// Shared with blocking tag writers so cancellation cannot remove an open file
+/// (or leave one behind after the async owner stops waiting).
+struct TemporaryDownload(PathBuf);
+
+impl Drop for TemporaryDownload {
+    fn drop(&mut self) {
+        crate::cache::cleanup_temp_file(&self.0);
+    }
+}
 
 /// Verify downloaded audio file integrity using lofty
 pub fn verify_integrity(path: &Path) -> Result<()> {
     use lofty::prelude::*;
     use lofty::probe::Probe;
 
-    let tagged_file = Probe::open(path)?.read()?;
+    let tagged_file = Probe::open(path)?
+        .guess_file_type()
+        .map_err(|e| DownloadError::io("probe audio format", e))?
+        .read()?;
 
     let props = tagged_file.properties();
     let duration = props.duration().as_secs();
@@ -41,6 +54,7 @@ pub async fn download_song(
     song_url: &str,
     download_dir: &Path,
     meta: &crate::metadata::SongMetadata,
+    lyrics: Option<String>,
     on_progress: impl Fn(u64, u64),
 ) -> Result<PathBuf> {
     // Ensure the download directory exists.
@@ -55,17 +69,7 @@ pub async fn download_song(
     );
     let temp_anchor = download_dir.join(&stem);
     let tmp = crate::cache::unique_temp_path(&temp_anchor);
-    {
-        let existing = crate::utils::AUDIO_EXTENSIONS
-            .iter()
-            .map(|e| download_dir.join(format!("{}.{}", stem, e)))
-            .find(|p| p.exists());
-        if let Some(p) = existing {
-            info!("Download file already exists: {:?}", p);
-            return Ok(p);
-        }
-    }
-
+    let temporary_guard = std::sync::Arc::new(TemporaryDownload(tmp.clone()));
     // Download audio stream.
     let client = reqwest::Client::new();
     let response = client.get(song_url).send().await?;
@@ -146,37 +150,26 @@ pub async fn download_song(
         extension.to_string()
     };
     let dest = download_dir.join(format!("{}.{}", stem, ext));
-    crate::cache::publish_or_reuse(&tmp, &dest, (total > 0).then_some(total))
-        .map_err(|error| DownloadError::io("publish downloaded file", error))?;
-
-    // Verify the final file is playable.
-    if let Err(e) = verify_integrity(&dest) {
-        let _ = fs::remove_file(&dest);
-        return Err(DownloadError::Integrity {
-            source: Box::new(e),
-        });
+    // Finish the private file before exposing it to the library or reporting success.
+    let result = async {
+        let mut edits = crate::cache::prepare_song_tags(ncm_id, meta).await?;
+        edits.lyrics = lyrics;
+        let writer_guard = temporary_guard.clone();
+        tokio::task::spawn_blocking(move || {
+            verify_integrity(&writer_guard.0)?;
+            crate::features::import::save_metadata(&writer_guard.0, &edits)?;
+            verify_integrity(&writer_guard.0)
+        })
+        .await
+        .map_err(|e| DownloadError::io("join audio tagging", std::io::Error::other(e)))??;
+        crate::cache::publish_replace(&tmp, &dest)
+            .map_err(|e| DownloadError::io("publish tagged download", e))?;
+        Ok::<_, DownloadError>(())
     }
-
-    // Write metadata tags, reusing the unified image cache when available.
-    let mut edits = meta.to_metadata_edits();
-    if edits.cover_data.is_none()
-        && let Some(path) = crate::image::resolve_cached(crate::image::ImageKind::SongCover, ncm_id)
-        && let Ok(data) = fs::read(&path)
-    {
-        edits.cover_mime = Some(
-            match crate::utils::detect_image_format(&data) {
-                "png" => "image/png",
-                "gif" => "image/gif",
-                "webp" => "image/webp",
-                "bmp" => "image/bmp",
-                _ => "image/jpeg",
-            }
-            .to_string(),
-        );
-        edits.cover_data = Some(data);
-    }
-    if let Err(e) = crate::features::import::save_metadata(&dest, &edits) {
-        warn!("Failed to write metadata tags to {:?}: {}", dest, e);
+    .await;
+    if let Err(error) = result {
+        crate::cache::cleanup_temp_file(&tmp);
+        return Err(error);
     }
 
     info!(
@@ -186,4 +179,57 @@ pub async fn download_song(
         ext
     );
     Ok(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn aborting_a_download_removes_its_partial_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\npartial")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let root = crate::cache::unique_temp_path(&std::env::temp_dir().join("cancel-download"));
+        let directory = root.clone();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let download = tokio::spawn(async move {
+            download_song(
+                1,
+                &url,
+                &directory,
+                &crate::metadata::SongMetadata::default(),
+                None,
+                |_, _| {
+                    let _ = progress_tx.send(());
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), progress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        download.abort();
+        assert!(download.await.unwrap_err().is_cancelled());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir(root).unwrap();
+    }
 }

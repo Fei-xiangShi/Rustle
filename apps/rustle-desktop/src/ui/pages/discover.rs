@@ -1,7 +1,7 @@
 //! Discovery-first home page.
 
 use iced::widget::{Space, column, container, responsive, row, scrollable, text};
-use iced::{Color, Element, Fill, Length, Padding};
+use iced::{Element, Fill, Length, Padding};
 
 use crate::api::PRIVATE_RADAR_PLAYLIST_ID;
 use crate::app::{DiscoverPageState, DiscoverViewMode, ImageState, Message};
@@ -175,8 +175,8 @@ fn personal_feature_row<'a>(
             .as_ref()
             .and_then(|track| image_state.get(ImageKind::SongCover, track.id)),
         (
-            Color::from_rgb(0.92, 0.25, 0.43),
-            Color::from_rgb(0.48, 0.18, 0.62),
+            rustle_ui::theme::decoration::feature(0)[0],
+            rustle_ui::theme::decoration::feature(0)[1],
         ),
         feature_width,
         state.card_animations.get_progress(&DAILY_FEATURE_ID),
@@ -200,8 +200,8 @@ fn personal_feature_row<'a>(
         crate::ui::icons::BROWSE,
         image_state.get(ImageKind::PlaylistCover, PRIVATE_RADAR_PLAYLIST_ID),
         (
-            Color::from_rgb(0.18, 0.35, 0.63),
-            Color::from_rgb(0.42, 0.18, 0.55),
+            rustle_ui::theme::decoration::feature(1)[0],
+            rustle_ui::theme::decoration::feature(1)[1],
         ),
         feature_width,
         state
@@ -227,8 +227,8 @@ fn personal_feature_row<'a>(
                 .and_then(|track| image_state.get(ImageKind::SongCover, track.id))
         }),
         (
-            Color::from_rgb(0.16, 0.46, 0.59),
-            Color::from_rgb(0.29, 0.19, 0.55),
+            rustle_ui::theme::decoration::feature(2)[0],
+            rustle_ui::theme::decoration::feature(2)[1],
         ),
         feature_width,
         state.card_animations.get_progress(&PERSONAL_FM_FEATURE_ID),

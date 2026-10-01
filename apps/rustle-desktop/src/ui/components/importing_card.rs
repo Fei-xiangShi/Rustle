@@ -5,13 +5,13 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{Space, button, column, container, row, text};
-use iced::{Alignment, Element, Fill, Padding};
-
 use crate::app::Message;
-use crate::ui::responsive::{TextRole, UiTokens};
+use crate::ui::responsive::UiTokens;
 use crate::ui::theme;
 use crate::ui::widgets::{ProgressRing, view_progress_ring_styled};
+use iced::Element;
+use iced::widget::{Space, container};
+use std::time::Instant;
 
 /// State for an importing playlist
 #[derive(Debug, Clone)]
@@ -28,6 +28,12 @@ pub struct ImportingPlaylist {
     pub total: u64,
     /// Is import complete
     pub completed: bool,
+    pub finalized: bool,
+    pub display_progress: f32,
+    pub rotation: f32,
+    pub completion_started: Option<Instant>,
+    pub animation_time: f32,
+    last_frame: Instant,
     /// Whether cancellation has been requested
     pub cancelling: bool,
     /// Database ID of created playlist (set after completion)
@@ -53,6 +59,12 @@ impl ImportingPlaylist {
             current: 0,
             total: 0,
             completed: false,
+            finalized: false,
+            display_progress: 0.0,
+            rotation: 0.0,
+            completion_started: None,
+            animation_time: 0.0,
+            last_frame: Instant::now(),
             cancelling: false,
             playlist_id: None,
             root_path,
@@ -63,14 +75,49 @@ impl ImportingPlaylist {
         }
     }
 
+    /// Keep the ID for cleanup even when cancellation beat playlist creation.
+    pub fn attach_prepared(&mut self, playlist_id: i64) -> bool {
+        self.playlist_id = Some(playlist_id);
+        !self.cancelling
+    }
+
     pub fn update_progress(&mut self, current: u64, total: u64) {
         self.current = current;
         self.total = total;
         self.progress = if total > 0 {
-            current as f32 / total as f32
+            (current as f32 / total as f32 * 0.95).clamp(self.progress, 0.95)
         } else {
             0.0
         };
+    }
+
+    /// Start the check animation only after the persisted playlist is loaded.
+    pub fn ready(&mut self) {
+        if self.completed && self.finalized && self.completion_started.is_none() {
+            self.completion_started = Some(Instant::now());
+        }
+    }
+
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let dt = now
+            .saturating_duration_since(self.last_frame)
+            .as_secs_f32()
+            .min(0.1);
+        self.last_frame = now;
+        self.rotation = (self.rotation + dt * 4.0) % std::f32::consts::TAU;
+        self.display_progress +=
+            (self.progress - self.display_progress) * (1.0 - (-12.0 * dt).exp());
+        if let Some(start) = self.completion_started {
+            self.animation_time = now.saturating_duration_since(start).as_secs_f32();
+            if self.animation_time >= 0.25 {
+                self.display_progress = 1.0;
+            }
+        }
+        self.completion_started.is_some() && self.animation_time >= 1.4
+    }
+
+    pub fn opacity(&self) -> f32 {
+        1.0 - ((self.animation_time - 1.0) / 0.4).clamp(0.0, 1.0)
     }
 
     pub fn set_cover(&mut self, path: String) {
@@ -119,161 +166,89 @@ impl ImportingPlaylist {
     }
 }
 
-/// Build an importing playlist card for the sidebar
-pub fn view(playlist: &ImportingPlaylist, tokens: UiTokens) -> Element<'static, Message> {
-    let name = playlist.name.clone();
-    let progress = playlist.progress;
-    let percentage = (progress * 100.0) as u32;
-
-    // Progress indicator - show checkmark when completed, progress ring otherwise
-    let progress_indicator: Element<'static, Message> = if playlist.completed {
-        // Show checkmark icon when completed
-        container(
-            iced::widget::svg(iced::widget::svg::Handle::from_memory(
-                crate::ui::icons::CHECK.as_bytes(),
-            ))
-            .width(tokens.size(22.0))
-            .height(tokens.size(22.0))
-            .style(|_theme, _status| iced::widget::svg::Style {
-                color: Some(theme::ACCENT_PINK),
-            }),
-        )
-        .width(tokens.size(22.0))
-        .height(tokens.size(22.0))
-        .center_x(tokens.size(22.0))
-        .center_y(tokens.size(22.0))
-        .into()
-    } else {
-        // Show progress ring with percentage during import
-        let progress_ring = ProgressRing::new(progress, tokens.size(2.5), tokens.size(1.0))
-            .background_color(theme::SURFACE_LIGHT)
-            .progress_color(theme::ACCENT_PINK);
-
-        container(
-            column![
-                view_progress_ring_styled(progress_ring, tokens.size(32.0)),
-                text(format!("{}%", percentage))
-                    .size(tokens.text(TextRole::Caption))
-                    .style(|theme| text::Style {
-                        color: Some(theme::text_muted(theme))
-                    })
-                    .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT))
-            ]
-            .align_x(Alignment::Center)
-            .spacing(tokens.space(2.0)),
-        )
-        .width(tokens.size(38.0))
-        .center_x(tokens.size(38.0))
-        .center_y(tokens.size(38.0))
-        .into()
-    };
-
-    // Playlist info
-    let status_text = if playlist.cancelling {
-        "正在取消...".to_string()
-    } else if let Some(status) = &playlist.status_text {
-        status.clone()
-    } else if playlist.completed {
-        "导入完成".to_string()
-    } else if playlist.total > 0 {
-        format!("{}/{}", playlist.current, playlist.total)
-    } else {
-        "扫描中...".to_string()
-    };
-
-    let skip_detail = playlist.recent_skips.first().cloned();
-    let completed = playlist.completed;
-    let mut info = column![
-        text(name)
-            .size(tokens.text(TextRole::BodyLarge))
-            .style(move |theme| text::Style {
-                color: Some(if completed {
-                    theme::text_primary(theme)
-                } else {
-                    theme::text_secondary(theme)
-                })
-            })
-            .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT)),
-        text(status_text)
-            .size(tokens.text(TextRole::Body))
-            .style(|theme| text::Style {
-                color: Some(theme::text_muted(theme))
-            })
-            .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT))
-    ];
-    if let Some(detail) = skip_detail {
-        info = info.push(
-            text(detail)
-                .size(tokens.text(TextRole::Caption))
-                .style(|theme| text::Style {
-                    color: Some(theme::text_muted(theme)),
-                })
-                .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT)),
-        );
-    }
-    let info = info.spacing(tokens.space(3.0));
-
-    let trailing: Element<'static, Message> = if !playlist.completed {
-        if playlist.cancelling {
-            text("取消中")
-                .size(tokens.text(TextRole::Body))
-                .style(|theme| text::Style {
-                    color: Some(theme::text_muted(theme)),
-                })
-                .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT))
-                .into()
-        } else {
-            button(
-                text("取消")
-                    .size(tokens.text(TextRole::Body))
-                    .style(|theme| text::Style {
-                        color: Some(theme::text_muted(theme)),
-                    })
-                    .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT)),
-            )
-            .style(theme::text_button)
-            .padding([tokens.space(5.0), tokens.space(10.0)])
-            .on_press(Message::CancelScan)
-            .into()
-        }
-    } else {
-        Space::new().width(tokens.size(1.0)).into()
-    };
-
-    let content = row![
-        progress_indicator,
-        Space::new().width(tokens.space(14.0)),
-        info,
-        Space::new().width(Fill),
-        trailing,
-    ]
-    .align_y(Alignment::Center)
-    .padding(
-        Padding::new(tokens.space(12.0))
-            .left(tokens.space(16.0))
-            .right(tokens.space(16.0)),
+/// Shared cover-sized animation for the sidebar and compact rail.
+pub fn indicator(
+    playlist: &ImportingPlaylist,
+    size: f32,
+    tokens: UiTokens,
+) -> Element<'static, Message> {
+    let opacity = playlist.opacity();
+    let mut ring = ProgressRing::new(
+        playlist.display_progress,
+        tokens.size(2.5),
+        tokens.size(2.0),
     );
-
-    // Make it a button only if completed
-    if playlist.completed {
-        let on_press = playlist
-            .playlist_id
-            .map(Message::OpenPlaylist)
-            .unwrap_or(Message::PlayHero);
-        button(content)
-            .width(Fill)
-            .padding(0)
-            .style(move |theme, status| theme::nav_item(theme, status, tokens.theme_metrics()))
-            .on_press(on_press)
-            .into()
-    } else {
-        // Non-clickable during import
-        container(content)
-            .width(Fill)
-            .style(|_theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+    ring.opacity = opacity;
+    ring.check_progress = ((playlist.animation_time - 0.25) / 0.3).clamp(0.0, 1.0);
+    if playlist.total == 0 && !playlist.completed {
+        ring.progress = 0.22;
+        ring.rotation = playlist.rotation;
+    }
+    let backdrop = container(Space::new())
+        .width(size)
+        .height(size)
+        .style(move |theme| {
+            let mut color = theme::surface_container(theme);
+            color.a *= opacity;
+            iced::widget::container::Style {
+                background: Some(color.into()),
+                border: iced::Border {
+                    radius: tokens.size(6.0).into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            })
-            .into()
+            }
+        });
+    iced::widget::stack![backdrop, view_progress_ring_styled(ring, size)].into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_before_creation_prevents_scan_and_retains_cleanup_id() {
+        let mut playlist = ImportingPlaylist::new("Music".into(), PathBuf::new());
+        playlist.begin_cancelling();
+        assert!(!playlist.attach_prepared(42));
+        assert_eq!(playlist.playlist_id, Some(42));
+        assert!(playlist.cancelling);
+    }
+
+    #[test]
+    fn import_animation_waits_for_persisted_playlist_before_check_and_fade() {
+        let mut playlist = ImportingPlaylist::new("Music".into(), PathBuf::new());
+        playlist.complete(1, 0, 0);
+        playlist.ready();
+        assert!(playlist.completion_started.is_none());
+        assert!(!playlist.tick(Instant::now() + Duration::from_secs(2)));
+        playlist.finalized = true;
+        playlist.ready();
+        let start = playlist.completion_started.unwrap();
+        assert!(!playlist.tick(start + Duration::from_millis(800)));
+        assert_eq!(playlist.opacity(), 1.0);
+        assert_eq!(playlist.display_progress, 1.0);
+        assert!(!playlist.tick(start + Duration::from_millis(1200)));
+        assert!((playlist.opacity() - 0.5).abs() < 0.001);
+        assert!(playlist.tick(start + Duration::from_millis(1400)));
+        assert!(playlist.opacity() < 0.001);
+    }
+
+    #[test]
+    fn import_animation_smooths_progress_and_reserves_finalization() {
+        let mut playlist = ImportingPlaylist::new("Music".into(), PathBuf::new());
+        let start = playlist.last_frame;
+        playlist.update_progress(5, 10);
+        assert_eq!(playlist.display_progress, 0.0);
+        playlist.tick(start + Duration::from_millis(16));
+        assert!(playlist.display_progress > 0.0);
+        assert!(playlist.display_progress < playlist.progress);
+        playlist.update_progress(3, 10);
+        assert_eq!(playlist.progress, 0.475);
+        playlist.update_progress(10, 10);
+        assert_eq!(playlist.progress, 0.95);
+        playlist.complete(10, 0, 0);
+        assert_eq!(playlist.progress, 1.0);
     }
 }

@@ -60,42 +60,19 @@ impl SongMetadata {
         crate::utils::format_time_padded(self.duration.as_secs_f32())
     }
 
-    /// Resolve the best available cover for display.
-    ///
-    /// If `file_path` points to an existing file, extracts embedded cover art.
-    /// For NCM songs (`song_id < 0`), delegates to [`crate::utils::find_cover`].
-    pub fn resolve_cover(&self, file_path: Option<&str>, song_id: i64) -> Option<PathBuf> {
-        // 1. Local file: extract embedded cover
-        if let Some(p) = file_path {
-            let path = std::path::Path::new(p);
-            if path.is_absolute()
-                && path.exists()
-                && let Ok(m) = crate::features::import::extract_metadata(path)
-                && let Some(data) = m.cover_data
-            {
-                let dir = std::env::temp_dir().join("rustle_covers");
-                let _ = std::fs::create_dir_all(&dir);
-                let out = dir.join(format!("{}.jpg", song_id));
-                let _ = std::fs::write(&out, &data);
-                return Some(out);
-            }
-            // File exists but no embedded cover — still use the file path
-            // (cover might be external, e.g. cover.jpg in same folder)
-        }
-        // 2. NCM song: check cache, auto-download if missing
-        if song_id < 0 {
-            return crate::image::resolve_cached(
-                crate::image::ImageKind::SongCover,
-                (-song_id) as u64,
-            );
-        }
-        // 3. Local song without file: check explicit cover_path
-        if let Some(CoverSource::Path(p)) = &self.cover
-            && p.exists()
-        {
-            return Some(p.clone());
-        }
-        None
+    /// Build an editing preview from embedded bytes without exporting a thumbnail.
+    /// Call on a blocking worker, alongside tag inspection.
+    pub fn cover_handle(&self, file_path: &str) -> Option<iced::widget::image::Handle> {
+        let image = match &self.cover {
+            Some(CoverSource::Embedded { data, .. }) => image::load_from_memory(data).ok(),
+            _ => crate::image::artwork::load(std::path::Path::new(file_path)),
+        }?;
+        let pixels = image.thumbnail(300, 300).to_rgba8();
+        Some(iced::widget::image::Handle::from_rgba(
+            pixels.width(),
+            pixels.height(),
+            pixels.into_raw(),
+        ))
     }
 
     /// Resolve metadata from the best available source.
@@ -186,6 +163,7 @@ impl SongMetadata {
                 CoverSource::Embedded { mime, .. } => Some(mime.clone()),
                 _ => None,
             }),
+            lyrics: None,
         }
     }
 }

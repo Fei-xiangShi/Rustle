@@ -1,5 +1,6 @@
 //! Message update handlers - thin dispatcher delegating to submodules
 
+pub(super) mod audio_index;
 pub mod audio_preload_manager;
 mod context_menu;
 mod database;
@@ -49,6 +50,7 @@ impl App {
         }
 
         // Try each handler in order until one handles the message
+        handle!(handle_audio_index);
         handle!(handle_navigation);
         handle!(handle_context_menu);
         handle!(handle_overlay);
@@ -79,10 +81,11 @@ impl App {
     }
 
     fn with_image_tasks(&mut self, message: &Message, task: Task<Message>) -> Task<Message> {
+        let source_task = self.refresh_audio_index_after_message(message);
         let image_tasks = self.collect_image_tasks_after_message(message);
         self.ui
             .playlist_page
             .sync_gradient_animation(self.core.settings.display.power_saving_mode);
-        Task::batch([task, image_tasks])
+        Task::batch([task, image_tasks, source_task])
     }
 }

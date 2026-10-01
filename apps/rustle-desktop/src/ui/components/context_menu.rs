@@ -28,7 +28,7 @@ pub fn view(
     let tokens = context.tokens;
     let source = menu.source;
     let is_liked = menu.is_liked;
-    let can_show_folder = source != Source::Online;
+    let can_show_folder = matches!(source, Source::Local | Source::Cached);
     let can_download = source != Source::Local;
     let can_edit = source == Source::Local;
 
@@ -244,9 +244,9 @@ fn item<'a>(
                     .height(tokens.icon(IconRole::Small))
                     .style(move |t, _| svg::Style {
                         color: Some(if is_accent {
-                            purple()
+                            theme::accent(t)
                         } else if is_danger {
-                            theme::ACCENT_PINK
+                            theme::danger(t)
                         } else {
                             theme::text_muted(t)
                         }),
@@ -256,9 +256,9 @@ fn item<'a>(
                     .size(tokens.text(TextRole::Body))
                     .style(move |t| text::Style {
                         color: Some(if is_accent {
-                            accent_text()
+                            theme::accent(t)
                         } else if is_danger {
-                            theme::ACCENT_PINK
+                            theme::danger(t)
                         } else {
                             theme::text_primary(t)
                         }),
@@ -283,9 +283,9 @@ fn item<'a>(
     widgets::hover_surface(button)
         .style(move |theme, progress| {
             let hover = if is_accent {
-                purple_bg()
+                theme::accent_subtle(theme)
             } else if is_danger {
-                red_bg()
+                theme::danger(theme).scale_alpha(0.1)
             } else {
                 theme::surface_hover(theme)
             };
@@ -303,19 +303,6 @@ fn item<'a>(
             }
         })
         .into()
-}
-
-fn purple() -> Color {
-    Color::from_rgba(0.659, 0.333, 0.969, 1.0)
-}
-fn accent_text() -> Color {
-    Color::from_rgba(0.847, 0.706, 0.996, 1.0)
-}
-fn purple_bg() -> Color {
-    Color::from_rgba(0.659, 0.333, 0.969, 0.12)
-}
-fn red_bg() -> Color {
-    Color::from_rgba(1.0, 0.08, 0.29, 0.10)
 }
 
 fn div<'a>(tokens: crate::ui::responsive::UiTokens) -> Element<'a, Message> {
@@ -353,14 +340,14 @@ fn divider_padding(tokens: crate::ui::responsive::UiTokens) -> Padding {
 
 fn glass(t: &iced::Theme) -> Color {
     let s = theme::surface(t);
-    Color::from_rgba(s.r, s.g, s.b, 0.92)
+    rustle_ui::color::with_alpha(s, 0.92)
 }
 
 fn glass_border(t: &iced::Theme) -> Color {
     if theme::is_dark_theme(t) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.07)
+        rustle_ui::theme::white(0.07)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.08)
+        rustle_ui::theme::black(0.08)
     }
 }
 

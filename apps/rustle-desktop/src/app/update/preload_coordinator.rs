@@ -45,7 +45,8 @@ pub struct BackgroundSlot {
     pub cover_path: Option<String>,
     pub colors_ready: bool,
     pub texture_ready: bool,
-    /// Cached dominant colors for instant shader install
+    /// Last accepted colors for this song. Retained across cover changes for
+    /// player chrome; shader installation additionally requires colors_ready.
     pub primary: Option<[f32; 4]>,
     pub secondary: Option<[f32; 4]>,
     pub tertiary: Option<[f32; 4]>,
@@ -133,9 +134,7 @@ impl PreloadCoordinator {
             self.retain_window_slots(&new_window);
             self.window = new_window;
             WindowChange::SongChanged
-        } else if self.window.next_index != new_window.next_index
-            || self.window.prev_index != new_window.prev_index
-        {
+        } else if self.window != new_window {
             self.retain_window_slots(&new_window);
             self.window = new_window;
             WindowChange::AdjacentChanged
@@ -152,16 +151,9 @@ impl PreloadCoordinator {
 
     /// Remove slots for songs no longer in the given window (current + next + prev).
     fn retain_window_slots(&mut self, window: &PreloadWindow) {
-        let keep_ids: Vec<i64> = [
-            window.current_song_id,
-            window.next_song_id,
-            window.prev_song_id,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        self.background_slots.retain(|id, _| keep_ids.contains(id));
-        self.lyrics_slots.retain(|id, _| keep_ids.contains(id));
+        self.background_slots
+            .retain(|id, _| window.contains_song(*id));
+        self.lyrics_slots.retain(|id, _| window.contains_song(*id));
     }
 
     // ── Background slot ──
@@ -238,13 +230,11 @@ impl PreloadCoordinator {
         slot.texture_ready = true;
     }
 
-    /// Return the extracted cover colors once they are ready for this song.
-    pub fn background_colors(&self, song_id: i64) -> Option<([f32; 4], [f32; 4], [f32; 4])> {
+    /// Player chrome follows the song lifetime, not background preparation.
+    /// Keep the last accepted colors while a new derivative is pending or fails.
+    /// Slot eviction / clear_window releases them; another song never uses them.
+    pub fn progress_colors(&self, song_id: i64) -> Option<([f32; 4], [f32; 4], [f32; 4])> {
         let slot = self.background_slots.get(&song_id)?;
-        if !slot.colors_ready {
-            return None;
-        }
-
         Some((slot.primary?, slot.secondary?, slot.tertiary?))
     }
 
@@ -266,6 +256,9 @@ impl PreloadCoordinator {
     /// Clone cached background data for installation into shader.
     pub fn background_data(&self, song_id: i64) -> Option<PreparedBackground> {
         let slot = self.background_slots.get(&song_id)?;
+        if !self.is_background_ready(song_id, slot.cover_path.as_deref()) {
+            return None;
+        }
         let cover_path = slot.cover_path.clone();
         let primary = slot.primary?;
         let secondary = slot.secondary?;
@@ -319,10 +312,27 @@ impl PreloadCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::PreloadCoordinator;
+    use super::{PreloadCoordinator, WindowChange};
 
     #[test]
-    fn background_colors_are_bound_to_the_current_cover() {
+    fn replacing_adjacent_song_at_same_index_evicts_old_resources() {
+        let mut coordinator = PreloadCoordinator::default();
+        coordinator.refresh_window_with_indices(Some(1), Some(0), Some(1), Some(2), None, None);
+        coordinator.ensure_background_slot(2, Some("old.png".into()));
+        let color = [0.8, 0.2, 0.3, 1.0];
+        coordinator.store_background_colors(2, "old.png".into(), color, color, color);
+        assert_eq!(
+            coordinator.refresh_window_with_indices(Some(1), Some(0), Some(1), Some(3), None, None),
+            WindowChange::AdjacentChanged
+        );
+        assert_eq!(coordinator.window().next_song_id, Some(3));
+        assert_eq!(coordinator.progress_colors(2), None);
+        coordinator.store_background_colors(2, "old.png".into(), color, color, color);
+        assert_eq!(coordinator.progress_colors(2), None);
+    }
+
+    #[test]
+    fn progress_colors_retain_last_accepted_cover_while_background_is_pending() {
         let mut coordinator = PreloadCoordinator::default();
         let primary = [0.8, 0.2, 0.3, 1.0];
         let secondary = [0.3, 0.6, 0.9, 1.0];
@@ -336,7 +346,7 @@ mod tests {
             secondary,
             tertiary,
         );
-        assert_eq!(coordinator.background_colors(1), None);
+        assert_eq!(coordinator.progress_colors(1), None);
 
         coordinator.store_background_colors(
             1,
@@ -346,12 +356,93 @@ mod tests {
             tertiary,
         );
         assert_eq!(
-            coordinator.background_colors(1),
+            coordinator.progress_colors(1),
             Some((primary, secondary, tertiary))
         );
 
         coordinator.ensure_background_slot(1, Some("second.png".to_string()));
-        assert_eq!(coordinator.background_colors(1), None);
+        assert_eq!(
+            coordinator.progress_colors(1),
+            Some((primary, secondary, tertiary))
+        );
+        assert!(!coordinator.is_background_ready(1, Some("second.png")));
+        assert!(coordinator.background_data(1).is_none());
+    }
+
+    #[test]
+    fn progress_colors_survive_thumbnail_hero_thumbnail_round_trip() {
+        let mut coordinator = PreloadCoordinator::default();
+        let thumbnail = [0.8, 0.2, 0.3, 1.0];
+        let hero = [0.3, 0.6, 0.9, 1.0];
+        coordinator.ensure_background_slot(1, Some("thumbnail.png".into()));
+        coordinator.store_background_colors(
+            1,
+            "thumbnail.png".into(),
+            thumbnail,
+            thumbnail,
+            thumbnail,
+        );
+        coordinator.store_background_texture(1, "thumbnail.png".into(), vec![1, 2, 3], 1, 1);
+        assert!(coordinator.background_data(1).is_some());
+
+        coordinator.ensure_background_slot(1, Some("hero.png".into()));
+        assert_eq!(
+            coordinator.progress_colors(1),
+            Some((thumbnail, thumbnail, thumbnail))
+        );
+        coordinator.store_background_colors(1, "hero.png".into(), hero, hero, hero);
+        // New colors must not be installed alongside the old thumbnail texture.
+        assert!(coordinator.background_data(1).is_none());
+        coordinator.store_background_texture(1, "hero.png".into(), vec![4, 5, 6], 1, 1);
+        assert!(coordinator.background_data(1).is_some());
+
+        coordinator.ensure_background_slot(1, Some("thumbnail.png".into()));
+        assert_eq!(coordinator.progress_colors(1), Some((hero, hero, hero)));
+        assert!(coordinator.background_data(1).is_none());
+        coordinator.store_background_colors(
+            1,
+            "thumbnail.png".into(),
+            thumbnail,
+            thumbnail,
+            thumbnail,
+        );
+        coordinator.store_background_texture(1, "thumbnail.png".into(), vec![1, 2, 3], 1, 1);
+        assert!(coordinator.background_data(1).is_some());
+
+        // A late Hero result cannot replace the newly accepted Thumbnail.
+        coordinator.store_background_colors(1, "hero.png".into(), hero, hero, hero);
+        coordinator.store_background_texture(1, "hero.png".into(), vec![4, 5, 6], 1, 1);
+        assert_eq!(
+            coordinator.progress_colors(1),
+            Some((thumbnail, thumbnail, thumbnail))
+        );
+        assert_eq!(
+            coordinator.background_data(1).unwrap().image_data,
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn progress_colors_follow_song_window_and_reject_evicted_results() {
+        let mut coordinator = PreloadCoordinator::default();
+        let color = [0.8, 0.2, 0.3, 1.0];
+        coordinator.refresh_window_with_indices(Some(1), Some(0), Some(1), Some(2), None, None);
+        coordinator.ensure_background_slot(1, Some("cover.png".into()));
+        coordinator.store_background_colors(1, "cover.png".into(), color, color, color);
+        coordinator.ensure_background_slot(2, Some("other.png".into()));
+        assert_eq!(coordinator.progress_colors(2), None);
+
+        coordinator.refresh_window_with_indices(Some(2), Some(1), None, None, Some(0), Some(1));
+        assert_eq!(coordinator.progress_colors(1), Some((color, color, color)));
+        assert_eq!(coordinator.progress_colors(2), None);
+        coordinator.refresh_window_with_indices(Some(3), Some(2), None, None, Some(1), Some(2));
+        coordinator.store_background_colors(1, "cover.png".into(), color, color, color);
+        assert_eq!(coordinator.progress_colors(1), None);
+
+        coordinator.store_background_colors(2, "other.png".into(), color, color, color);
+        coordinator.clear_window();
+        coordinator.store_background_colors(2, "other.png".into(), color, color, color);
+        assert_eq!(coordinator.progress_colors(2), None);
     }
 
     #[test]

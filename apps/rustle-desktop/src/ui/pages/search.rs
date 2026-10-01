@@ -149,7 +149,7 @@ fn view_for_context<'a>(
                                     text(label)
                                         .size(tokens.text(TextRole::Caption))
                                         .style(|_theme| iced::widget::text::Style {
-                                            color: Some(theme::ACCENT),
+                                            color: Some(theme::accent(_theme)),
                                         })
                                         .into()
                                 })
@@ -164,7 +164,7 @@ fn view_for_context<'a>(
                                         .size(tokens.text(TextRole::Caption))
                                         .style(move |theme| iced::widget::text::Style {
                                             color: Some(if availability_restricted {
-                                                theme::ACCENT_PINK
+                                                theme::accent(theme)
                                             } else {
                                                 theme::text_muted(theme)
                                             }),
@@ -434,7 +434,7 @@ fn search_tabs(
                         .size(tokens.text(TextRole::Body))
                         .style(move |theme| iced::widget::text::Style {
                             color: Some(if is_active {
-                                theme::ACCENT_PINK
+                                theme::accent(theme)
                             } else {
                                 theme::settings_inactive_tab(theme)
                             }),
@@ -465,7 +465,7 @@ fn search_tabs(
                 .width(Fill)
                 .style(move |theme| container::Style {
                     background: Some(Background::Color(if is_active {
-                        theme::ACCENT_PINK
+                        theme::accent(theme)
                     } else {
                         theme::settings_inactive_underline(theme)
                     })),
@@ -827,7 +827,7 @@ fn cover_base_style(
             color: theme::border_color(theme),
         },
         shadow: iced::Shadow {
-            color: iced::Color::from_rgba(0.0, 0.0, 0.0, shadow_alpha),
+            color: rustle_ui::theme::black(shadow_alpha),
             offset: iced::Vector::new(0.0, tokens.size(4.0) + scale_offset),
             blur_radius: shadow_blur,
         },

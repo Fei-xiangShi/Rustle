@@ -33,8 +33,8 @@ pub struct LyricsPreloadManager {
 }
 
 impl LyricsPreloadManager {
-    fn has_word_level_cache(ncm_id: u64) -> bool {
-        crate::features::lyrics::has_cached_word_level_lyrics(ncm_id)
+    fn has_best_cache(ncm_id: u64) -> bool {
+        crate::features::lyrics::has_cached_best_lyrics(ncm_id)
     }
 
     fn has_any_cache(ncm_id: u64) -> bool {
@@ -42,9 +42,9 @@ impl LyricsPreloadManager {
     }
 
     pub fn should_schedule_warmup(&mut self, song_id: i64, ncm_id: u64) -> bool {
-        // A YRC cache is complete. An old LRC-only cache still needs one
-        // online upgrade attempt, so it must not short-circuit warmup here.
-        if Self::has_word_level_cache(ncm_id) {
+        // Only the versioned multi-source selection cache is complete. Legacy
+        // LRC/YRC files still need one automatic upgrade attempt.
+        if Self::has_best_cache(ncm_id) {
             self.mark_ready(song_id, ncm_id);
             return false;
         }
@@ -65,7 +65,7 @@ impl LyricsPreloadManager {
     }
 
     pub fn begin_warmup(&mut self, song_id: i64, ncm_id: u64) -> bool {
-        if Self::has_word_level_cache(ncm_id) {
+        if Self::has_best_cache(ncm_id) {
             self.mark_ready(song_id, ncm_id);
             return false;
         }

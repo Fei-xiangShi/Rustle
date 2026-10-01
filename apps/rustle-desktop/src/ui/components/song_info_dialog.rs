@@ -71,6 +71,7 @@ pub fn view_edit_body(
 
     let cover = edit_cover_block(
         &e.cover_path,
+        e.cover_handle.as_ref(),
         locale.get(Key::SongEditCoverReplace),
         id,
         tokens,
@@ -100,6 +101,7 @@ pub fn view_edit_body(
 
 fn edit_cover_block<'a>(
     path: &Option<std::path::PathBuf>,
+    embedded: Option<&iced::widget::image::Handle>,
     replace_label: &str,
     song_id: i64,
     tokens: crate::ui::responsive::UiTokens,
@@ -108,8 +110,8 @@ fn edit_cover_block<'a>(
     let cover_radius = tokens.cover_radius(CoverRadiusRole::Card);
     let handle = path
         .as_ref()
-        .filter(|p| p.exists())
-        .map(|p| iced::widget::image::Handle::from_path(p.clone()));
+        .map(|p| iced::widget::image::Handle::from_path(p.clone()))
+        .or_else(|| embedded.cloned());
     let img = crate::ui::components::cover_image::custom(
         handle.as_ref(),
         crate::image::ImageKind::SongCover,
@@ -231,22 +233,22 @@ fn inp_s(
     radius: f32,
     tokens: UiTokens,
 ) -> text_input::Style {
-    let purple = Color::from_rgba(0.659, 0.333, 0.969, 1.0);
+    let accent = theme::accent(t);
     let c = match s {
-        text_input::Status::Focused { .. } => Color::from_rgba(0.659, 0.333, 0.969, 0.50),
-        text_input::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.20),
-        _ => Color::from_rgba(1.0, 1.0, 1.0, 0.10),
+        text_input::Status::Focused { .. } => accent,
+        text_input::Status::Hovered => rustle_ui::theme::white(0.20),
+        _ => rustle_ui::theme::white(0.10),
     };
     text_input::Style {
-        background: iced::Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.05)),
+        background: iced::Background::Color(theme::surface(t)),
         border: Border {
             color: c,
             width: tokens.size(1.0),
             radius: Radius::new(radius),
         },
-        placeholder: theme::TEXT_MUTED,
+        placeholder: theme::text_muted(t),
         value: theme::text_primary(t),
-        selection: purple,
+        selection: accent,
     }
 }
 
@@ -254,9 +256,9 @@ fn inp_s(
 
 fn glass_border(t: &iced::Theme) -> Color {
     if theme::is_dark_theme(t) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.10)
+        rustle_ui::theme::white(0.10)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.10)
+        rustle_ui::theme::black(0.10)
     }
 }
 

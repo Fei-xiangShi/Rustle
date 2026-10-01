@@ -2,7 +2,7 @@
 //!
 //! Provides unified song resolution for both local and NCM songs.
 //! Handles caching, URL fetching, and cover downloading.
-//! Uses SharedBuffer for streaming playback (no file-based streaming).
+//! Streams through a bounded buffer backed by a contiguous file cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub struct ResolvedSong {
     pub finalized_cache_path: Option<String>,
     /// Local cover path or recoverable remote source (if available).
     pub cover_path: Option<String>,
-    /// Shared buffer for direct memory playback (None if using cached file)
+    /// Bounded streaming buffer and its file backing (None for a finalized file)
     pub shared_buffer: Option<SharedBuffer>,
     /// Duration in seconds (from API)
     pub duration_secs: Option<u64>,
@@ -124,13 +124,16 @@ pub(crate) async fn resolve_audio_source(
         ncm_id,
         crate::api::quality_api_level(requested_level)
     );
-    let requested_candidate = crate::utils::find_cached_audio(&song_cache_dir, &requested_stem);
-    if let Some(cached_path) = requested_candidate.as_ref()
-        && crate::cache::is_audio_cache_complete(cached_path, ncm_id, requested_level, None)
-    {
+    if let Some(path) = find_complete_audio_cache(
+        &song_cache_dir,
+        &requested_stem,
+        ncm_id,
+        requested_level,
+        None,
+    ) {
         return Ok(ResolvedAudioSource::Cached {
-            quality: cached_quality(requested_level, requested_level, cached_path),
-            path: cached_path.clone(),
+            quality: cached_quality(requested_level, requested_level, &path),
+            path,
         });
     }
 
@@ -140,46 +143,13 @@ pub(crate) async fn resolve_audio_source(
         .map_err(AppError::from)?;
     let quality = ResolvedAudioQuality::from(&url);
     let actual_stem = format!("{}_{}", ncm_id, crate::api::quality_api_level(url.level));
-    if actual_stem == requested_stem {
-        if let Some(cached_path) = requested_candidate {
-            if crate::cache::is_audio_cache_complete(&cached_path, ncm_id, url.level, url.size) {
-                return Ok(ResolvedAudioSource::Cached {
-                    path: cached_path,
-                    quality,
-                });
-            }
-            tracing::info!(
-                ?cached_path,
-                ncm_id,
-                "Removing incomplete preferred-quality cache"
-            );
-            crate::cache::remove_audio_cache(&cached_path);
-        }
-    } else {
-        if let Some(cached_path) = requested_candidate {
-            tracing::info!(
-                ?cached_path,
-                ncm_id,
-                "Removing unverifiable cache after actual-quality negotiation"
-            );
-            crate::cache::remove_audio_cache(&cached_path);
-        }
-    }
-    if actual_stem != requested_stem
-        && let Some(cached_path) = crate::utils::find_cached_audio(&song_cache_dir, &actual_stem)
+    // Recheck after negotiation: another coordinator may have published while
+    // the URL request was pending. Readers never remove a publisher's data or
+    // manifest in the interval between those two atomic renames.
+    if let Some(path) =
+        find_complete_audio_cache(&song_cache_dir, &actual_stem, ncm_id, url.level, url.size)
     {
-        if crate::cache::is_audio_cache_complete(&cached_path, ncm_id, url.level, url.size) {
-            return Ok(ResolvedAudioSource::Cached {
-                path: cached_path,
-                quality,
-            });
-        }
-        tracing::info!(
-            ?cached_path,
-            ncm_id,
-            "Removing incomplete actual-quality cache"
-        );
-        crate::cache::remove_audio_cache(&cached_path);
+        return Ok(ResolvedAudioSource::Cached { path, quality });
     }
 
     Ok(ResolvedAudioSource::Streaming {
@@ -190,6 +160,21 @@ pub(crate) async fn resolve_audio_source(
             actual_quality: url.level,
         },
         quality,
+    })
+}
+
+fn find_complete_audio_cache(
+    directory: &std::path::Path,
+    stem: &str,
+    song_id: u64,
+    quality: NcmQualityLevel,
+    expected_size: Option<u64>,
+) -> Option<PathBuf> {
+    // A stale file with a different extension must not hide a valid cache.
+    crate::utils::cached_audio_candidates(directory, stem).find(|path| {
+        crate::cache::is_audio_cache_complete(path, song_id, quality, expected_size)
+            && rustle_storage::cache::read_audio_manifest(path)
+                .is_some_and(|manifest| manifest.source_size.is_some())
     })
 }
 
@@ -226,6 +211,22 @@ pub fn get_ncm_id(song: &DbSong) -> u64 {
 /// 3. Reuses an actual-quality cache or streams into one with SharedBuffer
 /// 4. Reuses a cached cover or recovers its remote source from track metadata
 pub async fn resolve_song(
+    client: Arc<NcmClient>,
+    song: &DbSong,
+    context: PlaybackContext,
+    event_tx: tokio::sync::mpsc::Sender<StreamingEvent>,
+) -> Result<ResolvedSong, AppError> {
+    let cancellation = context.cancellation.clone();
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(PlaybackError::Cancelled(
+            "song resolution was cancelled".to_string(),
+        ).into()),
+        result = resolve_song_inner(client, song, context, event_tx) => result,
+    }
+}
+
+async fn resolve_song_inner(
     client: Arc<NcmClient>,
     song: &DbSong,
     context: PlaybackContext,
@@ -290,7 +291,7 @@ pub async fn resolve_song(
                 url,
                 cache_path,
                 cache_key,
-                crate::cache::audio_cache_store(),
+                crate::cache::tagged_audio_cache_store(client.clone(), song),
                 quality.bitrate,
                 identity,
                 Some(event_tx),
@@ -322,6 +323,18 @@ pub async fn resolve_song(
         return Err(playback_error.into());
     }
 
+    // Publication may win the startup race. Prefer an independent file decoder
+    // instead of keeping a completed coordinator in the streaming lifecycle.
+    if let Some(path) = shared_buffer.finalized_cache_path() {
+        return Ok(ResolvedSong {
+            finalized_cache_path: Some(path.to_string_lossy().into_owned()),
+            cover_path,
+            shared_buffer: None,
+            duration_secs: Some(song.duration_secs as u64),
+            quality: Some(quality),
+        });
+    }
+
     // The downloader continues filling the bounded window and sparse cache in
     // the background after the decoder has a stable startup reserve.
     Ok(ResolvedSong {
@@ -334,14 +347,12 @@ pub async fn resolve_song(
 }
 
 async fn resolve_cover(client: &NcmClient, song: &DbSong, ncm_id: u64) -> Option<String> {
-    if let Some(path) = crate::image::resolve_cached(crate::image::ImageKind::SongCover, ncm_id) {
-        return Some(path.to_string_lossy().to_string());
-    }
-
-    if let Some(source) = song.cover_path.as_deref()
-        && (crate::image::is_remote_url(source) || crate::image::is_valid_local_path(source))
+    if let Some(source) = song
+        .cover_path
+        .as_deref()
+        .filter(|source| crate::image::is_remote_url(source))
     {
-        return Some(source.to_string());
+        return Some(source.to_owned());
     }
 
     match client.track_detail(&[ncm_id]).await {
@@ -354,5 +365,92 @@ async fn resolve_cover(client: &NcmClient, song: &DbSong, ncm_id: u64) -> Option
             tracing::warn!(ncm_id, %error, "Failed to recover current-song cover source");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_extension_does_not_hide_or_delete_the_published_audio() {
+        let directory =
+            crate::cache::unique_temp_path(&std::env::temp_dir().join("rustle-cache-lookup"));
+        std::fs::create_dir(&directory).unwrap();
+        let stale = directory.join("7_lossless.mp3");
+        let current = directory.join("7_lossless.flac");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::write(&current, b"fLaCfixture").unwrap();
+        // A reader arriving between data and manifest publication leaves both
+        // files alone. A subsequent lookup finds the fully published format.
+        assert!(
+            find_complete_audio_cache(&directory, "7_lossless", 7, NcmQualityLevel::Lossless, None)
+                .is_none()
+        );
+        assert!(current.exists());
+        rustle_storage::cache::write_tagged_audio_manifest(
+            &current,
+            7,
+            NcmQualityLevel::Lossless,
+            11,
+            "flac",
+        )
+        .unwrap();
+        assert_eq!(
+            find_complete_audio_cache(&directory, "7_lossless", 7, NcmQualityLevel::Lossless, None),
+            Some(current.clone())
+        );
+        assert_eq!(
+            find_complete_audio_cache(
+                &directory,
+                "7_lossless",
+                7,
+                NcmQualityLevel::Lossless,
+                Some(11)
+            ),
+            Some(current.clone())
+        );
+        assert!(stale.exists());
+        std::fs::remove_file(stale).unwrap();
+        rustle_storage::cache::remove_audio_cache(&current);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_resolution_does_not_start_source_or_cover_requests() {
+        let controller = crate::audio::identity::PlaybackGenerationController::new();
+        let context = controller.activate_generation();
+        context.cancellation.cancel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let song = DbSong {
+            id: -7,
+            file_path: "ncm://7".to_string(),
+            title: "Song".to_string(),
+            artist: String::new(),
+            album: String::new(),
+            duration_secs: 180,
+            track_number: None,
+            year: None,
+            genre: None,
+            cover_path: None,
+            file_hash: None,
+            file_size: 0,
+            format: Some("ncm".to_string()),
+            normalization_gain: None,
+            play_count: 0,
+            last_played: None,
+            last_modified: 0,
+            is_missing: false,
+            created_at: 0,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            resolve_song(Arc::new(NcmClient::new()), &song, context, tx),
+        )
+        .await
+        .unwrap();
+        let expected: AppError = PlaybackError::Cancelled("cancelled".to_string()).into();
+        assert_eq!(result.unwrap_err().code(), expected.code());
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -1,5 +1,8 @@
 //! Async helper functions for database operations
 
+mod local_covers;
+use local_covers::restore_playlist_cover;
+
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -9,9 +12,7 @@ use iced::Task;
 use crate::app::Message;
 use crate::application::tray::{TrayLabels, TrayPresentation, TrayState};
 use crate::audio::chain::AudioProcessingChain;
-use crate::database::{
-    Database, DbPlaybackState, DbPlaylist, DbSong, DbWatchedFolder, NewPlaylist,
-};
+use crate::database::{Database, DbPlaybackState, DbPlaylist, DbSong, DbWatchedFolder};
 use crate::features::PlayMode;
 use crate::features::import::{CoverCache, default_cache_dir};
 use crate::platform::media_controls::{MediaCommand, MediaHandle, start_media_controls};
@@ -103,7 +104,25 @@ pub async fn load_songs(db: Arc<Database>) -> Vec<DbSong> {
 
 /// Load all playlists from database
 pub async fn load_playlists(db: Arc<Database>) -> Vec<DbPlaylist> {
-    db.get_all_playlists().await.unwrap_or_default()
+    let mut playlists = db.get_all_playlists().await.unwrap_or_default();
+    for playlist in &mut playlists {
+        if playlist
+            .cover_path
+            .as_deref()
+            .is_some_and(crate::image::is_valid_local_path)
+        {
+            continue;
+        }
+        match db.get_playlist_songs(playlist.id).await {
+            Ok(songs) => {
+                restore_playlist_cover(playlist, songs.iter());
+            }
+            Err(error) => {
+                tracing::warn!(playlist_id = playlist.id, %error, "Cannot recover playlist artwork")
+            }
+        }
+    }
+    playlists
 }
 
 /// Load playback state from database
@@ -176,7 +195,7 @@ pub async fn validate_songs(db: Arc<Database>) -> u32 {
 /// Initialize cover cache
 pub async fn init_cover_cache() -> anyhow::Result<CoverCache> {
     let cache_dir = default_cache_dir();
-    Ok(CoverCache::new(cache_dir)?)
+    Ok(CoverCache::new(cache_dir, crate::cache::cache_publisher())?)
 }
 
 /// Initialize font system for lyrics text shaping
@@ -320,38 +339,6 @@ pub async fn open_folder_dialog() -> Option<PathBuf> {
         .map(|handle| handle.path().to_path_buf())
 }
 
-/// Create playlist from import results
-pub async fn create_playlist_from_import(
-    db: Arc<Database>,
-    name: String,
-    cover_path: Option<String>,
-    scanned_paths: Vec<std::path::PathBuf>,
-) -> crate::database::StorageResult<i64> {
-    let playlist = NewPlaylist {
-        name,
-        description: None,
-        cover_path,
-        is_smart: false,
-    };
-
-    let playlist_id = db.create_playlist(playlist).await?;
-
-    // Add songs from scanned paths to playlist
-    for path in scanned_paths {
-        let path_str = path.to_string_lossy().to_string();
-        // Find song by path in database
-        if let Ok(Some(song)) = db.get_song_by_path(&path_str).await {
-            if let Err(e) = db.add_song_to_playlist(playlist_id, song.id).await {
-                tracing::warn!("Failed to add song {} to playlist: {}", song.id, e);
-            }
-        } else {
-            tracing::warn!("Song not found in database: {}", path_str);
-        }
-    }
-
-    Ok(playlist_id)
-}
-
 /// Sync an existing local-library playlist to the latest import scan.
 pub async fn sync_playlist_from_import(
     db: Arc<Database>,
@@ -379,7 +366,7 @@ pub async fn load_playlist_view(
     playlist_id: i64,
 ) -> Option<crate::app::PlaylistViewPayload> {
     // Get playlist info
-    let playlist = db.get_playlist(playlist_id).await.ok()??;
+    let mut playlist = db.get_playlist(playlist_id).await.ok()??;
     let watched_folder = db
         .get_watched_folder_by_playlist(playlist_id)
         .await
@@ -392,6 +379,8 @@ pub async fn load_playlist_view(
         .await
         .unwrap_or_default();
 
+    restore_playlist_cover(&mut playlist, songs.iter().map(|row| &row.song));
+
     let mut images = Vec::new();
     if let (Ok(id), Some(path)) = (u64::try_from(playlist.id), playlist.cover_path.as_deref())
         && crate::image::is_valid_local_path(path)
@@ -402,16 +391,6 @@ pub async fn load_playlist_view(
             PathBuf::from(path),
         ));
     }
-    images.extend(songs.iter().filter_map(|song| {
-        let path = song.song.cover_path.as_deref()?;
-        if !crate::image::is_valid_local_path(path) {
-            return None;
-        }
-        let (kind, id) =
-            crate::image::song_cover_key_for_source(song.song.id, &song.song.file_path)?;
-        Some((kind, id, PathBuf::from(path)))
-    }));
-
     // Convert to view models
     let song_views: Vec<pages::PlaylistSongView> = songs
         .iter()
@@ -425,7 +404,17 @@ pub async fn load_playlist_view(
                     song.song.id,
                     &song.song.file_path,
                 ),
-                cover_url: None,
+                cover_url: if crate::image::ncm_song_id(song.song.id, &song.song.file_path)
+                    .is_some()
+                {
+                    song.song
+                        .cover_path
+                        .as_deref()
+                        .filter(|p| crate::image::is_remote_url(p))
+                        .map(str::to_owned)
+                } else {
+                    Some(song.song.file_path.clone())
+                },
                 index: i + 1,
                 title: meta.title.clone(),
                 artist: meta.artist.clone(),
@@ -453,11 +442,7 @@ pub async fn load_playlist_view(
         format!("{} 分钟", total_mins)
     };
 
-    // Extract color palette from cover image
-    let palette = playlist
-        .cover_path
-        .as_ref()
-        .and_then(|p| crate::utils::ColorPalette::from_image_path(std::path::Path::new(p)));
+    let palette = None;
 
     let view = pages::PlaylistView {
         kind: pages::playlist::DetailPageKind::Playlist,

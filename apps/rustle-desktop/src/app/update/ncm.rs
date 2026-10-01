@@ -2,7 +2,7 @@
 
 use iced::Task;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::api::{ArtistSummary, LoginInfo, NcmClient, PRIVATE_RADAR_PLAYLIST_ID, PlaylistSummary};
 use crate::app::message::QrLoginStatus;
@@ -330,10 +330,8 @@ impl App {
         if is_daily_recommend {
             self.invalidate_daily_recommend_cover();
         }
-        self.ui.playlist_page.ncm_load_generation =
-            self.ui.playlist_page.ncm_load_generation.wrapping_add(1);
-        let generation = self.ui.playlist_page.ncm_load_generation;
         self.reset_playlist_page_state();
+        let generation = self.ui.playlist_page.ncm_load_generation;
 
         let (name, owner) = if is_daily_recommend {
             let locale = &self.core.locale;
@@ -387,6 +385,10 @@ impl App {
         };
 
         self.ui.playlist_page.current = Some(skeleton_view);
+        self.ui
+            .playlist_page
+            .begin_online_tracks(internal_id, generation);
+        self.ui.playlist_page.ncm_replace_songs_on_chunk = true;
         self.ui.playlist_page.load_state =
             crate::app::update::page_loader::PlaylistLoadState::Loading;
 
@@ -517,6 +519,7 @@ impl App {
 
         debug!("Opening album page: {}", album_id);
         self.reset_playlist_page_state();
+        let generation = self.ui.playlist_page.ncm_load_generation;
 
         let skeleton_view = crate::ui::pages::PlaylistView {
             kind: crate::ui::pages::playlist::DetailPageKind::Album,
@@ -544,6 +547,9 @@ impl App {
         };
 
         self.ui.playlist_page.current = Some(skeleton_view);
+        self.ui
+            .playlist_page
+            .begin_online_tracks(page_id, generation);
         self.ui.playlist_page.load_state =
             crate::app::update::page_loader::PlaylistLoadState::Loading;
 
@@ -551,9 +557,9 @@ impl App {
             let client = client.clone();
             return Task::perform(
                 async move { client.album_detail(album_id).await.ok() },
-                |result| {
+                move |result| {
                     if let Some(detail) = result {
-                        Message::AlbumDetailLoaded(detail)
+                        Message::AlbumDetailLoaded(generation, detail)
                     } else {
                         Message::ShowErrorToast("加载专辑失败".to_string())
                     }
@@ -580,6 +586,7 @@ impl App {
 
         debug!("Opening artist page: {}", artist_id);
         self.reset_playlist_page_state();
+        let generation = self.ui.playlist_page.ncm_load_generation;
 
         let internal_id = artist_page_id(artist_id);
         let skeleton_view = crate::ui::pages::PlaylistView {
@@ -608,6 +615,9 @@ impl App {
         };
 
         self.ui.playlist_page.current = Some(skeleton_view);
+        self.ui
+            .playlist_page
+            .begin_online_tracks(internal_id, generation);
         self.ui.playlist_page.load_state =
             crate::app::update::page_loader::PlaylistLoadState::Loading;
 
@@ -615,9 +625,9 @@ impl App {
             let client = client.clone();
             return Task::perform(
                 async move { client.artist_detail(artist_id).await.ok() },
-                |result| {
+                move |result| {
                     if let Some(detail) = result {
-                        Message::ArtistDetailLoaded(detail)
+                        Message::ArtistDetailLoaded(generation, detail)
                     } else {
                         Message::ShowErrorToast("加载歌手失败".to_string())
                     }
@@ -644,6 +654,7 @@ impl App {
 
         debug!("Opening user page: {}", user_id);
         self.reset_playlist_page_state();
+        let generation = self.ui.playlist_page.ncm_load_generation;
 
         let page_id = user_page_id(user_id);
         let skeleton_view = crate::ui::pages::PlaylistView {
@@ -672,6 +683,9 @@ impl App {
         };
 
         self.ui.playlist_page.current = Some(skeleton_view);
+        self.ui
+            .playlist_page
+            .begin_online_tracks(page_id, generation);
         self.ui.playlist_page.load_state =
             crate::app::update::page_loader::PlaylistLoadState::Loading;
 
@@ -685,9 +699,9 @@ impl App {
                         .ok()
                         .map(|detail| (page_id, detail))
                 },
-                |result| {
+                move |result| {
                     if let Some((page_id, detail)) = result {
-                        Message::UserPageDetailLoaded(page_id, detail)
+                        Message::UserPageDetailLoaded(generation, page_id, detail)
                     } else {
                         Message::ShowErrorToast("加载用户失败".to_string())
                     }
@@ -704,30 +718,62 @@ impl App {
             Message::TryAutoLogin(retry_count) => {
                 let retry = *retry_count;
                 let proxy_url = self.core.settings.network.proxy_url();
-                if let Some(cookie) = NcmClient::load_cookie_from_file() {
-                    let client = NcmClient::from_cookie_with_proxy(cookie, proxy_url);
-                    self.set_ncm_client(client.clone());
+                let client = match NcmClient::from_session_file_with_proxy(proxy_url.clone()) {
+                    Ok(Some(client)) => client,
+                    Ok(None) => NcmClient::with_proxy(proxy_url),
+                    Err(error) => {
+                        tracing::warn!(
+                            error_code = %error.code().as_str(),
+                            "ncm_session_load_failed"
+                        );
+                        NcmClient::with_proxy(proxy_url)
+                    }
+                };
+                let has_authenticated_session = client.has_authenticated_session();
+                self.set_ncm_client(client.clone());
 
+                if has_authenticated_session {
                     Some(Task::perform(
                         async move {
-                            match client.login_status().await {
-                                Ok(login_info) => Some(login_info),
-                                Err(e) => {
-                                    error!("Auto login failed (attempt {}): {:?}", retry + 1, e);
-                                    None
-                                }
+                            let login = client
+                                .authenticated_login_status()
+                                .await
+                                .map_err(crate::error::AppError::from)?;
+                            if let Err(error) = client.refresh_login().await {
+                                tracing::warn!(
+                                    error_code = %error.code().as_str(),
+                                    "ncm_auto_login_refresh_failed"
+                                );
                             }
+                            Ok(login)
                         },
                         move |result| Message::AutoLoginResult(result, retry),
                     ))
                 } else {
-                    self.set_ncm_client(NcmClient::with_proxy(proxy_url));
-                    Some(self.load_discover_data())
+                    Some(Task::perform(
+                        async move {
+                            client
+                                .ensure_anonymous_session()
+                                .await
+                                .map_err(crate::error::AppError::from)
+                        },
+                        Message::AnonymousSessionReady,
+                    ))
                 }
             }
 
-            Message::AutoLoginResult(login_info_opt, retry_count) => {
-                if let Some(login_info) = login_info_opt {
+            Message::AnonymousSessionReady(result) => {
+                if let Err(error) = result {
+                    tracing::warn!(
+                        error_code = %error.code(),
+                        "ncm_anonymous_session_bootstrap_failed"
+                    );
+                }
+                Some(self.load_discover_data())
+            }
+
+            Message::AutoLoginResult(login_result, retry_count) => match login_result {
+                Ok(login_info) => {
                     debug!("Auto login successful: {:?}", login_info);
                     self.core.is_logged_in = true;
 
@@ -765,15 +811,36 @@ impl App {
                         ),
                         self.load_user_playlists(),
                     ]))
-                } else {
+                }
+                Err(error) => {
+                    if error.code() == crate::error::ErrorCode::AuthenticationRequired {
+                        self.core.is_logged_in = false;
+                        self.core.user_info = None;
+                        let Some(client) = self.core.ncm_client.clone() else {
+                            return Some(self.load_discover_data());
+                        };
+                        return Some(Task::perform(
+                            async move {
+                                client
+                                    .invalidate_authenticated_session()
+                                    .map_err(crate::error::AppError::from)?;
+                                client
+                                    .ensure_anonymous_session()
+                                    .await
+                                    .map_err(crate::error::AppError::from)
+                            },
+                            Message::AnonymousSessionReady,
+                        ));
+                    }
                     // Auto login failed - retry up to 3 times
                     const MAX_RETRIES: u8 = 3;
                     let retry = *retry_count;
                     if retry < MAX_RETRIES {
-                        info!(
-                            "Auto login failed, retrying ({}/{})",
-                            retry + 1,
-                            MAX_RETRIES
+                        tracing::warn!(
+                            attempt = retry + 1,
+                            max_attempts = MAX_RETRIES + 1,
+                            error_code = %error.code(),
+                            "ncm_auto_login_retrying"
                         );
                         // Wait 1 seconds before retry
                         Some(Task::perform(
@@ -783,14 +850,15 @@ impl App {
                             move |_| Message::TryAutoLogin(retry + 1),
                         ))
                     } else {
-                        info!(
-                            "Auto login failed after {} retries, keeping cookie for next launch",
-                            MAX_RETRIES
+                        tracing::warn!(
+                            attempts = MAX_RETRIES + 1,
+                            error_code = %error.code(),
+                            "ncm_auto_login_retry_exhausted"
                         );
                         Some(self.load_discover_data())
                     }
                 }
-            }
+            },
 
             Message::RequestQrCode => {
                 self.ui.home.login_popup_open = true;
@@ -948,22 +1016,33 @@ impl App {
             Message::Logout => {
                 if let Some(client) = &self.core.ncm_client {
                     let client = client.clone();
-                    tokio::spawn(async move {
-                        client.logout().await;
-                    });
+                    return Some(Task::perform(
+                        async move { client.logout().await.map_err(crate::error::AppError::from) },
+                        Message::LogoutCompleted,
+                    ));
                 }
 
-                NcmClient::clean_cookie_file();
+                Some(Task::done(Message::LogoutCompleted(Ok(()))))
+            }
+
+            Message::LogoutCompleted(result) => {
                 self.core.is_logged_in = false;
                 self.core.user_info = None;
                 self.ui.home.user_playlists.clear();
-                let proxy_url = self.core.settings.network.proxy_url();
-                self.set_ncm_client(NcmClient::with_proxy(proxy_url));
-
-                Some(Task::batch([
-                    Self::toast_success("已退出登录".to_string()),
-                    self.load_discover_data(),
-                ]))
+                let mut tasks = vec![self.load_discover_data()];
+                match result {
+                    Ok(()) => tasks.push(Self::toast_success("已退出登录".to_string())),
+                    Err(error) => {
+                        tracing::warn!(
+                            error_code = %error.code(),
+                            "ncm_logout_session_finalize_failed"
+                        );
+                        tasks.push(Self::toast_warning(
+                            "已退出登录，但本地会话状态保存失败".to_string(),
+                        ));
+                    }
+                }
+                Some(Task::batch(tasks))
             }
 
             Message::UserInfoLoaded(user_info) => {
@@ -999,9 +1078,13 @@ impl App {
                     Some(Task::perform(
                         async move {
                             match client.like_song(song_id, !is_liked).await {
-                                Ok(_) => Some(!is_liked),
-                                Err(e) => {
-                                    error!("Failed to toggle like: {}", e);
+                                Ok(result) => Some(result.liked),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        song_id,
+                                        error_code = %error.code().as_str(),
+                                        "ncm_like_mutation_failed"
+                                    );
                                     None
                                 }
                             }
@@ -1194,6 +1277,11 @@ impl App {
                     {
                         playlist.songs = cached_views;
                     }
+                    self.ui.playlist_page.replace_online_tracks(
+                        internal_id,
+                        generation,
+                        detail.tracks.clone(),
+                    );
                     self.ui.home.current_ncm_playlist_songs = detail.tracks.clone();
                     self.ui.playlist_page.load_state =
                         crate::app::update::page_loader::PlaylistLoadState::Ready;
@@ -1268,7 +1356,7 @@ impl App {
                     return Some(Task::none());
                 }
 
-                self.ui.playlist_page.ncm_replace_songs_on_chunk = baseline.is_some();
+                self.ui.playlist_page.ncm_replace_songs_on_chunk = true;
                 self.ui.home.current_ncm_playlist_songs.clear();
                 self.ui.playlist_page.load_state =
                     crate::app::update::page_loader::PlaylistLoadState::Loading;
@@ -1432,6 +1520,18 @@ impl App {
                     return Some(Task::none());
                 }
                 if self.ui.playlist_page.ncm_replace_songs_on_chunk {
+                    if !self.ui.playlist_page.replace_online_tracks(
+                        *playlist_id,
+                        *generation,
+                        tracks.clone(),
+                    ) {
+                        tracing::warn!(
+                            page_id = *playlist_id,
+                            generation = *generation,
+                            "playlist_track_owner_rejected_replacement"
+                        );
+                        return Some(Task::none());
+                    }
                     if let Some(playlist) = &mut self.ui.playlist_page.current
                         && playlist.id == *playlist_id
                     {
@@ -1439,6 +1539,17 @@ impl App {
                     }
                     self.ui.home.current_ncm_playlist_songs.clear();
                     self.ui.playlist_page.ncm_replace_songs_on_chunk = false;
+                } else if !self.ui.playlist_page.append_online_tracks(
+                    *playlist_id,
+                    *generation,
+                    tracks,
+                ) {
+                    tracing::warn!(
+                        page_id = *playlist_id,
+                        generation = *generation,
+                        "playlist_track_owner_rejected_append"
+                    );
+                    return Some(Task::none());
                 }
                 self.ui
                     .home
@@ -1478,7 +1589,17 @@ impl App {
                 }
             }
 
-            Message::NcmPlaylistSongsReady(playlist_id, song_views) => {
+            Message::NcmPlaylistSongsReady(generation, playlist_id, song_views) => {
+                if *generation != self.ui.playlist_page.ncm_load_generation
+                    || !self
+                        .ui
+                        .playlist_page
+                        .current
+                        .as_ref()
+                        .is_some_and(|playlist| playlist.id == *playlist_id)
+                {
+                    return Some(Task::none());
+                }
                 let mut song_views = song_views.clone();
 
                 debug!("NCM playlist songs ready: {} songs", song_views.len());
@@ -1508,14 +1629,25 @@ impl App {
                 Some(Task::none())
             }
 
-            Message::AlbumDetailLoaded(detail) => {
+            Message::AlbumDetailLoaded(generation, detail) => {
+                let page_id = album_page_id(detail.id);
+                if *generation != self.ui.playlist_page.ncm_load_generation
+                    || !self
+                        .ui
+                        .playlist_page
+                        .current
+                        .as_ref()
+                        .is_some_and(|playlist| playlist.id == page_id)
+                {
+                    return Some(Task::none());
+                }
+                let generation = *generation;
                 debug!(
                     "Album detail loaded: {} with {} tracks",
                     detail.name,
                     detail.tracks.len()
                 );
 
-                let page_id = album_page_id(detail.id);
                 let total_secs: u64 = detail
                     .tracks
                     .iter()
@@ -1549,6 +1681,11 @@ impl App {
                     playlist.like_count.clear();
                 }
 
+                self.ui.playlist_page.replace_online_tracks(
+                    page_id,
+                    generation,
+                    detail.tracks.clone(),
+                );
                 self.ui.home.current_ncm_playlist_songs = detail.tracks.clone();
 
                 let tracks = detail.tracks.clone();
@@ -1560,20 +1697,33 @@ impl App {
                         .await
                         .unwrap_or_default()
                     },
-                    move |song_views| Message::NcmPlaylistSongsReady(page_id, song_views),
+                    move |song_views| {
+                        Message::NcmPlaylistSongsReady(generation, page_id, song_views)
+                    },
                 );
 
                 Some(tracks_task)
             }
 
-            Message::ArtistDetailLoaded(detail) => {
+            Message::ArtistDetailLoaded(generation, detail) => {
+                let page_id = artist_page_id(detail.id);
+                if *generation != self.ui.playlist_page.ncm_load_generation
+                    || !self
+                        .ui
+                        .playlist_page
+                        .current
+                        .as_ref()
+                        .is_some_and(|playlist| playlist.id == page_id)
+                {
+                    return Some(Task::none());
+                }
+                let generation = *generation;
                 debug!(
                     "Artist detail loaded: {} with {} tracks",
                     detail.name,
                     detail.top_tracks.len()
                 );
 
-                let page_id = artist_page_id(detail.id);
                 let total_secs: u64 = detail.top_tracks.iter().map(|s| s.duration_ms / 1000).sum();
                 let total_mins = total_secs / 60;
                 let total_hours = total_mins / 60;
@@ -1610,6 +1760,11 @@ impl App {
                     playlist.like_count = format!("{} 张专辑", detail.album_count);
                 }
 
+                self.ui.playlist_page.replace_online_tracks(
+                    page_id,
+                    generation,
+                    detail.top_tracks.clone(),
+                );
                 self.ui.home.current_ncm_playlist_songs = detail.top_tracks.clone();
 
                 let tracks = detail.top_tracks.clone();
@@ -1621,7 +1776,9 @@ impl App {
                         .await
                         .unwrap_or_default()
                     },
-                    move |song_views| Message::NcmPlaylistSongsReady(page_id, song_views),
+                    move |song_views| {
+                        Message::NcmPlaylistSongsReady(generation, page_id, song_views)
+                    },
                 );
 
                 let albums_task = if let Some(client) = &self.core.ncm_client {
@@ -1662,8 +1819,19 @@ impl App {
                 Some(Task::none())
             }
 
-            Message::UserPageDetailLoaded(page_id, detail) => {
+            Message::UserPageDetailLoaded(generation, page_id, detail) => {
                 let page_id = *page_id;
+                if *generation != self.ui.playlist_page.ncm_load_generation
+                    || !self
+                        .ui
+                        .playlist_page
+                        .current
+                        .as_ref()
+                        .is_some_and(|playlist| playlist.id == page_id)
+                {
+                    return Some(Task::none());
+                }
+                let generation = *generation;
                 let description = if !detail.signature.trim().is_empty() {
                     Some(detail.signature.clone())
                 } else if detail.artist_id != 0 {
@@ -1705,9 +1873,9 @@ impl App {
                                     .ok()
                                     .map(|detail| (page_id, detail))
                             },
-                            |result| {
+                            move |result| {
                                 if let Some((page_id, detail)) = result {
-                                    Message::UserArtistDetailLoaded(page_id, detail)
+                                    Message::UserArtistDetailLoaded(generation, page_id, detail)
                                 } else {
                                     Message::NoOp
                                 }
@@ -1752,8 +1920,19 @@ impl App {
                 Some(Task::none())
             }
 
-            Message::UserArtistDetailLoaded(page_id, detail) => {
+            Message::UserArtistDetailLoaded(generation, page_id, detail) => {
                 let page_id = *page_id;
+                if *generation != self.ui.playlist_page.ncm_load_generation
+                    || !self
+                        .ui
+                        .playlist_page
+                        .current
+                        .as_ref()
+                        .is_some_and(|playlist| playlist.id == page_id)
+                {
+                    return Some(Task::none());
+                }
+                let generation = *generation;
                 let total_secs: u64 = detail.top_tracks.iter().map(|s| s.duration_ms / 1000).sum();
                 let total_mins = total_secs / 60;
                 let total_hours = total_mins / 60;
@@ -1798,6 +1977,11 @@ impl App {
                     playlist.like_count = format!("{} 张专辑", detail.album_count);
                 }
 
+                self.ui.playlist_page.replace_online_tracks(
+                    page_id,
+                    generation,
+                    detail.top_tracks.clone(),
+                );
                 self.ui.home.current_ncm_playlist_songs = detail.top_tracks.clone();
                 self.ui.playlist_page.load_state =
                     crate::app::update::page_loader::PlaylistLoadState::Ready;
@@ -1811,7 +1995,9 @@ impl App {
                         .await
                         .unwrap_or_default()
                     },
-                    move |song_views| Message::NcmPlaylistSongsReady(page_id, song_views),
+                    move |song_views| {
+                        Message::NcmPlaylistSongsReady(generation, page_id, song_views)
+                    },
                 );
 
                 Some(tracks_task)
@@ -1911,11 +2097,15 @@ impl App {
                     return Some(Task::perform(
                         async move {
                             client
-                                .playlist_add_tracks(pid, &sid.to_string(), "add")
+                                .mutate_playlist_tracks(
+                                    pid,
+                                    &[sid],
+                                    crate::api::PlaylistTrackOperation::Add,
+                                )
                                 .await
                         },
                         move |result| match result {
-                            Ok(()) => Message::NcmPlaylistAddResult(sid, pid, Ok(())),
+                            Ok(_) => Message::NcmPlaylistAddResult(sid, pid, Ok(())),
                             Err(e) => Message::NcmPlaylistAddResult(sid, pid, Err(e.into())),
                         },
                     ));

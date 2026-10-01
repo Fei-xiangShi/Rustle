@@ -35,11 +35,11 @@ pub fn view_body(
             );
             checkbox::Style {
                 background: iced::Background::Color(if is_checked {
-                    theme::ACCENT_PINK
+                    theme::accent(theme)
                 } else {
                     theme::hover_bg_alpha(theme, 0.1)
                 }),
-                icon_color: theme::BLACK,
+                icon_color: theme::black(1.0),
                 border: iced::Border {
                     radius: tokens.size(4.0).into(),
                     width: if is_checked { 0.0 } else { tokens.size(1.0) },

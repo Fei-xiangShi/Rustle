@@ -8,7 +8,7 @@ use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, svg, text, text_input, toggler,
     tooltip,
 };
-use iced::{Alignment, Background, Border, Color, ContentFit, Element, Fill, Length, Padding};
+use iced::{Alignment, Background, Border, ContentFit, Element, Fill, Length, Padding};
 
 use crate::app::{ImageState, Message, SettingsSection};
 use crate::features::{Action, KeyBindings, Settings, ShortcutScope};
@@ -173,7 +173,7 @@ fn tab_bar(
                         .size(tokens.text(TextRole::Body))
                         .style(move |theme| text::Style {
                             color: Some(if is_active {
-                                theme::ACCENT_PINK
+                                theme::accent(theme)
                             } else {
                                 theme::settings_inactive_tab(theme)
                             }),
@@ -204,7 +204,7 @@ fn tab_bar(
                 .width(Fill)
                 .style(move |theme| container::Style {
                     background: Some(Background::Color(if is_active {
-                        theme::ACCENT_PINK
+                        theme::accent(theme)
                     } else {
                         theme::settings_inactive_underline(theme)
                     })),
@@ -366,7 +366,7 @@ fn account_section(
                 .center_x(tokens.target(crate::ui::responsive::TargetRole::Icon))
                 .center_y(tokens.target(crate::ui::responsive::TargetRole::Icon))
                 .style(move |_theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(theme::BORDER_GRAY)),
+                    background: Some(iced::Background::Color(theme::border_color(_theme))),
                     border: iced::Border {
                         radius: tokens.radius(RadiusRole::Large).into(),
                         ..Default::default()
@@ -658,7 +658,7 @@ fn audio_engine_entry_row(locale: Locale, context: ResponsiveContext) -> Element
             button::Style {
                 background: bg,
                 border: Border::default(),
-                text_color: Color::WHITE,
+                text_color: theme::text_primary(theme),
                 ..Default::default()
             }
         })
@@ -986,7 +986,7 @@ where
         .width(Length::Fixed(tokens.size(200.0)))
         .style(move |theme, status| {
             let border_color = match status {
-                text_input::Status::Focused { .. } => theme::ACCENT_PINK,
+                text_input::Status::Focused { .. } => theme::accent(theme),
                 text_input::Status::Hovered => theme::settings_input_border_hover(theme),
                 _ => theme::settings_input_border(theme),
             };
@@ -999,7 +999,7 @@ where
                 },
                 placeholder: theme::settings_desc(theme),
                 value: theme::settings_label(theme),
-                selection: theme::ACCENT_PINK,
+                selection: theme::accent(theme),
             }
         });
 
@@ -1094,7 +1094,7 @@ fn storage_section(
                         theme::secondary_button(theme, status, tokens.theme_metrics())
                     })
                     .height(tokens.target(crate::ui::responsive::TargetRole::Control))
-                    .padding([tokens.space(4.0), tokens.space(12.0)])
+                    .padding([tokens.space(8.0), tokens.space(16.0)])
                     .on_press(Message::UpdateDownloadDirDialog),
                 ]
                 .spacing(tokens.space(8.0))
@@ -1428,7 +1428,9 @@ fn shortcut_cell(
                 .size(tokens.text(TextRole::Label))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .ellipsis(iced::widget::text::Ellipsis::End)
-                .color(theme::ACCENT_PINK),
+                .style(|theme| text::Style {
+                    color: Some(theme::accent(theme)),
+                }),
         )
         .width(Fill)
         .center_x(Fill)
@@ -1438,7 +1440,7 @@ fn shortcut_cell(
             border: Border {
                 radius: tokens.radius(RadiusRole::Small).into(),
                 width: tokens.size(1.0),
-                color: theme::ACCENT_PINK,
+                color: theme::accent(theme),
             },
             ..Default::default()
         })
@@ -1470,9 +1472,9 @@ fn shortcut_cell(
     let edit_button = button(shortcut_display)
         .width(Fill)
         .padding(0)
-        .style(|_, _| button::Style {
+        .style(|theme, _| button::Style {
             background: None,
-            text_color: Color::WHITE,
+            text_color: theme::text_primary(theme),
             border: Border::default(),
             ..Default::default()
         })

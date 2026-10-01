@@ -438,6 +438,21 @@ async fn download_audio_streaming(
     direction: PreloadDirection,
     identity: PreloadIdentity,
 ) -> Message {
+    let cancellation = identity.cancellation.clone();
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Message::PreloadAudioFailed(idx, direction, identity.clone()),
+        result = download_audio_streaming_inner(client, idx, song, direction, identity.clone()) => result,
+    }
+}
+
+async fn download_audio_streaming_inner(
+    client: Arc<NcmClient>,
+    idx: usize,
+    song: DbSong,
+    direction: PreloadDirection,
+    identity: PreloadIdentity,
+) -> Message {
     let ncm_id = super::song_resolver::get_ncm_id(&song);
 
     tracing::info!(
@@ -472,7 +487,7 @@ async fn download_audio_streaming(
                 url,
                 cache_path,
                 cache_key,
-                crate::cache::audio_cache_store(),
+                crate::cache::tagged_audio_cache_store(client.clone(), &song),
                 quality.bitrate,
                 StreamingIdentity::Preload(identity.clone()),
                 None,
@@ -485,6 +500,15 @@ async fn download_audio_streaming(
     // after the first startup watermark. The audio thread rechecks the same
     // buffer before promotion and rejects Ready-then-failed preloads.
     if wait_for_buffer_playable(&shared_buffer, 30).await {
+        if let Some(path) = shared_buffer.finalized_cache_path() {
+            return Message::PreloadReady(
+                idx,
+                path.to_string_lossy().into_owned(),
+                direction,
+                Some(quality),
+                identity,
+            );
+        }
         tracing::info!(
             "Preload: returning SharedBuffer for song {} (downloaded: {} bytes)",
             ncm_id,

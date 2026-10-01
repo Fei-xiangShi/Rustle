@@ -96,7 +96,7 @@ impl OverlayEntry {
 // ============================================================================
 
 fn backdrop_color() -> Color {
-    Color::from_rgba(0.0, 0.0, 0.0, 0.6)
+    rustle_ui::theme::black(0.6)
 }
 
 /// Prevent pointer interaction from reaching layers below an overlay.
@@ -370,7 +370,7 @@ pub fn modal_view<'a>(
                     radius: Radius::new(border_radius),
                 },
                 shadow: Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                    color: rustle_ui::theme::black(0.4),
                     offset: iced::Vector::new(0.0, tokens.size(8.0)),
                     blur_radius: tokens.size(32.0),
                 },

@@ -75,11 +75,6 @@ impl App {
                 Some(Task::none())
             }
 
-            Message::PlayHero => {
-                tracing::info!("Playing Global Hits 2024");
-                Some(Task::none())
-            }
-
             Message::ImportLocalPlaylist => {
                 tracing::info!("Import local playlist");
                 Some(Task::perform(open_folder_dialog(), Message::FolderSelected))

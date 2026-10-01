@@ -217,7 +217,20 @@ pub fn view(props: PlayerBarView<'_>) -> Element<'static, Message> {
     let current_song = current_song.cloned();
     let current_artists = current_artists.to_vec();
     let current_song_cover = current_song_cover.cloned();
-    let current_quality = current_quality.cloned();
+    // Resolved quality is also retained for cached playback, but the player
+    // bar only exposes it for online songs.
+    let current_quality = current_quality
+        .filter(|_| {
+            current_song.as_ref().is_some_and(|song| {
+                utils::compute_source(
+                    &song.file_path,
+                    song.id,
+                    Some(&song.artist),
+                    Some(&song.title),
+                ) == utils::Source::Online
+            })
+        })
+        .cloned();
     let tokens = context.tokens;
     let bar_height = tokens.chrome(ChromeRole::PlayerBar);
     let prefer_vertical_volume = context.profile.is_compact();
@@ -450,10 +463,7 @@ fn build_song_info(
 
     let expand_overlay = widgets::hover_surface(Space::new().width(cover_px).height(cover_px))
         .style(move |_theme, progress| iced::widget::container::Style {
-            background: Some(iced::Background::Color(Color::from_rgba(
-                0.0,
-                0.0,
-                0.0,
+            background: Some(iced::Background::Color(rustle_ui::theme::black(
                 0.58 * progress,
             ))),
             border: iced::Border {
@@ -535,7 +545,7 @@ fn build_song_info(
         artist_items.push(
             metadata_text(quality.actual.short_name().to_string())
                 .style(|_theme| text::Style {
-                    color: Some(theme::ACCENT),
+                    color: Some(theme::accent(_theme)),
                 })
                 .into(),
         );

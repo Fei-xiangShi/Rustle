@@ -452,7 +452,7 @@ impl canvas::Program<Message> for EqCurve {
         let height = bounds.height;
 
         // Draw horizontal grid lines (subtle)
-        let grid_color = Color::from_rgba(1.0, 1.0, 1.0, 0.08);
+        let grid_color = theme::text_muted(_theme).scale_alpha(0.08);
         for i in 0..=4 {
             let y = height * (i as f32 / 4.0);
             let line = Path::line(Point::new(0.0, y), Point::new(width, y));
@@ -470,7 +470,7 @@ impl canvas::Program<Message> for EqCurve {
         frame.stroke(
             &center_line,
             Stroke::default()
-                .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.15))
+                .with_color(theme::text_muted(_theme).scale_alpha(0.15))
                 .with_width(self.tokens.size(1.0)),
         );
 
@@ -478,7 +478,7 @@ impl canvas::Program<Message> for EqCurve {
         let points = self.calculate_curve_points(width, height);
 
         // Draw gradient fill under the curve
-        self.draw_gradient_fill(&mut frame, &points, width, height);
+        self.draw_gradient_fill(&mut frame, &points, width, height, _theme);
 
         // Draw the main curve line
         if points.len() >= 2 {
@@ -492,7 +492,7 @@ impl canvas::Program<Message> for EqCurve {
             frame.stroke(
                 &curve,
                 Stroke::default()
-                    .with_color(theme::ACCENT_PINK)
+                    .with_color(theme::accent(_theme))
                     .with_width(self.tokens.size(2.0)),
             );
         }
@@ -546,7 +546,14 @@ impl EqCurve {
     }
 
     /// Draw gradient fill from curve to bottom with fade effect
-    fn draw_gradient_fill(&self, frame: &mut Frame, points: &[Point], _width: f32, height: f32) {
+    fn draw_gradient_fill(
+        &self,
+        frame: &mut Frame,
+        points: &[Point],
+        _width: f32,
+        height: f32,
+        theme: &Theme,
+    ) {
         if points.len() < 2 {
             return;
         }
@@ -581,7 +588,7 @@ impl EqCurve {
                 builder.close();
             });
 
-            let fill_color = Color::from_rgba(0.95, 0.3, 0.5, alpha);
+            let fill_color = theme::accent(theme).scale_alpha(alpha);
             frame.fill(&fill_path, fill_color);
         }
     }
@@ -626,7 +633,7 @@ impl canvas::Program<Message> for VolumeMeter {
             builder.line_to(Point::new(0.0, height));
             builder.close();
         });
-        frame.fill(&bg_rect, Color::from_rgba(1.0, 1.0, 1.0, 0.1));
+        frame.fill(&bg_rect, theme::text_muted(_theme).scale_alpha(0.1));
 
         // Level indicator (from bottom up)
         // Draw level with gradient colors (green -> yellow -> red)
@@ -648,13 +655,13 @@ impl canvas::Program<Message> for VolumeMeter {
             // Color based on level: green (low) -> yellow (mid) -> red (high)
             let color = if seg_level < 0.6 {
                 // Green zone
-                theme::spectrum_green()
+                theme::success(_theme)
             } else if seg_level < 0.85 {
                 // Yellow zone
-                theme::spectrum_yellow()
+                theme::warning(_theme)
             } else {
                 // Red zone
-                theme::spectrum_red()
+                theme::danger(_theme)
             };
 
             let seg_rect = Path::new(|builder| {
@@ -724,11 +731,11 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
             builder.line_to(Point::new(left_margin, top_margin + graph_height));
             builder.close();
         });
-        frame.fill(&bg_rect, Color::from_rgba(0.0, 0.0, 0.0, 0.3));
+        frame.fill(&bg_rect, rustle_ui::theme::black(0.3));
 
         // Draw horizontal grid lines (dB levels)
-        let grid_color = Color::from_rgba(1.0, 1.0, 1.0, 0.08);
-        let zero_db_color = Color::from_rgba(1.0, 1.0, 1.0, 0.2);
+        let grid_color = theme::text_muted(_theme).scale_alpha(0.08);
+        let zero_db_color = theme::text_muted(_theme).scale_alpha(0.2);
 
         for &(db, label) in &SPECTRUM_DB_LABELS {
             let y = top_margin + ((db_max - db as f32) / db_range) * graph_height;
@@ -748,7 +755,7 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
             let text = Text {
                 content: label.to_string(),
                 position: Point::new(left_margin - self.tokens.size(8.0), y),
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
+                color: theme::text_muted(_theme),
                 size: iced::Pixels(self.tokens.size(10.0)),
                 align_x: iced::alignment::Horizontal::Right.into(),
                 align_y: iced::alignment::Vertical::Center,
@@ -775,7 +782,7 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
             let text = Text {
                 content: label.to_string(),
                 position: Point::new(x, top_margin + graph_height + self.tokens.size(12.0)),
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
+                color: theme::text_muted(_theme),
                 size: iced::Pixels(self.tokens.size(10.0)),
                 align_x: iced::alignment::Horizontal::Center.into(),
                 align_y: iced::alignment::Vertical::Top,
@@ -803,7 +810,7 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
                         continue;
                     }
 
-                    let color = db_to_color(db);
+                    let color = db_to_color(db, _theme);
                     let bar = Path::new(|builder| {
                         builder.move_to(Point::new(x, top_margin + graph_height));
                         builder.line_to(Point::new(x, y));
@@ -832,7 +839,7 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
                         ));
                         builder.close();
                     });
-                    frame.fill(&fill_path, Color::from_rgba(0.9, 0.3, 0.5, 0.3));
+                    frame.fill(&fill_path, theme::accent(_theme).scale_alpha(0.3));
 
                     // Draw curve line
                     let curve = Path::new(|builder| {
@@ -854,7 +861,7 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
                     frame.stroke(
                         &curve,
                         Stroke::default()
-                            .with_color(theme::ACCENT_PINK)
+                            .with_color(theme::accent(_theme))
                             .with_width(self.tokens.size(2.0)),
                     );
                 }
@@ -869,7 +876,7 @@ impl canvas::Program<Message> for SpectrumAnalyzer {
                 left_margin + graph_width - self.tokens.size(4.0),
                 top_margin + graph_height - self.tokens.size(4.0),
             ),
-            color: Color::from_rgba(1.0, 1.0, 1.0, 0.35),
+            color: theme::text_muted(_theme),
             size: iced::Pixels(self.tokens.size(10.0)),
             align_x: iced::alignment::Horizontal::Right.into(),
             align_y: iced::alignment::Vertical::Bottom,
@@ -900,24 +907,9 @@ fn freq_to_x(freq: f32, width: f32) -> f32 {
     x * width
 }
 
-/// Convert dB value to color (gradient from dark blue to pink/red)
-fn db_to_color(db: f32) -> Color {
-    // Normalize to 0-1 range (-60dB to +12dB)
-    let t = ((db + 60.0) / 72.0).clamp(0.0, 1.0);
-
-    if t < 0.5 {
-        // Low levels: dark blue to cyan
-        let s = t * 2.0;
-        Color::from_rgba(0.1 + s * 0.2, 0.2 + s * 0.4, 0.4 + s * 0.3, 0.7)
-    } else if t < 0.8 {
-        // Mid levels: cyan to pink
-        let s = (t - 0.5) / 0.3;
-        Color::from_rgba(0.3 + s * 0.6, 0.6 - s * 0.2, 0.7 - s * 0.2, 0.8)
-    } else {
-        // High levels: pink to red (hot)
-        let s = (t - 0.8) / 0.2;
-        Color::from_rgba(0.9 + s * 0.05, 0.4 - s * 0.2, 0.5 - s * 0.3, 0.9)
-    }
+/// Semantic intensity ramp: blue/teal through warning amber to overload red.
+fn db_to_color(db: f32, theme: &Theme) -> Color {
+    theme::palette::meter(theme, (db + 60.0) / 72.0)
 }
 
 // ============================================================================
@@ -954,7 +946,7 @@ fn sliders_with_preamp(
             .size(tokens.text(TextRole::Micro))
             .style(move |theme| text::Style {
                 color: Some(if preamp != 0.0 {
-                    theme::ACCENT_PINK
+                    theme::accent(theme)
                 } else {
                     theme::settings_value(theme)
                 })
@@ -1032,7 +1024,7 @@ fn vertical_slider_band(
             .size(tokens.text(TextRole::Micro))
             .style(move |theme| text::Style {
                 color: Some(if value != 0.0 {
-                    theme::ACCENT_PINK
+                    theme::accent(theme)
                 } else {
                     theme::settings_value(theme)
                 })
@@ -1127,7 +1119,7 @@ where
             .size(tokens.text(TextRole::Micro))
             .style(move |theme| text::Style {
                 color: Some(if value != 0.0 {
-                    theme::ACCENT_PINK
+                    theme::accent(theme)
                 } else {
                     theme::settings_value(theme)
                 }),
