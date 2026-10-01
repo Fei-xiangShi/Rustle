@@ -1,3 +1,5 @@
 //! Compatibility facade for shared panic-containment helpers.
 
-pub(crate) use rustle_observability::runtime::{catch_ffi_unwind, spawn_guarded};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) use rustle_observability::runtime::catch_ffi_unwind;
+pub(crate) use rustle_observability::runtime::spawn_guarded;
