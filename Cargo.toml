@@ -16,7 +16,7 @@ default-members = ["apps/rustle-desktop"]
 resolver = "3"
 
 [workspace.package]
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 rust-version = "1.98.0"
 authors = ["Fei_xiangShi"]
