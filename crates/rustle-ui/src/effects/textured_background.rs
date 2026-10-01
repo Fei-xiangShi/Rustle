@@ -64,7 +64,7 @@ impl Default for MeshUniforms {
 }
 
 /// WGSL Shader - 完整实现 mesh.vert.glsl + mesh.frag.glsl
-const MESH_SHADER: &str = r#"
+pub(super) const MESH_SHADER: &str = r#"
 struct Uniforms {
     time: f32,
     volume: f32,
@@ -134,22 +134,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     
     var result = textureSample(t_texture, s_texture, clamp(final_uv, vec2f(0.0), vec2f(1.0)));
     
-    // 一致: alphaVolumeFactor = u_alpha * max(0.5, 1.0 - u_volume * 0.5)
-    let alpha_volume_factor = uniforms.alpha * max(0.5, 1.0 - uniforms.volume * 0.5);
-    
-    // 一致: result.rgb *= v_color * alphaVolumeFactor; result.a *= alphaVolumeFactor;
-    result = vec4f(result.rgb * in.color * alpha_volume_factor, result.a * alpha_volume_factor);
-    
-    // Dithering
-    result = vec4f(result.rgb + vec3f(dither), result.a);
-    
-    // Vignette 效果
+    // The sRGB texture is already decoded to linear RGB by textureSample.
+    // Mesh white modulation is a linear identity; opacity is straight alpha.
+    let volume_brightness = max(0.5, 1.0 - uniforms.volume * 0.5);
     let dist = distance(in.uv, vec2f(0.5));
-    let vignette = smoothstep(0.8, 0.3, dist);
-    let mask = 0.6 + vignette * 0.4;
-    result = vec4f(result.rgb * mask, result.a);
-    
-    return result;
+    let mask = 0.6 + (1.0 - smoothstep(0.3, 0.8, dist)) * 0.4;
+    return color_output(result.rgb * in.color * volume_brightness * mask,
+                        result.a * uniforms.alpha, dither);
 }
 "#;
 
@@ -331,7 +322,10 @@ impl shader::Pipeline for MeshGradientPipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Mesh Gradient Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(MESH_SHADER)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(super::color_shader(
+                MESH_SHADER,
+                format,
+            ))),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -542,11 +536,11 @@ fn extract_mesh_colors(
 
 /// 默认背景色 - 用于没有封面时的默认背景
 /// 使用柔和的蓝灰色渐变，减少紫色
-const DEFAULT_BG_COLORS: [[f32; 3]; 4] = [
-    [0.35, 0.40, 0.50], // 蓝灰色 (左上)
-    [0.30, 0.45, 0.55], // 天蓝色 (右上)
-    [0.25, 0.30, 0.40], // 深蓝灰 (左下)
-    [0.20, 0.22, 0.30], // 暗蓝灰 (右下)
+const DEFAULT_BG_COLORS: [crate::color::Oklcha; 4] = [
+    crate::color::Oklcha::new(0.36, 0.045, 185.0, 1.0),
+    crate::color::Oklcha::new(0.40, 0.055, 210.0, 1.0),
+    crate::color::Oklcha::new(0.28, 0.035, 230.0, 1.0),
+    crate::color::Oklcha::new(0.23, 0.025, 185.0, 1.0),
 ];
 
 /// Textured Background Program
@@ -590,6 +584,7 @@ impl TexturedBackgroundProgram {
         let size = 512u32;
         let mut pixels = Vec::with_capacity((size * size * 4) as usize);
 
+        let corners = DEFAULT_BG_COLORS.map(|color| color.lab());
         for y in 0..size {
             for x in 0..size {
                 // 使用双线性插值在四个角的颜色之间过渡
@@ -597,10 +592,10 @@ impl TexturedBackgroundProgram {
                 let fy = y as f32 / (size - 1) as f32;
 
                 // 四角颜色
-                let tl = DEFAULT_BG_COLORS[0]; // 左上
-                let tr = DEFAULT_BG_COLORS[1]; // 右上
-                let bl = DEFAULT_BG_COLORS[2]; // 左下
-                let br = DEFAULT_BG_COLORS[3]; // 右下
+                let tl = corners[0]; // 左上
+                let tr = corners[1]; // 右上
+                let bl = corners[2]; // 左下
+                let br = corners[3]; // 右下
 
                 // 使用平滑的 smoothstep 插值
                 let sx = fx * fx * (3.0 - 2.0 * fx);
@@ -623,11 +618,8 @@ impl TexturedBackgroundProgram {
                     top[2] * (1.0 - sy) + bottom[2] * sy,
                 ];
 
-                // 纯净渐变，无噪点
-                pixels.push((color[0].clamp(0.0, 1.0) * 255.0) as u8);
-                pixels.push((color[1].clamp(0.0, 1.0) * 255.0) as u8);
-                pixels.push((color[2].clamp(0.0, 1.0) * 255.0) as u8);
-                pixels.push(255u8); // Alpha
+                // Oklab interpolation above; encode only at the texture boundary.
+                pixels.extend_from_slice(&crate::color::lab_color(color, 1.0).into_rgba8());
             }
         }
 
@@ -669,9 +661,21 @@ impl TexturedBackgroundProgram {
             return false;
         }
 
-        tracing::info!("Processing new background image...");
-
         let processed = process_image_for_background(&image, 32);
+        // Different cover derivatives/paths can produce the same background.
+        // Also reuse a still-retained texture after a transient clear; rebuilding
+        // would randomize the mesh and restart the fade for identical pixels.
+        if self.mesh_states.last().is_some_and(|state| {
+            state.image.width == processed.width
+                && state.image.height == processed.height
+                && state.image.data == processed.data
+        }) {
+            self.current_image_path = path_key;
+            self.has_cover = true;
+            return false;
+        }
+
+        tracing::debug!("Creating background texture for changed image content");
 
         let preset = choose_control_point_preset();
         let colors = extract_mesh_colors(&processed, preset.width, preset.height);
@@ -814,5 +818,45 @@ impl<Message> shader::Program<Message> for TexturedBackgroundProgram {
         bounds: Rectangle,
     ) -> Self::Primitive {
         self.primitive(bounds.width / bounds.height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_background_reuses_texture_across_paths_and_transient_clear() {
+        let mut program = TexturedBackgroundProgram::new();
+        let cover = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            64,
+            64,
+            image::Rgba([200, 40, 60, 255]),
+        ));
+        assert!(program.set_album_image(cover.clone(), Some("thumbnail".into())));
+        let texture = program.mesh_states[0].texture_id;
+        let mesh = program.mesh_states[0].mesh.clone();
+        assert!(!program.set_album_image(cover.clone(), Some("hero".into())));
+        assert_eq!(program.mesh_states.len(), 1);
+        assert_eq!(program.mesh_states[0].texture_id, texture);
+        assert!(Arc::ptr_eq(&mesh, &program.mesh_states[0].mesh));
+        assert!(program.is_same_image(std::path::Path::new("hero")));
+
+        program.clear_cover();
+        program.update(100.0);
+        let alpha = program.mesh_states[0].alpha;
+        assert!(!program.set_album_image(cover, Some("refreshed".into())));
+        assert_eq!(program.mesh_states[0].texture_id, texture);
+        assert_eq!(program.mesh_states[0].alpha, alpha);
+        assert!(program.has_cover);
+
+        let changed = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            64,
+            64,
+            image::Rgba([40, 200, 60, 255]),
+        ));
+        assert!(program.set_album_image(changed, Some("new-song".into())));
+        assert_ne!(program.mesh_states.last().unwrap().texture_id, texture);
+        assert_eq!(program.mesh_states.len(), 2);
     }
 }

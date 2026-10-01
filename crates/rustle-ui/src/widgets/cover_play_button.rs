@@ -54,7 +54,7 @@ pub fn view<'a, Message: Clone + 'a>(
                     ..Default::default()
                 },
                 shadow: iced::Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.30 * reveal),
+                    color: crate::theme::black(0.30 * reveal),
                     offset: iced::Vector::new(0.0, tokens.size(4.0)),
                     blur_radius: tokens.size(8.0),
                 },
@@ -67,8 +67,8 @@ pub fn view<'a, Message: Clone + 'a>(
 
 fn play_background(reveal_progress: f32, hover_progress: f32) -> Color {
     let reveal = reveal_progress.clamp(0.0, 1.0);
-    let idle = Color::from_rgba(0.42, 0.43, 0.46, 0.66 * reveal);
-    let hovered = Color::from_rgba(0.58, 0.59, 0.62, 0.78 * reveal);
+    let idle = crate::theme::decoration::artwork_button(false).scale_alpha(0.66 * reveal);
+    let hovered = crate::theme::decoration::artwork_button(true).scale_alpha(0.78 * reveal);
     theme::lerp_color(idle, hovered, hover_progress)
 }
 

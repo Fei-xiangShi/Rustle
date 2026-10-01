@@ -53,16 +53,17 @@ where
             let fallback_color = if size == SliderSize::Full {
                 Color::WHITE
             } else {
-                theme::ACCENT_PINK
+                theme::accent(iced_theme)
             };
             let played_background = played_gradient.map_or(
                 iced::Background::Color(fallback_color),
                 |[light, middle, dark]| {
                     iced::Background::Gradient(iced::Gradient::Linear(
-                        iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
-                            .add_stop(0.0, light)
-                            .add_stop(0.5, middle)
-                            .add_stop(1.0, dark),
+                        crate::color::gradient_three(
+                            std::f32::consts::FRAC_PI_2,
+                            [light, middle, dark],
+                            0.5,
+                        ),
                     ))
                 },
             );
@@ -83,9 +84,9 @@ where
                         }),
                     ),
                     // Downloaded but not played - slightly brighter than background
-                    secondary_background: Some(iced::Background::Color(Color::from_rgba(
-                        0.6, 0.6, 0.6, 0.5,
-                    ))),
+                    secondary_background: Some(iced::Background::Color(
+                        theme::text_muted(iced_theme).scale_alpha(0.5),
+                    )),
                     width: tokens.size(4.0),
                     border: iced::Border {
                         radius: tokens.size(rail_radius).into(),
@@ -114,7 +115,7 @@ fn colors_light_to_dark(mut colors: [Color; 3]) -> [Color; 3] {
 }
 
 fn perceived_brightness(color: Color) -> f32 {
-    color.r * 0.299 + color.g * 0.587 + color.b * 0.114
+    crate::color::Oklcha::from_color(color).lightness()
 }
 
 /// Build a horizontal volume slider using shared root-rem tokens.

@@ -500,10 +500,12 @@ fn default_style(_theme: &Theme, _status: Status, tokens: UiTokens) -> Style {
     Style {
         rail: Rail {
             backgrounds: (
-                Background::Color(Color::from_rgb(0.8, 0.2, 0.5)),
-                Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.1)),
+                Background::Color(crate::theme::accent(_theme)),
+                Background::Color(crate::theme::divider(_theme)),
             ),
-            secondary_background: Some(Background::Color(Color::from_rgba(0.5, 0.5, 0.5, 0.4))),
+            secondary_background: Some(Background::Color(
+                crate::theme::text_muted(_theme).scale_alpha(0.4),
+            )),
             width: tokens.size(4.0),
             border: Border {
                 radius: tokens.size(2.0).into(),
@@ -515,7 +517,7 @@ fn default_style(_theme: &Theme, _status: Status, tokens: UiTokens) -> Style {
             shape: HandleShape::Circle {
                 radius: tokens.size(6.0),
             },
-            background: Background::Color(Color::from_rgb(0.8, 0.2, 0.5)),
+            background: Background::Color(crate::theme::accent(_theme)),
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
         },

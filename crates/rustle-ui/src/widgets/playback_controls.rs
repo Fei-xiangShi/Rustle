@@ -167,7 +167,7 @@ pub fn prev_button<M: Clone + 'static>(
             .height(icon_size)
             .style(move |_theme, _status| svg::Style {
                 color: Some(if disabled {
-                    theme::opaque_color(theme::TEXT_DISABLED)
+                    theme::opaque_color(theme::disabled(_theme))
                 } else {
                     theme::text_secondary(_theme)
                 }),
@@ -272,7 +272,7 @@ pub fn favorite_button<M: Clone + 'static>(
                 color: Some(if !enabled {
                     theme::opaque_color(theme::icon_muted(theme))
                 } else if is_liked {
-                    theme::ACCENT_PINK
+                    theme::accent(theme)
                 } else {
                     theme::text_secondary(theme)
                 }),

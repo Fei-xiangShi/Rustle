@@ -73,7 +73,7 @@ pub fn view<'a, Message: Clone + 'a>(
         top = top.push(Space::new().width(Fill)).push(
             text(badge)
                 .size(tokens.text(TextRole::Display))
-                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.72))
+                .color(crate::theme::white(0.92))
                 .font(iced::Font::DEFAULT.weight(theme::BOLD_WEIGHT)),
         );
     }
@@ -101,7 +101,7 @@ pub fn view<'a, Message: Clone + 'a>(
     let bottom = row![
         text(subtitle)
             .size(tokens.text(TextRole::Body))
-            .color(Color::from_rgba(1.0, 1.0, 1.0, 0.82)),
+            .color(crate::theme::white(0.92)),
         Space::new().width(Fill),
         play,
     ]
@@ -139,9 +139,7 @@ pub fn view<'a, Message: Clone + 'a>(
 fn gradient_style(colors: (Color, Color), radius: f32) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(iced::Background::Gradient(iced::Gradient::Linear(
-            iced::gradient::Linear::new(std::f32::consts::PI * 0.82)
-                .add_stop(0.0, colors.0)
-                .add_stop(1.0, colors.1),
+            crate::color::gradient(std::f32::consts::PI * 0.82, colors.0, colors.1),
         ))),
         border: iced::Border {
             radius: radius.into(),
@@ -155,8 +153,8 @@ fn scrim_style(radius: f32) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(iced::Background::Gradient(iced::Gradient::Linear(
             iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
-                .add_stop(0.0, Color::from_rgba(0.0, 0.0, 0.0, 0.1))
-                .add_stop(1.0, Color::from_rgba(0.0, 0.0, 0.0, 0.62)),
+                .add_stop(0.0, crate::theme::black(0.1))
+                .add_stop(1.0, crate::theme::black(0.62)),
         ))),
         border: iced::Border {
             radius: radius.into(),
@@ -177,7 +175,7 @@ fn shadow_style(
             ..Default::default()
         },
         shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.22 + 0.14 * hover_progress),
+            color: crate::theme::black(0.22 + 0.14 * hover_progress),
             offset: iced::Vector::new(0.0, tokens.size(5.0 + 3.0 * hover_progress)),
             blur_radius: tokens.size(18.0 + 8.0 * hover_progress),
         },

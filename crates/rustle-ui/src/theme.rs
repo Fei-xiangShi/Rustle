@@ -1,10 +1,12 @@
 //! Theme system for the music streaming application
 //! Supports both dark and light modes with consistent color palette
 
-use iced::color;
 use iced::font::Weight;
 use iced::widget::{button, container, pick_list, scrollable};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
+pub mod decoration;
+pub mod palette;
+pub use palette::{application, colors};
 
 /// Bold UI weight tuned for the native platform's default sans-serif family.
 #[cfg(target_os = "macos")]
@@ -65,24 +67,7 @@ pub struct ThemeMetrics {
 
 /// Check if theme is dark mode
 fn is_dark(theme: &Theme) -> bool {
-    matches!(
-        theme,
-        Theme::Dark
-            | Theme::Dracula
-            | Theme::Nord
-            | Theme::SolarizedDark
-            | Theme::GruvboxDark
-            | Theme::CatppuccinMocha
-            | Theme::TokyoNight
-            | Theme::TokyoNightStorm
-            | Theme::TokyoNightLight
-            | Theme::KanagawaWave
-            | Theme::KanagawaDragon
-            | Theme::KanagawaLotus
-            | Theme::Moonfly
-            | Theme::Nightfly
-            | Theme::Oxocarbon
-    )
+    theme.palette().is_dark
 }
 
 /// Public function to check if theme is dark mode
@@ -90,38 +75,9 @@ pub fn is_dark_theme(theme: &Theme) -> bool {
     is_dark(theme)
 }
 
-// Dark mode colors
-mod dark {
-    use super::*;
-    pub const BACKGROUND: Color = color!(0x000000);
-    pub const SIDEBAR: Color = color!(0x121212);
-    pub const SURFACE: Color = color!(0x1a1a1a);
-    pub const BORDER: Color = color!(0x282828);
-    pub const SURFACE_LIGHT: Color = color!(0x333333);
-    pub const TEXT_MUTED: Color = color!(0x888888);
-    pub const TEXT_SECONDARY: Color = color!(0xb3b3b3);
-    pub const TEXT_PRIMARY: Color = color!(0xffffff);
-}
-
-// Light mode colors
-mod light {
-    use super::*;
-    pub const BACKGROUND: Color = color!(0xffffff);
-    pub const SIDEBAR: Color = color!(0xf5f5f5);
-    pub const SURFACE: Color = color!(0xeeeeee);
-    pub const BORDER: Color = color!(0xdddddd);
-    pub const TEXT_MUTED: Color = color!(0x777777);
-    pub const TEXT_SECONDARY: Color = color!(0x555555);
-    pub const TEXT_PRIMARY: Color = color!(0x1a1a1a);
-}
-
 /// Get background color based on theme
 pub fn background(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::BACKGROUND
-    } else {
-        light::BACKGROUND
-    }
+    colors(theme).canvas
 }
 
 /// Translucent background used by the fixed top-bar overlay.
@@ -133,56 +89,32 @@ pub fn top_bar_background(theme: &Theme) -> Color {
 
 /// Get sidebar color based on theme
 pub fn sidebar_bg(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::SIDEBAR
-    } else {
-        light::SIDEBAR
-    }
+    colors(theme).sidebar
 }
 
 /// Get surface color based on theme
 pub fn surface(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::SURFACE
-    } else {
-        light::SURFACE
-    }
+    colors(theme).surface
 }
 
 /// Get border color based on theme
 pub fn border_color(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::BORDER
-    } else {
-        light::BORDER
-    }
+    colors(theme).border
 }
 
 /// Get muted text color based on theme
 pub fn text_muted(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::TEXT_MUTED
-    } else {
-        light::TEXT_MUTED
-    }
+    colors(theme).muted
 }
 
 /// Get secondary text color based on theme
 pub fn text_secondary(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::TEXT_SECONDARY
-    } else {
-        light::TEXT_SECONDARY
-    }
+    colors(theme).secondary
 }
 
 /// Get primary text color based on theme
 pub fn text_primary(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        dark::TEXT_PRIMARY
-    } else {
-        light::TEXT_PRIMARY
-    }
+    colors(theme).text
 }
 
 /// Return the RGB portion of a color without carrying its alpha channel.
@@ -192,41 +124,37 @@ pub fn text_primary(theme: &Theme) -> Color {
 /// use this for the tint and the SVG widget's `opacity` field for alpha.
 #[inline]
 pub fn opaque_color(color: Color) -> Color {
-    Color::from_rgb(color.r, color.g, color.b)
+    crate::color::with_alpha(color, 1.0)
 }
 
-// Legacy constants for backward compatibility (dark mode defaults)
-pub const BLACK: Color = dark::BACKGROUND;
-pub const BORDER_GRAY: Color = dark::BORDER;
-pub const SURFACE_LIGHT: Color = dark::SURFACE_LIGHT;
-pub const TEXT_MUTED: Color = dark::TEXT_MUTED;
-pub const TEXT_SECONDARY: Color = dark::TEXT_SECONDARY;
-pub const TEXT_PRIMARY: Color = dark::TEXT_PRIMARY;
-/// Disabled text color (for inactive buttons)
-pub const TEXT_DISABLED: Color = Color::from_rgba(0.5, 0.5, 0.5, 0.5);
-
-/// Neon pink accent color (same for both modes)
-pub const ACCENT_PINK: Color = color!(0xff1493);
-
-/// Hover state for accent
-pub const ACCENT_PINK_HOVER: Color = color!(0xff69b4);
-
-/// Primary accent color
-pub const ACCENT: Color = color!(0x1e90ff);
-
-/// Hover state for primary accent
-pub const ACCENT_HOVER: Color = color!(0x4169e1);
-
-/// Surface secondary color
-pub const SURFACE_SECONDARY: Color = color!(0x1a1a1a);
+/// Theme-resolved cyan-teal brand and paired foreground.
+pub fn accent(theme: &Theme) -> Color {
+    colors(theme).accent
+}
+pub fn accent_hover(theme: &Theme) -> Color {
+    colors(theme).accent_hover
+}
+pub fn on_accent(theme: &Theme) -> Color {
+    colors(theme).on_accent
+}
+pub fn accent_subtle(theme: &Theme) -> Color {
+    colors(theme).accent_subtle
+}
+pub fn disabled(theme: &Theme) -> Color {
+    text_muted(theme).scale_alpha(0.5)
+}
+/// Neutral OKLCH endpoint L=1, for artwork foregrounds and white overlays.
+pub fn white(alpha: f32) -> Color {
+    crate::color::with_alpha(Color::WHITE, alpha)
+}
+/// Neutral OKLCH endpoint L=0, for scrims and shadows.
+pub fn black(alpha: f32) -> Color {
+    crate::color::with_alpha(Color::BLACK, alpha)
+}
 
 /// Dynamic surface hover color based on theme
 pub fn surface_hover(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        color!(0x2a2a2a)
-    } else {
-        color!(0xe0e0e0)
-    }
+    colors(theme).hover
 }
 
 // ============================================================================
@@ -262,7 +190,7 @@ pub fn login_popup(theme: &Theme, metrics: ThemeMetrics) -> container::Style {
             color: border_color(theme),
         },
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            color: black(0.5),
             offset: Vector::new(0.0, metrics.popup_shadow_offset_y),
             blur_radius: metrics.popup_shadow_blur,
         },
@@ -276,13 +204,13 @@ pub fn login_popup(theme: &Theme, metrics: ThemeMetrics) -> container::Style {
 
 /// Primary button style
 pub fn primary_button(
-    _theme: &Theme,
+    theme: &Theme,
     status: button::Status,
     metrics: ThemeMetrics,
 ) -> button::Style {
     let base = button::Style {
-        background: Some(Background::Color(ACCENT)),
-        text_color: Color::WHITE,
+        background: Some(Background::Color(accent(theme))),
+        text_color: on_accent(theme),
         border: Border {
             radius: metrics.pill_radius.into(),
             ..Default::default()
@@ -292,7 +220,16 @@ pub fn primary_button(
 
     match status {
         button::Status::Hovered => button::Style {
-            background: Some(Background::Color(ACCENT_HOVER)),
+            background: Some(Background::Color(accent_hover(theme))),
+            ..base
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Background::Color(colors(theme).accent_pressed)),
+            ..base
+        },
+        button::Status::Disabled => button::Style {
+            background: Some(Background::Color(accent_subtle(theme))),
+            text_color: disabled(theme),
             ..base
         },
         _ => base,
@@ -355,7 +292,7 @@ pub fn danger_button(
 ) -> button::Style {
     let base = button::Style {
         background: Some(Background::Color(danger(theme))),
-        text_color: Color::WHITE,
+        text_color: palette::on_color(danger(theme)),
         border: Border {
             radius: metrics.pill_radius.into(),
             ..Default::default()
@@ -375,89 +312,67 @@ pub fn danger_button(
 /// Hover background color based on theme
 pub fn hover_bg(theme: &Theme) -> Color {
     if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.12)
+        white(0.12)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.08)
+        black(0.08)
     }
 }
 
 /// Play button hover color - slightly lighter/darker than text_primary
 pub fn play_button_hover(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        // Dark mode: white button, hover slightly gray
-        Color::from_rgb(0.9, 0.9, 0.9)
-    } else {
-        // Light mode: dark button, hover slightly lighter
-        Color::from_rgb(0.25, 0.25, 0.25)
-    }
+    lerp_color(text_primary(theme), text_secondary(theme), 0.25)
 }
 
 /// Surface elevated color (for cards, popups)
 pub fn surface_elevated(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.12, 0.12, 0.14)
-    } else {
-        Color::from_rgb(0.96, 0.96, 0.98)
-    }
+    colors(theme).raised
 }
 
 /// Surface container color (for input fields, panels)
 pub fn surface_container(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.15, 0.15, 0.15)
-    } else {
-        Color::from_rgb(0.92, 0.92, 0.92)
-    }
+    colors(theme).surface
 }
 
 /// Danger/error color
 pub fn danger(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.9, 0.3, 0.3)
-    } else {
-        Color::from_rgb(0.8, 0.2, 0.2)
-    }
+    colors(theme).danger
 }
 
 /// Danger hover color
 pub fn danger_hover(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(1.0, 0.4, 0.4)
-    } else {
-        Color::from_rgb(0.9, 0.3, 0.3)
-    }
+    colors(theme).danger_hover
 }
 
 /// Success color
-pub fn success(_theme: &Theme) -> Color {
-    Color::from_rgb(0.3, 0.8, 0.5)
+pub fn success(theme: &Theme) -> Color {
+    colors(theme).success
 }
 
 /// Warning color
-pub fn warning(_theme: &Theme) -> Color {
-    Color::from_rgb(0.95, 0.75, 0.3)
+pub fn warning(theme: &Theme) -> Color {
+    colors(theme).warning
 }
 
 /// Info color
-pub fn info(_theme: &Theme) -> Color {
-    Color::from_rgb(0.4, 0.7, 0.95)
+pub fn info(theme: &Theme) -> Color {
+    colors(theme).info
 }
 
 /// Divider/separator color
 pub fn divider(theme: &Theme) -> Color {
     if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.1)
+        white(0.1)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.1)
+        black(0.1)
     }
 }
 
 /// Overlay backdrop color
 pub fn overlay_backdrop(theme: &Theme, opacity: f32) -> Color {
     if is_dark(theme) {
-        Color::from_rgba(0.0, 0.0, 0.0, opacity)
+        black(opacity)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, opacity * 0.7)
+        black(opacity * 0.7)
     }
 }
 
@@ -506,7 +421,7 @@ pub fn button_danger(
 
     button::Style {
         background: Some(Background::Color(base)),
-        text_color: Color::WHITE,
+        text_color: palette::on_color(danger(theme)),
         border: Border {
             radius: metrics.small_radius.into(),
             ..Default::default()
@@ -535,24 +450,24 @@ pub fn settings_pick_list(
 ) -> pick_list::Style {
     let bg = if is_dark(theme) {
         match status {
-            pick_list::Status::Active => Color::from_rgba(1.0, 1.0, 1.0, 0.08),
-            pick_list::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.12),
-            pick_list::Status::Opened { .. } => Color::from_rgba(1.0, 1.0, 1.0, 0.15),
-            pick_list::Status::Disabled => Color::from_rgba(1.0, 1.0, 1.0, 0.04),
+            pick_list::Status::Active => white(0.08),
+            pick_list::Status::Hovered => white(0.12),
+            pick_list::Status::Opened { .. } => white(0.15),
+            pick_list::Status::Disabled => white(0.04),
         }
     } else {
         match status {
-            pick_list::Status::Active => Color::from_rgba(0.0, 0.0, 0.0, 0.05),
-            pick_list::Status::Hovered => Color::from_rgba(0.0, 0.0, 0.0, 0.08),
-            pick_list::Status::Opened { .. } => Color::from_rgba(0.0, 0.0, 0.0, 0.1),
-            pick_list::Status::Disabled => Color::from_rgba(0.0, 0.0, 0.0, 0.03),
+            pick_list::Status::Active => black(0.05),
+            pick_list::Status::Hovered => black(0.08),
+            pick_list::Status::Opened { .. } => black(0.1),
+            pick_list::Status::Disabled => black(0.03),
         }
     };
 
     let border_color = if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.1)
+        white(0.1)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.15)
+        black(0.15)
     };
 
     pick_list::Style {
@@ -571,17 +486,9 @@ pub fn settings_pick_list(
 /// Unified dropdown menu style - dark background with rounded corners
 pub fn settings_pick_list_menu(theme: &Theme, metrics: ThemeMetrics) -> iced::overlay::menu::Style {
     let (bg, selected_bg, border_color) = if is_dark(theme) {
-        (
-            Color::from_rgb(0.15, 0.15, 0.15),
-            Color::from_rgba(1.0, 1.0, 1.0, 0.1),
-            Color::from_rgba(1.0, 1.0, 1.0, 0.1),
-        )
+        (surface(theme), white(0.1), white(0.1))
     } else {
-        (
-            Color::from_rgb(0.98, 0.98, 0.98),
-            Color::from_rgba(0.0, 0.0, 0.0, 0.08),
-            Color::from_rgba(0.0, 0.0, 0.0, 0.1),
-        )
+        (surface(theme), black(0.08), black(0.1))
     };
 
     iced::overlay::menu::Style {
@@ -640,28 +547,20 @@ pub fn dark_scrollable(
 
 /// Panel background (queue panel, popups)
 pub fn panel_bg(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.12, 0.12, 0.14)
-    } else {
-        Color::from_rgb(0.96, 0.96, 0.97)
-    }
+    colors(theme).raised
 }
 
 /// Panel border color
 pub fn panel_border(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.08)
-    } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.1)
-    }
+    colors(theme).border
 }
 
 /// Shadow color for panels
 pub fn shadow_color(theme: &Theme) -> Color {
     if is_dark(theme) {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.5)
+        black(0.5)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.15)
+        black(0.15)
     }
 }
 
@@ -672,210 +571,122 @@ pub fn player_bar_bg(theme: &Theme) -> Color {
 
 /// Top border color used by the player bar and matching sidebar footer separator
 pub fn player_bar_border(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        color!(0x2d2d2d)
-    } else {
-        color!(0xd8d8d8)
-    }
+    colors(theme).border
 }
 
 /// Header text color (slightly dimmed)
 pub fn header_text(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.6)
-    } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.7)
-    }
+    colors(theme).secondary
 }
 
 /// Dimmed text color (for indices, durations)
 pub fn dimmed_text(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.5)
-    } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.6)
-    }
+    colors(theme).muted
 }
 
 /// Icon color (muted)
 pub fn icon_muted(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.4)
-    } else {
-        Color::from_rgba(0.0, 0.0, 0.0, 0.4)
-    }
+    colors(theme).muted
 }
 
 /// Hover background with alpha
 pub fn hover_bg_alpha(theme: &Theme, alpha: f32) -> Color {
     if is_dark(theme) {
-        Color::from_rgba(1.0, 1.0, 1.0, alpha)
+        white(alpha)
     } else {
-        Color::from_rgba(0.0, 0.0, 0.0, alpha * 0.7)
+        black(alpha * 0.7)
     }
 }
 
 /// Interpolate between two colors for animated UI state transitions.
 pub fn lerp_color(from: Color, to: Color, progress: f32) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-    Color::from_rgba(
-        from.r + (to.r - from.r) * progress,
-        from.g + (to.g - from.g) * progress,
-        from.b + (to.b - from.b) * progress,
-        from.a + (to.a - from.a) * progress,
-    )
+    crate::color::mix(from, to, progress)
 }
 
 /// Animated text color based on progress (for hover animations)
 pub fn animated_text(theme: &Theme, progress: f32) -> Color {
-    if is_dark(theme) {
-        let alpha = 0.55 + 0.45 * progress;
-        Color::from_rgba(1.0, 1.0, 1.0, alpha)
-    } else {
-        let alpha = 0.55 + 0.45 * progress;
-        Color::from_rgba(0.0, 0.0, 0.0, alpha)
-    }
+    lerp_color(text_secondary(theme), text_primary(theme), progress)
 }
 
 /// Animated brightness for sidebar items
 pub fn animated_brightness(theme: &Theme, progress: f32) -> Color {
-    if is_dark(theme) {
-        let idle = color!(0x99a1af);
-        Color::from_rgb(
-            idle.r + (1.0 - idle.r) * progress,
-            idle.g + (1.0 - idle.g) * progress,
-            idle.b + (1.0 - idle.b) * progress,
-        )
-    } else {
-        let brightness = 0.5 - 0.3 * progress;
-        Color::from_rgb(brightness, brightness, brightness)
-    }
+    lerp_color(text_secondary(theme), text_primary(theme), progress)
 }
 
 /// Close button hover (muted red adapted to the active theme)
 pub fn close_button_hover(theme: &Theme) -> Color {
-    let mut color = if is_dark(theme) {
-        color!(0x4a3032)
-    } else {
-        color!(0xead6d7)
-    };
-    color.a = 0.72;
-    color
+    crate::color::with_alpha(lerp_color(surface(theme), danger(theme), 0.22), 0.92)
 }
 
 /// Spectrum meter colors
 pub fn spectrum_green() -> Color {
-    Color::from_rgb(0.2, 0.8, 0.4)
+    palette::DARK.success
 }
 
 pub fn spectrum_yellow() -> Color {
-    Color::from_rgb(0.9, 0.8, 0.2)
+    palette::DARK.warning
 }
 
 pub fn spectrum_red() -> Color {
-    Color::from_rgb(0.95, 0.3, 0.3)
+    palette::DARK.danger
 }
 
 /// Settings page title color
 pub fn settings_title(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.95, 0.95, 0.95)
-    } else {
-        Color::from_rgb(0.1, 0.1, 0.1)
-    }
+    colors(theme).text
 }
 
 /// Settings page label color
 pub fn settings_label(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.9, 0.9, 0.9)
-    } else {
-        Color::from_rgb(0.15, 0.15, 0.15)
-    }
+    colors(theme).text
 }
 
 /// Settings page description color
-pub fn settings_desc(_theme: &Theme) -> Color {
-    Color::from_rgb(0.5, 0.5, 0.5)
+pub fn settings_desc(theme: &Theme) -> Color {
+    colors(theme).muted
 }
 
 /// Settings page value color
 pub fn settings_value(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.7, 0.7, 0.7)
-    } else {
-        Color::from_rgb(0.35, 0.35, 0.35)
-    }
+    colors(theme).secondary
 }
 
 /// Settings section title color
 pub fn settings_section_title(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.7, 0.7, 0.7)
-    } else {
-        Color::from_rgb(0.35, 0.35, 0.35)
-    }
+    colors(theme).secondary
 }
 
 /// Settings inactive tab color
 pub fn settings_inactive_tab(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.6, 0.6, 0.6)
-    } else {
-        Color::from_rgb(0.45, 0.45, 0.45)
-    }
+    colors(theme).muted
 }
 
 /// Settings inactive underline color
 pub fn settings_inactive_underline(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.25, 0.25, 0.25)
-    } else {
-        Color::from_rgb(0.8, 0.8, 0.8)
-    }
+    colors(theme).border
 }
 
 /// Settings input background color
 pub fn settings_input_bg(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.15, 0.15, 0.15)
-    } else {
-        Color::from_rgb(0.95, 0.95, 0.95)
-    }
+    colors(theme).surface
 }
 
 /// Settings input border color
 pub fn settings_input_border(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.3, 0.3, 0.3)
-    } else {
-        Color::from_rgb(0.75, 0.75, 0.75)
-    }
+    colors(theme).control_border
 }
 
 /// Settings input border hover color
 pub fn settings_input_border_hover(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.4, 0.4, 0.4)
-    } else {
-        Color::from_rgb(0.6, 0.6, 0.6)
-    }
+    colors(theme).accent
 }
 
 /// Shortcut key background color
 pub fn shortcut_key_bg(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.3, 0.15, 0.2)
-    } else {
-        Color::from_rgb(0.95, 0.85, 0.9)
-    }
+    colors(theme).accent_subtle
 }
 
 /// Shortcut background color
 pub fn shortcut_bg(theme: &Theme) -> Color {
-    if is_dark(theme) {
-        Color::from_rgb(0.2, 0.2, 0.2)
-    } else {
-        Color::from_rgb(0.9, 0.9, 0.9)
-    }
+    colors(theme).surface
 }

@@ -1009,7 +1009,7 @@ where
                     shadow: iced::Shadow::default(),
                     snap: true,
                 },
-                Color::from_rgba(1.0, 1.0, 1.0, alpha),
+                crate::theme::white(alpha),
             );
         }
     }

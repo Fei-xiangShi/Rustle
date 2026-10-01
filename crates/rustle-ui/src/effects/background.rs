@@ -44,9 +44,9 @@ impl Default for BackgroundUniforms {
             resolution: [1920.0, 1080.0],
             time: 0.0,
             volume: 1.0,
-            color_primary: [0.15, 0.08, 0.25, 1.0],
-            color_secondary: [0.08, 0.12, 0.20, 1.0],
-            color_tertiary: [0.05, 0.05, 0.10, 1.0],
+            color_primary: color_to_array(crate::color::artwork::FALLBACK[0].to_color()),
+            color_secondary: color_to_array(crate::color::artwork::FALLBACK[1].to_color()),
+            color_tertiary: color_to_array(crate::color::artwork::FALLBACK[2].to_color()),
             flow_speed: 4.0,
             blur_amount: 0.8,
             vignette_intensity: 0.6,
@@ -56,7 +56,7 @@ impl Default for BackgroundUniforms {
 }
 
 /// WGSL shader source for the animated background
-const BACKGROUND_SHADER: &str = r#"
+pub(super) const BACKGROUND_SHADER: &str = r#"
 struct Uniforms {
     resolution: vec2f,
     time: f32,
@@ -164,15 +164,15 @@ fn mesh_gradient(uv: vec2f, time: f32, volume: f32) -> vec3f {
     let base_color = mesh_color(clamp(final_uv, vec2f(0.0), vec2f(1.0)));
     
     // Alpha 和音量因子
-    let alpha_volume_factor = uniforms.opacity * max(0.5, 1.0 - volume * 0.5);
+    // Opacity belongs only to output alpha; volume controls illumination.
     
-    return base_color * alpha_volume_factor;
+    return gamut_mapped_lab(base_color) * max(0.5, 1.0 - volume * 0.5);
 }
 
 // Vignette 效果
 fn vignette_effect(uv: vec2f) -> f32 {
     let dist = distance(uv, vec2f(0.5));
-    let vignette = smoothstep(0.8, 0.3, dist);
+    let vignette = 1.0 - smoothstep(0.3, 0.8, dist);
     return 0.6 + vignette * 0.4;
 }
 
@@ -187,13 +187,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
     
     // 应用 dithering (减少色带)
     let dither = INV_255 * gradient_noise(in.position.xy) - HALF_INV_255;
-    color += vec3f(dither);
+    // Dither is applied at the encoded output boundary.
     
     // 应用 vignette 效果
     let mask = vignette_effect(uv);
     color *= mask;
     
-    return vec4f(color, uniforms.opacity);
+    return color_output(color, uniforms.opacity, dither);
 }
 "#;
 
@@ -209,7 +209,10 @@ impl shader::Pipeline for BackgroundPipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Background Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BACKGROUND_SHADER)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(super::color_shader(
+                BACKGROUND_SHADER,
+                format,
+            ))),
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -289,6 +292,15 @@ impl shader::Pipeline for BackgroundPipeline {
 impl BackgroundPipeline {
     fn update(&mut self, queue: &wgpu::Queue, uniforms: BackgroundUniforms) {
         self.uniforms = uniforms;
+        // Public uniforms carry sRGB. GPU control colors are Cartesian Oklab.
+        for color in [
+            &mut self.uniforms.color_primary,
+            &mut self.uniforms.color_secondary,
+            &mut self.uniforms.color_tertiary,
+        ] {
+            let [l, a, b] = crate::color::Oklcha::from_color(iced::Color::from(*color)).lab();
+            *color = [l, a, b, color[3]];
+        }
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
     }
 }

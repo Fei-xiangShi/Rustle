@@ -11,6 +11,7 @@
 //!   contracts shared by the other UI layers
 
 pub mod animation;
+pub mod color;
 pub mod effects;
 pub mod icons;
 pub mod primitives;

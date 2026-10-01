@@ -8,7 +8,7 @@ use iced::advanced::renderer;
 use iced::advanced::widget::{self, Widget};
 use iced::event::Event;
 use iced::mouse;
-use iced::{Background, Border, Color, Element, Length, Rectangle, Size, Theme};
+use iced::{Background, Border, Element, Length, Rectangle, Size, Theme};
 
 use crate::responsive::UiTokens;
 
@@ -22,10 +22,6 @@ pub struct VerticalSlider<'a, Message> {
     height: Length,
     rail_width: f32,
     handle_radius: f32,
-    rail_color: Color,
-    handle_color: Color,
-    handle_color_hovered: Color,
-    handle_color_dragging: Color,
 }
 
 impl<'a, Message> VerticalSlider<'a, Message> {
@@ -48,10 +44,6 @@ impl<'a, Message> VerticalSlider<'a, Message> {
             height: Length::Fixed(tokens.size(180.0)),
             rail_width: tokens.size(4.0),
             handle_radius: tokens.size(8.0),
-            rail_color: crate::theme::divider(&iced::Theme::Dark),
-            handle_color: crate::theme::TEXT_SECONDARY,
-            handle_color_hovered: Color::WHITE,
-            handle_color_dragging: crate::theme::ACCENT_PINK,
         }
     }
 
@@ -179,7 +171,7 @@ where
                 border: Border::default().rounded(self.rail_width / 2.0),
                 ..Default::default()
             },
-            Background::Color(self.rail_color),
+            Background::Color(crate::theme::divider(_theme)),
         );
 
         // Calculate handle position
@@ -190,11 +182,11 @@ where
 
         // Determine handle color
         let handle_color = if state.is_dragging {
-            self.handle_color_dragging
+            crate::theme::accent(_theme)
         } else if is_hovered {
-            self.handle_color_hovered
+            crate::theme::text_primary(_theme)
         } else {
-            self.handle_color
+            crate::theme::text_secondary(_theme)
         };
 
         // Draw handle

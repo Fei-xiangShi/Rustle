@@ -34,8 +34,8 @@ pub fn toggle_button<Message: Clone + 'static>(
         .style(|_theme, status| button::Style {
             background: Some(Background::Color(Color::TRANSPARENT)),
             text_color: match status {
-                button::Status::Hovered | button::Status::Pressed => theme::ACCENT_PINK_HOVER,
-                _ => theme::ACCENT_PINK,
+                button::Status::Hovered | button::Status::Pressed => theme::accent_hover(_theme),
+                _ => theme::accent(_theme),
             },
             ..Default::default()
         })

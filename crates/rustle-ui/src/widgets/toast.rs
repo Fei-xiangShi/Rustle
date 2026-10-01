@@ -20,12 +20,12 @@ pub enum ToastStyle {
 
 impl ToastStyle {
     /// Get the accent color for this style (used for icon/indicator only)
-    pub fn accent_color(&self) -> iced::Color {
+    pub fn accent_color(&self, theme: &iced::Theme) -> iced::Color {
         match self {
-            ToastStyle::Success => theme::success(&iced::Theme::Dark),
-            ToastStyle::Error => theme::danger(&iced::Theme::Dark),
-            ToastStyle::Warning => theme::warning(&iced::Theme::Dark),
-            ToastStyle::Info => theme::info(&iced::Theme::Dark),
+            ToastStyle::Success => theme::success(theme),
+            ToastStyle::Error => theme::danger(theme),
+            ToastStyle::Warning => theme::warning(theme),
+            ToastStyle::Info => theme::info(theme),
         }
     }
 
@@ -80,7 +80,7 @@ impl Toast {
 /// - Accent color only on icon (not background)
 /// - Soft shadow for floating effect
 pub fn view_toast<'a, Message: 'a>(toast: &Toast, tokens: UiTokens) -> Element<'a, Message> {
-    let accent_color = toast.style.accent_color();
+    let style = toast.style;
     let icon = toast.style.icon_svg();
     let message = toast.message.clone();
 
@@ -91,7 +91,7 @@ pub fn view_toast<'a, Message: 'a>(toast: &Toast, tokens: UiTokens) -> Element<'
             .height(tokens.size(20.0)),
     )
     .style(move |_theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(accent_color)),
+        background: Some(iced::Background::Color(style.accent_color(_theme))),
         border: iced::Border {
             radius: tokens.size(2.0).into(),
             ..Default::default()
@@ -104,7 +104,7 @@ pub fn view_toast<'a, Message: 'a>(toast: &Toast, tokens: UiTokens) -> Element<'
         .width(tokens.size(14.0))
         .height(tokens.size(14.0))
         .style(move |_theme, _status| svg::Style {
-            color: Some(accent_color),
+            color: Some(style.accent_color(_theme)),
         });
 
     // Message text

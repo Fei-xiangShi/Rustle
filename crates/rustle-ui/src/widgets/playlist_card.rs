@@ -170,7 +170,7 @@ fn card_shadow_style_for(
             ..Default::default()
         },
         shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.28 + 0.16 * hover_progress),
+            color: crate::theme::black(0.28 + 0.16 * hover_progress),
             offset: iced::Vector::new(0.0, tokens.size(4.0 + 4.0 * hover_progress)),
             blur_radius: tokens.size(14.0 + 8.0 * hover_progress),
         },
@@ -180,10 +180,7 @@ fn card_shadow_style_for(
 
 fn cover_hover_mask_style_for(hover_progress: f32, radius: f32) -> iced::widget::container::Style {
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(Color::from_rgba(
-            0.0,
-            0.0,
-            0.0,
+        background: Some(iced::Background::Color(crate::theme::black(
             hover_mask_alpha(hover_progress),
         ))),
         border: iced::Border {
@@ -220,7 +217,7 @@ fn placeholder_style_for(
             ..Default::default()
         },
         shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.12 * hover_progress),
+            color: crate::theme::black(0.12 * hover_progress),
             offset: iced::Vector::new(0.0, tokens.size(2.0)),
             blur_radius: tokens.size(8.0),
         },
@@ -241,9 +238,7 @@ fn footer_fallback_style_for(theme: &iced::Theme, radius: f32) -> iced::widget::
 
 fn footer_scrim_style_for(radius: f32) -> iced::widget::container::Style {
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(Color::from_rgba(
-            0.02, 0.02, 0.025, 0.34,
-        ))),
+        background: Some(iced::Background::Color(crate::theme::black(0.50))),
         border: iced::Border {
             radius: iced::border::bottom(radius),
             ..Default::default()
