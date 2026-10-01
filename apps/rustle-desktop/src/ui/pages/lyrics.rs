@@ -12,6 +12,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Animation, Color, Element, Fill, Length, Padding};
 
+use crate::api::ArtistSummary;
 use crate::app::{ImageState, LyricsDisplayMode, Message};
 use crate::application::lyrics::LyricLine;
 use crate::database::DbSong;
@@ -40,7 +41,7 @@ use crate::ui::widgets::{self, ControlSize, SliderSize};
 pub struct LyricsPageView<'a> {
     pub song: &'a DbSong,
     pub image_state: &'a ImageState,
-    pub artist_id: Option<u64>,
+    pub current_artists: &'a [ArtistSummary],
     pub is_playing: bool,
     pub position: f32,
     pub duration_secs: f32,
@@ -64,7 +65,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
     let LyricsPageView {
         song,
         image_state,
-        artist_id,
+        current_artists,
         is_playing,
         position,
         duration_secs,
@@ -91,7 +92,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
             let artwork_panel = build_artwork_panel(ArtworkPanelView {
                 song,
                 image_state,
-                artist_id,
+                current_artists,
                 is_playing,
                 position,
                 duration_secs,
@@ -158,7 +159,7 @@ pub fn view<'a>(view: LyricsPageView<'a>) -> Element<'a, Message> {
                             let artwork_panel = build_artwork_panel(ArtworkPanelView {
                                 song,
                                 image_state,
-                                artist_id,
+                                current_artists,
                                 is_playing,
                                 position,
                                 duration_secs,
@@ -562,7 +563,7 @@ fn artwork_requires_vertical_scroll(context: ResponsiveContext, title_bar_height
 struct ArtworkPanelView<'a> {
     song: &'a DbSong,
     image_state: &'a ImageState,
-    artist_id: Option<u64>,
+    current_artists: &'a [ArtistSummary],
     is_playing: bool,
     position: f32,
     duration_secs: f32,
@@ -578,7 +579,7 @@ fn build_artwork_panel<'a>(view: ArtworkPanelView<'a>) -> Element<'a, Message> {
     let ArtworkPanelView {
         song,
         image_state,
-        artist_id,
+        current_artists,
         is_playing,
         position,
         duration_secs,
@@ -612,23 +613,14 @@ fn build_artwork_panel<'a>(view: ArtworkPanelView<'a>) -> Element<'a, Message> {
         })
         .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT));
 
-    // Artist name
-    let artist_action = artist_id
-        .map(Message::OpenArtist)
-        .or_else(|| Some(Message::OpenArtistByName(song.artist.clone())));
-    let artist: Element<'a, Message> = button(
-        text(&song.artist)
-            .size(tokens.text(TextRole::Subtitle))
-            .style(|theme| text::Style {
-                color: Some(theme::text_secondary(theme)),
-            }),
-    )
-    .padding(0)
-    .style(|_theme, _status| button::Style {
-        background: Some(iced::Background::Color(Color::TRANSPARENT)),
-        ..Default::default()
-    })
-    .on_press_maybe(artist_action)
+    let artist: Element<'a, Message> = row(crate::ui::components::artist_links::items(
+        &song.artist,
+        current_artists,
+        tokens.text(TextRole::Subtitle),
+        None,
+    ))
+    .width(media_width)
+    .wrap()
     .into();
 
     // Progress bar - using unified widget with download progress

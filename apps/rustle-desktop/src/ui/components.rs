@@ -15,6 +15,7 @@
 //! - **Widgets** (`crate::ui::widgets`): Composable UI patterns (no business logic)
 //! - **Components** (this module): Business-specific UI with Message handling
 
+pub mod artist_links;
 pub mod context_menu;
 pub mod cover_image;
 pub mod detail_card;

@@ -20,10 +20,6 @@ use crate::ui::theme;
 use crate::ui::{components, pages, widgets};
 
 impl App {
-    fn current_song_artist_id(&self) -> Option<u64> {
-        self.playback.current_artist_id
-    }
-
     /// Build the view for a specific window
     pub fn view(&self, window_id: iced::window::Id) -> Element<'_, Message> {
         responsive(move |size| {
@@ -74,7 +70,7 @@ impl App {
                     pages::lyrics::view(pages::lyrics::LyricsPageView {
                         song,
                         image_state: &self.ui.image_state,
-                        artist_id: self.current_song_artist_id(),
+                        current_artists: &self.playback.current_artists,
                         is_playing,
                         position: display_position,
                         duration_secs: duration,

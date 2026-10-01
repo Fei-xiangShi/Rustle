@@ -104,74 +104,6 @@ impl PlayerBarLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ArtistTarget {
-    Id(u64),
-    Name(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtistLink {
-    name: String,
-    target: ArtistTarget,
-}
-
-fn artist_links(artist_text: &str, structured_artists: &[ArtistSummary]) -> Vec<ArtistLink> {
-    let mut links = Vec::new();
-
-    if !structured_artists.is_empty() {
-        for artist in structured_artists {
-            let name = artist.name.trim();
-            if name.is_empty() {
-                continue;
-            }
-
-            links.push(ArtistLink {
-                name: name.to_string(),
-                target: if artist.id == 0 {
-                    ArtistTarget::Name(name.to_string())
-                } else {
-                    ArtistTarget::Id(artist.id)
-                },
-            });
-        }
-    } else {
-        for name in artist_text
-            .split('/')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            if links.iter().any(|link: &ArtistLink| link.name == name) {
-                continue;
-            }
-
-            links.push(ArtistLink {
-                name: name.to_string(),
-                target: ArtistTarget::Name(name.to_string()),
-            });
-        }
-    }
-
-    if links.is_empty() {
-        let name = artist_text.trim();
-        if !name.is_empty() {
-            links.push(ArtistLink {
-                name: name.to_string(),
-                target: ArtistTarget::Name(name.to_string()),
-            });
-        }
-    }
-
-    links
-}
-
-fn artist_target_message(target: ArtistTarget) -> Message {
-    match target {
-        ArtistTarget::Id(id) => Message::OpenArtist(id),
-        ArtistTarget::Name(name) => Message::OpenArtistByName(name),
-    }
-}
-
 pub struct PlayerBarView<'a> {
     pub context: ResponsiveContext,
     pub current_song: Option<&'a DbSong>,
@@ -497,45 +429,13 @@ fn build_song_info(
         })
         .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT));
 
-    let links = artist_links(&song.artist, current_artists);
     let metadata_height = tokens.size(20.0);
-    let metadata_text = move |content: String| {
-        text(content)
-            .size(tokens.text(TextRole::Body))
-            .line_height(iced::widget::text::LineHeight::Relative(1.0))
-            .height(metadata_height)
-            .align_y(iced::alignment::Vertical::Center)
-            .wrapping(Wrapping::None)
-    };
-    let mut artist_items: Vec<Element<'static, Message>> =
-        Vec::with_capacity(links.len().saturating_mul(2) + usize::from(show_quality) * 2);
-    for (index, link) in links.into_iter().enumerate() {
-        if index > 0 {
-            artist_items.push(
-                metadata_text(" / ".to_string())
-                    .style(|theme| text::Style {
-                        color: Some(theme::text_secondary(theme)),
-                    })
-                    .into(),
-            );
-        }
-
-        let artist_link = iced::widget::mouse_area(metadata_text(link.name))
-            .on_press(artist_target_message(link.target))
-            .interaction(mouse::Interaction::Pointer);
-        artist_items.push(
-            widgets::hover_surface(artist_link)
-                .style(move |theme, progress| iced::widget::container::Style {
-                    text_color: Some(theme::lerp_color(
-                        theme::text_secondary(theme),
-                        theme::text_primary(theme),
-                        progress,
-                    )),
-                    ..Default::default()
-                })
-                .into(),
-        );
-    }
+    let mut artist_items = super::artist_links::items(
+        &song.artist,
+        current_artists,
+        tokens.text(TextRole::Body),
+        Some(metadata_height),
+    );
 
     // Keep quality in the same inline flow as the artists. A separate `Fill`
     // artist widget would push a short name and the quality label to opposite
@@ -543,7 +443,12 @@ fn build_song_info(
     if show_quality && let Some(quality) = current_quality {
         artist_items.push(Space::new().width(tokens.space(8.0)).into());
         artist_items.push(
-            metadata_text(quality.actual.short_name().to_string())
+            text(quality.actual.short_name().to_string())
+                .size(tokens.text(TextRole::Body))
+                .line_height(iced::widget::text::LineHeight::Relative(1.0))
+                .height(metadata_height)
+                .align_y(iced::alignment::Vertical::Center)
+                .wrapping(Wrapping::None)
                 .style(|_theme| text::Style {
                     color: Some(theme::accent(_theme)),
                 })
@@ -752,11 +657,9 @@ fn volume_after_scroll(volume: f32, delta: mouse::ScrollDelta) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtistLink, ArtistTarget, HORIZONTAL_VOLUME_MAX_WIDTH, HORIZONTAL_VOLUME_MIN_WIDTH,
-        PlayerBarLayout, RIGHT_PREFERRED_WIDTH, VolumeLayout, artist_links, artist_target_message,
+        HORIZONTAL_VOLUME_MAX_WIDTH, HORIZONTAL_VOLUME_MIN_WIDTH, PlayerBarLayout,
+        RIGHT_PREFERRED_WIDTH, VolumeLayout,
     };
-    use crate::api::ArtistSummary;
-    use crate::app::Message;
     use crate::ui::responsive::UiTokens;
 
     #[test]
@@ -813,94 +716,5 @@ mod tests {
         assert!(matches!(desktop.volume, VolumeLayout::Horizontal { .. }));
         assert_eq!(compact.volume, VolumeLayout::Vertical);
         assert!(compact.show_time);
-    }
-
-    #[test]
-    fn structured_artists_keep_individual_ids() {
-        let artists = vec![
-            ArtistSummary {
-                id: 12,
-                name: "Artist A".to_string(),
-                image_url: String::new(),
-            },
-            ArtistSummary {
-                id: 34,
-                name: "Artist B".to_string(),
-                image_url: String::new(),
-            },
-        ];
-
-        assert_eq!(
-            artist_links("Artist A / Artist B", &artists),
-            vec![
-                ArtistLink {
-                    name: "Artist A".to_string(),
-                    target: ArtistTarget::Id(12),
-                },
-                ArtistLink {
-                    name: "Artist B".to_string(),
-                    target: ArtistTarget::Id(34),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn structured_artists_with_the_same_name_keep_distinct_ids() {
-        let artists = vec![
-            ArtistSummary {
-                id: 12,
-                name: "Shared Name".to_string(),
-                image_url: String::new(),
-            },
-            ArtistSummary {
-                id: 34,
-                name: "Shared Name".to_string(),
-                image_url: String::new(),
-            },
-        ];
-
-        assert_eq!(
-            artist_links("Shared Name / Shared Name", &artists),
-            vec![
-                ArtistLink {
-                    name: "Shared Name".to_string(),
-                    target: ArtistTarget::Id(12),
-                },
-                ArtistLink {
-                    name: "Shared Name".to_string(),
-                    target: ArtistTarget::Id(34),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn string_artists_are_split_trimmed_and_deduplicated() {
-        assert_eq!(
-            artist_links(" Artist A / Artist B / Artist A ", &[]),
-            vec![
-                ArtistLink {
-                    name: "Artist A".to_string(),
-                    target: ArtistTarget::Name("Artist A".to_string()),
-                },
-                ArtistLink {
-                    name: "Artist B".to_string(),
-                    target: ArtistTarget::Name("Artist B".to_string()),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn artist_targets_preserve_id_and_name_navigation_messages() {
-        assert!(matches!(
-            artist_target_message(ArtistTarget::Id(12)),
-            Message::OpenArtist(12)
-        ));
-        assert!(matches!(
-            artist_target_message(ArtistTarget::Name("Artist A".to_string())),
-            Message::OpenArtistByName(name) if name == "Artist A"
-        ));
     }
 }
