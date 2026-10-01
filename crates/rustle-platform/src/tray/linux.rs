@@ -257,7 +257,6 @@ fn create_menu(
                             ..Default::default()
                         },
                     ],
-                    ..Default::default()
                 }
                 .into(),
             ],

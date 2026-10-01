@@ -49,6 +49,7 @@ impl TrayError {
         }
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) const fn not_initialized() -> Self {
         Self {
             kind: TrayErrorKind::NotInitialized,
@@ -123,10 +124,12 @@ impl From<TrayError> for rustle_application::error::AppError {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) trait TrayResultExt<T> {
     fn tray_context(self, operation: &'static str) -> Result<T, TrayError>;
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl<T, E> TrayResultExt<T> for Result<T, E>
 where
     E: Error + Send + Sync + 'static,

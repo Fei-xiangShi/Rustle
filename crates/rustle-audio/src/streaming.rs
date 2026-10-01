@@ -975,6 +975,16 @@ impl SharedBuffer {
         buf: &mut [u8],
         reader_cancellation: Option<&StreamingReaderCancellation>,
     ) -> io::Result<usize> {
+        self.read_at_with_clock(position, buf, reader_cancellation, Instant::now)
+    }
+
+    fn read_at_with_clock(
+        &self,
+        position: u64,
+        buf: &mut [u8],
+        reader_cancellation: Option<&StreamingReaderCancellation>,
+        mut now: impl FnMut() -> Instant,
+    ) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -997,7 +1007,7 @@ impl SharedBuffer {
         // Wait for data if needed
         let mut wait_count = 0;
         let mut last_progress = (self.base_offset(), self.downloaded());
-        let mut last_progress_at = Instant::now();
+        let mut last_progress_at = now();
         loop {
             let downloaded = self.inner.downloaded.load(Ordering::Acquire);
             let base = self.base_offset();
@@ -1006,7 +1016,7 @@ impl SharedBuffer {
             let progress = (base, downloaded);
             if progress != last_progress {
                 last_progress = progress;
-                last_progress_at = Instant::now();
+                last_progress_at = now();
             }
 
             // A validated total size defines remote EOF independently from
@@ -1121,7 +1131,7 @@ impl SharedBuffer {
                 ));
             }
 
-            let stalled_for = last_progress_at.elapsed();
+            let stalled_for = now().duration_since(last_progress_at);
             if stalled_for >= self.inner.demand_stall_timeout {
                 let message = format!(
                     "decoder demand at byte {position} made no progress for {} ms",
@@ -2665,10 +2675,12 @@ mod tests {
             .coordinator_active
             .store(true, Ordering::Release);
         let started = Instant::now();
-        let error = buffer.read_at(0, &mut [0; 1]).unwrap_err();
+        let mut ticks = [started, started + Duration::from_millis(40)].into_iter();
+        let error = buffer
+            .read_at_with_clock(0, &mut [0; 1], None, || ticks.next().unwrap())
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(500));
         assert!(matches!(
             buffer.health(),
             SharedBufferHealth::Failed(PlaybackError::NetworkError(_))
@@ -2683,25 +2695,26 @@ mod tests {
             .inner
             .coordinator_active
             .store(true, Ordering::Release);
-        let reader = buffer.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut byte = [0; 1];
-            tx.send(reader.read_at(2, &mut byte).map(|count| (count, byte[0])))
-                .unwrap();
-        });
+        let started = Instant::now();
+        // Publish after each stalled snapshot. The next loop must observe the
+        // progress and reset the deadline, even past the original 200ms budget.
+        // Logical time is independent of how long CI takes to schedule a poll.
+        let mut ticks = [0, 120, 240, 360, 480].into_iter();
+        let mut byte = [0; 1];
+        let count = buffer
+            .read_at_with_clock(2, &mut byte, None, || {
+                let elapsed = ticks.next().expect("unexpected extra deadline check");
+                match elapsed {
+                    120 => buffer.append(&[1]),
+                    360 => buffer.append(&[2, 3]),
+                    _ => {}
+                }
+                started + Duration::from_millis(elapsed)
+            })
+            .unwrap();
 
-        std::thread::sleep(Duration::from_millis(120));
-        buffer.append(&[1]);
-        std::thread::sleep(Duration::from_millis(120));
-        buffer.append(&[2, 3]);
-
-        assert_eq!(
-            rx.recv_timeout(Duration::from_millis(500))
-                .unwrap()
-                .unwrap(),
-            (1, 3)
-        );
+        assert_eq!((count, byte[0]), (1, 3));
+        assert!(ticks.next().is_none());
         assert_eq!(buffer.health(), SharedBufferHealth::Refillable);
     }
 
