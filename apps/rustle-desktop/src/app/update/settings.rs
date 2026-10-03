@@ -215,7 +215,12 @@ impl App {
     }
 
     /// Get which section corresponds to a scroll Y offset (for tab highlight)
-    fn section_at_position(&self, y_offset: f32) -> SettingsSection {
+    fn section_at_position(&self, y_offset: f32, max_offset: f32) -> SettingsSection {
+        // The last section cannot always reach the activation line. Use the
+        // actual scroll limit, but keep Account selected when all content fits.
+        if max_offset > 0.0 && y_offset >= max_offset {
+            return SettingsSection::About;
+        }
         let activation_tolerance = crate::ui::responsive::ResponsiveContext::from_viewport(
             Size::new(self.core.window_width, self.core.window_height),
         )
@@ -610,7 +615,8 @@ impl App {
                 Some(Task::none())
             }
             Message::ScrollToSection(section) => {
-                self.sync_settings_section_route(*section);
+                // Highlight and route follow the actual viewport, including
+                // intermediate sections crossed during programmatic scrolling.
                 let target_y = self.section_scroll_position(*section);
                 let delta = target_y - self.ui.settings_scroll_offset;
                 let target = SmoothScrollTarget::Native("settings_scroll");
@@ -624,10 +630,10 @@ impl App {
                     Some(Task::none())
                 }
             }
-            Message::SettingsScrolled(y_offset) => {
-                self.ui.settings_scroll_offset = *y_offset;
+            Message::SettingsScrolled { offset, max_offset } => {
+                self.ui.settings_scroll_offset = *offset;
                 // Only update active tab highlight — do NOT overwrite measured positions
-                let section = self.section_at_position(*y_offset);
+                let section = self.section_at_position(*offset, *max_offset);
                 self.sync_settings_section_route(section);
                 Some(Task::none())
             }

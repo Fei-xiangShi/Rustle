@@ -11,31 +11,34 @@ use crate::app::message::Message;
 use crate::app::state::App;
 use crate::ui::animation::{SmoothScrollEvent, SmoothScrollTarget};
 
-fn read_native_scroll_offset(target: &'static str) -> impl Operation<f32> {
+fn read_native_scroll_offset(target: &'static str) -> impl Operation<(f32, f32)> {
     struct ReadScrollOffset {
         target: &'static str,
-        offset: Option<f32>,
+        offset: Option<(f32, f32)>,
     }
 
-    impl Operation<f32> for ReadScrollOffset {
-        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<f32>)) {
+    impl Operation<(f32, f32)> for ReadScrollOffset {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<(f32, f32)>)) {
             operate(self);
         }
 
         fn scrollable(
             &mut self,
             id: Option<&Id>,
-            _bounds: Rectangle,
-            _content_bounds: Rectangle,
+            bounds: Rectangle,
+            content_bounds: Rectangle,
             translation: iced::Vector,
             _state: &mut dyn Scrollable,
         ) {
             if id == Some(&Id::new(self.target)) {
-                self.offset = Some(translation.y);
+                self.offset = Some((
+                    translation.y,
+                    (content_bounds.height - bounds.height).max(0.0),
+                ));
             }
         }
 
-        fn finish(&self) -> Outcome<f32> {
+        fn finish(&self) -> Outcome<(f32, f32)> {
             self.offset.map_or(Outcome::None, Outcome::Some)
         }
     }
@@ -126,7 +129,7 @@ impl App {
     pub(super) fn settings_scroll_offset_task(&self) -> Task<Message> {
         iced_runtime::task::widget(widget_op::map(
             read_native_scroll_offset("settings_scroll"),
-            Message::SettingsScrolled,
+            |(offset, max_offset)| Message::SettingsScrolled { offset, max_offset },
         ))
     }
 }

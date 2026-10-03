@@ -106,7 +106,10 @@ pub fn view<'a>(view: SettingsPageView<'a>) -> Element<'a, Message> {
         .id(iced::widget::Id::new("settings_scroll"))
         .on_scroll(|viewport| {
             let offset = viewport.absolute_offset();
-            Message::SettingsScrolled(offset.y)
+            Message::SettingsScrolled {
+                offset: offset.y,
+                max_offset: (viewport.content_bounds().height - viewport.bounds().height).max(0.0),
+            }
         }),
         SmoothScrollTarget::Native("settings_scroll"),
         tokens,

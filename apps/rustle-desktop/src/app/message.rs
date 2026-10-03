@@ -195,8 +195,11 @@ pub enum Message {
     ApplyProxySettings,
     /// Settings navigation
     ScrollToSection(SettingsSection),
-    /// Settings page scrolled (y offset in pixels)
-    SettingsScrolled(f32),
+    /// Settings page scrolled (actual and maximum y offsets in pixels).
+    SettingsScrolled {
+        offset: f32,
+        max_offset: f32,
+    },
     /// Trigger measurement of section widget positions
     MeasureSectionPositions,
     /// Section positions measured from the widget tree
@@ -1089,7 +1092,7 @@ impl std::fmt::Debug for Message {
             Self::UpdateProxyPassword(_) => simple!("UpdateProxyPassword"),
             Self::ApplyProxySettings => simple!("ApplyProxySettings"),
             Self::ScrollToSection(s) => simple!("ScrollToSection", "{:?}", s),
-            Self::SettingsScrolled(y) => simple!("SettingsScrolled", "{:.0}", y),
+            Self::SettingsScrolled { offset, .. } => simple!("SettingsScrolled", "{:.0}", offset),
             Self::MeasureSectionPositions => simple!("MeasureSectionPositions"),
             Self::SectionPositionsMeasured(p) => {
                 simple!("SectionPositionsMeasured", "{} positions", p.len())
