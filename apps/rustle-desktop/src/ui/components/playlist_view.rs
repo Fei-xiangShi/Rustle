@@ -92,6 +92,8 @@ pub struct SongItem {
     pub display_album: String,
     pub duration: String,
     pub added_date: String,
+    pub quality_label: Option<String>,
+    pub availability_label: String,
     /// Song source for display badge
     pub source: Source,
 }
@@ -150,6 +152,8 @@ impl SongItem {
             duration,
             added_date,
             source,
+            quality_label: None,
+            availability_label: String::new(),
         }
     }
 }
@@ -182,6 +186,8 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 /// Configuration for playlist view columns
 #[derive(Debug, Clone, Copy)]
 pub struct PlaylistColumns {
+    /// Search results already have a single known source.
+    pub show_source: bool,
     /// Show the like button column (for online playlists)
     pub show_like: bool,
     /// Show the added date column (for local playlists)
@@ -195,6 +201,7 @@ pub struct PlaylistColumns {
 impl Default for PlaylistColumns {
     fn default() -> Self {
         Self {
+            show_source: true,
             show_like: true,
             show_added_date: false,
             show_album: true,
@@ -207,6 +214,7 @@ impl PlaylistColumns {
     /// Configuration for local playlists (with added date, no like button)
     pub fn local() -> Self {
         Self {
+            show_source: true,
             show_like: false,
             show_added_date: true,
             show_album: true,
@@ -217,6 +225,7 @@ impl PlaylistColumns {
     /// Configuration for online/cloud playlists (with like button, no added date)
     pub fn online() -> Self {
         Self {
+            show_source: true,
             show_like: true,
             show_added_date: false,
             show_album: true,
@@ -340,6 +349,23 @@ pub fn build_header(
 
 /// Build the virtual song list
 pub fn build_list<'a>(view: SongListView<'a>) -> Element<'a, Message> {
+    build_list_for_target(view, SmoothScrollTarget::PlaylistSongs)
+}
+
+/// Reuse the complete playlist row and image-demand contract on search pages.
+pub fn build_search_list<'a>(mut view: SongListView<'a>) -> Element<'a, Message> {
+    view.columns.show_source = false;
+    build_list_for_target(view, SmoothScrollTarget::SearchSongs).map(|message| match message {
+        Message::HoverSong(id) => Message::HoverSearchSong(id),
+        Message::PlaySong(id) => Message::PlaySearchSong(id.unsigned_abs()),
+        other => other,
+    })
+}
+
+fn build_list_for_target<'a>(
+    view: SongListView<'a>,
+    target: SmoothScrollTarget,
+) -> Element<'a, Message> {
     let SongListView {
         songs,
         filtered_indices,
@@ -434,14 +460,11 @@ pub fn build_list<'a>(view: SongListView<'a>) -> Element<'a, Message> {
             let song_id = songs.get(song_index).map(|s| s.id);
             Message::HoverSong(song_id)
         })
-        .on_smooth_scroll(|delta| {
-            Message::SmoothScroll(SmoothScrollEvent::Requested {
-                target: SmoothScrollTarget::PlaylistSongs,
-                delta,
-            })
+        .on_smooth_scroll(move |delta| {
+            Message::SmoothScroll(SmoothScrollEvent::Requested { target, delta })
         })
         .on_smooth_scroll_cancel(Message::SmoothScroll(SmoothScrollEvent::Cancelled {
-            target: SmoothScrollTarget::PlaylistSongs,
+            target,
         }))
         .on_visible_range(move |(start, end)| {
             let mut images = Vec::new();
@@ -535,52 +558,77 @@ fn build_song_row(
     );
 
     // --- Title info (use pre-truncated strings) ---
-    let compact_secondary = if columns.compact {
-        let mut secondary = display_artist.clone();
-        if !display_album.is_empty() {
-            secondary.push_str(" · ");
-            secondary.push_str(&display_album);
-        }
-        if columns.show_added_date && !added_date.is_empty() {
-            secondary.push_str(" · ");
-            secondary.push_str(&added_date);
-        }
-        Some(secondary)
-    } else {
-        None
-    };
-
-    let secondary_text = compact_secondary.unwrap_or(display_artist);
-    let title_info = column![
-        text(display_title)
-            .size(tokens.text(TextRole::BodyLarge))
-            .width(Fill)
+    let title = text(display_title)
+        .size(tokens.text(TextRole::BodyLarge))
+        .width(Fill)
+        .wrapping(Wrapping::None)
+        .ellipsis(Ellipsis::End)
+        .style(move |theme| text::Style {
+            color: Some(if is_playing {
+                theme::accent(theme)
+            } else {
+                theme::text_primary(theme)
+            }),
+        })
+        .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT));
+    // Keep badges next to the artist's intrinsic width, before compact album data.
+    let mut secondary_line = row![].align_y(Alignment::Center).spacing(tokens.space(6.0));
+    if columns.show_source {
+        secondary_line =
+            secondary_line.push(super::source_badge::source_badge(song.source, tokens));
+    }
+    secondary_line = secondary_line.push(
+        text(display_artist)
+            .size(tokens.text(TextRole::Label))
+            .width(Length::Fit.max(tokens.size(240.0)))
             .wrapping(Wrapping::None)
             .ellipsis(Ellipsis::End)
             .style(move |theme| text::Style {
-                color: Some(if is_playing {
-                    theme::accent(theme)
-                } else {
-                    theme::text_primary(theme)
-                })
-            })
-            .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT)),
-        row![
-            super::source_badge::source_badge(song.source, tokens),
-            text(secondary_text)
-                .size(tokens.text(TextRole::Label))
-                .width(Fill)
+                color: Some(theme::animated_text(theme, animation_progress)),
+            }),
+    );
+    if let Some(label) = &song.quality_label {
+        secondary_line = secondary_line.push(
+            text(label.clone())
+                .size(tokens.text(TextRole::Caption))
                 .wrapping(Wrapping::None)
-                .ellipsis(Ellipsis::End)
-                .style(move |theme| text::Style {
-                    color: Some(theme::animated_text(theme, animation_progress))
+                .style(|theme| text::Style {
+                    color: Some(theme::accent(theme)),
                 }),
-        ]
-        .align_y(iced::Alignment::Center)
-        .spacing(tokens.space(6.0))
-        .width(Fill),
-    ]
-    .spacing(tokens.space(3.0));
+        );
+    }
+    if !song.availability_label.is_empty() {
+        secondary_line = secondary_line.push(
+            text(song.availability_label.clone())
+                .size(tokens.text(TextRole::Caption))
+                .wrapping(Wrapping::None)
+                .style(|theme| text::Style {
+                    color: Some(theme::text_muted(theme)),
+                }),
+        );
+    }
+    if columns.compact {
+        let mut extra = display_album.clone();
+        if columns.show_added_date && !added_date.is_empty() {
+            if !extra.is_empty() {
+                extra.push_str(" · ");
+            }
+            extra.push_str(&added_date);
+        }
+        if !extra.is_empty() {
+            secondary_line = secondary_line.push(
+                text(format!("· {extra}"))
+                    .size(tokens.text(TextRole::Label))
+                    .width(Fill)
+                    .wrapping(Wrapping::None)
+                    .ellipsis(Ellipsis::End)
+                    .style(move |theme| text::Style {
+                        color: Some(theme::animated_text(theme, animation_progress)),
+                    }),
+            );
+        }
+    }
+    let title_info = column![title, secondary_line.width(Fill)].spacing(tokens.space(3.0));
 
     // --- Like button handling ---
     let ncm_song_id = if song_id < 0 {

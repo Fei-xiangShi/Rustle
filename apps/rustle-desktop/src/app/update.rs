@@ -20,6 +20,7 @@ pub mod page_loader;
 mod playback;
 mod player_controller;
 mod playlist;
+mod podcast;
 mod preload;
 pub mod preload_coordinator;
 mod protocol;
@@ -73,6 +74,7 @@ impl App {
         handle!(handle_ncm);
         handle!(handle_discover);
         handle!(handle_search);
+        handle!(handle_podcast);
         handle!(handle_preload);
         handle!(handle_protocol);
 

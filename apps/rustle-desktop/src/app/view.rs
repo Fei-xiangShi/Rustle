@@ -148,6 +148,7 @@ impl App {
         let main_content = match &self.ui.current_route {
             Route::Playlist(_)
             | Route::NcmPlaylist(_)
+            | Route::Podcast(_)
             | Route::Album(_)
             | Route::RecentlyPlayed => {
                 if let Some(playlist) = &self.ui.playlist_page.current {
@@ -217,6 +218,8 @@ impl App {
                 &self.ui.image_state,
                 self.core.locale,
                 context,
+                liked_songs,
+                current_playing_id,
             ),
             Route::Discover(mode) => {
                 let _ = mode;
@@ -272,6 +275,7 @@ impl App {
             can_go_back: self.ui.nav_history.can_go_back(),
             can_go_forward: self.ui.nav_history.can_go_forward(),
             search_query: &self.ui.search_query,
+            search_suggestions: &self.ui.search.suggestions,
             is_logged_in: self.core.is_logged_in,
             user_info: self.core.user_info.as_ref(),
             image_state: &self.ui.image_state,

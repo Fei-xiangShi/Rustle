@@ -728,6 +728,24 @@ impl App {
             error
         );
 
+        // Record every failure, including the one that reaches the retry limit.
+        // Shuffle must advance its own deck instead of replaying a fixed
+        // sequential fallback while retaining the same failed next candidate.
+        let next_idx = super::queue_navigator::skip_to_next_playable(
+            self.playback.queue.len(),
+            failed_idx,
+            self.effective_queue_play_mode(),
+            &mut self.playback.shuffle_cache,
+        );
+        self.refresh_preload_window();
+
+        let (next, prev) = self.playback.preload_coordinator.adjacent_indices();
+        let stale = self
+            .playback
+            .audio_preload_manager
+            .invalidate_stale(next, prev);
+        self.release_preload_requests(stale);
+
         // Show warning after too many consecutive failures
         let toast_task = if self.playback.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
             tracing::warn!(
@@ -751,8 +769,10 @@ impl App {
             return toast_task;
         }
 
-        // Skip to next playable song
-        Task::batch([toast_task, self.skip_to_next_playable(failed_idx)])
+        // Use the regular playback path so a missing local fallback participates
+        // in the same bounded failure handling as an unavailable online song.
+        let play_task = next_idx.map_or_else(Task::none, |idx| self.play_song_at_index(idx));
+        Task::batch([toast_task, play_task])
     }
 
     fn save_playback_position_snapshot(&self, song_id: i64, queue_pos: i64, position_secs: f64) {
@@ -1659,28 +1679,6 @@ impl App {
         self.play_song_at_index(prev_idx)
     }
 
-    fn skip_to_next_playable(&mut self, failed_idx: usize) -> Task<Message> {
-        // Use QueueNavigator's skip_to_next_playable for consistent behavior
-        let next_idx = super::queue_navigator::skip_to_next_playable(
-            self.playback.queue.len(),
-            failed_idx,
-            self.core.settings.play_mode,
-            &self.playback.shuffle_cache,
-        );
-
-        let Some(next_idx) = next_idx else {
-            return Task::none();
-        };
-
-        let song = &self.playback.queue[next_idx];
-        if super::song_resolver::needs_resolution(song) || PathBuf::from(&song.file_path).exists() {
-            return self.play_song_at_index(next_idx);
-        }
-
-        tracing::warn!("Skipping unavailable song: {}", song.title);
-        Task::none()
-    }
-
     pub fn handle_song_finished(&mut self) -> Task<Message> {
         tracing::info!(
             "handle_song_finished called, play_mode: {:?}, fm_mode: {}",
@@ -1770,7 +1768,7 @@ impl App {
         if !self
             .playback
             .lyrics_preload_manager
-            .should_schedule_warmup(song.id, ncm_id)
+            .should_schedule_warmup(song.id)
         {
             return Task::none();
         }

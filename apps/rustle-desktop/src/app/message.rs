@@ -57,6 +57,7 @@ impl SettingsSection {
 /// the update layer discard stale work safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchRequestContext {
+    pub generation: u64,
     pub keyword: String,
     pub tab: crate::app::state::SearchTab,
     pub page: u32,
@@ -178,6 +179,7 @@ pub enum Message {
     CacheStatsReady(crate::cache::CacheStats),
     /// Enforce cache size limit
     EnforceCacheLimit,
+    CacheLimitEnforced,
     /// Update system settings
     UpdateAudioOutputDevice(Option<String>),
     /// Toggle Discord Rich Presence
@@ -365,6 +367,12 @@ pub enum Message {
     LyricsWarmupFinished(i64, Result<(), AppError>),
     /// Local/cached lyrics loaded asynchronously (song_id, lyrics_lines)
     LocalLyricsReady(i64, Vec<crate::application::lyrics::LyricLine>),
+    LyricsCacheMiss(i64),
+    AdjacentLyricsPrepared(
+        i64,
+        u64,
+        Option<std::sync::Arc<Vec<crate::features::lyrics::engine::LyricLineData>>>,
+    ),
     /// Engine lines pre-computed asynchronously (song_id, engine_lines)
     LyricsEngineLinesReady(
         i64,
@@ -671,8 +679,30 @@ pub enum Message {
     SearchFailed(SearchErrorPayload),
     /// Change search page (pagination)
     SearchPageChanged(u32),
+    SearchPageInputChanged(String),
+    SearchPageJump,
+    RadioDetailLoaded(
+        u64,
+        u64,
+        Result<crate::api::RadioDetail, crate::error::AppError>,
+    ),
+    RadioProgramsLoaded(
+        u64,
+        u64,
+        u32,
+        Result<crate::api::RadioPrograms, crate::error::AppError>,
+    ),
+    SearchSuggestDue(u64),
+    SearchSuggestLoaded(
+        u64,
+        Result<Vec<crate::api::SearchSuggestion>, crate::error::AppError>,
+    ),
+    SearchSuggestDismiss,
+    SearchSuggestMove(i32),
+    SearchSuggestPick(usize),
+    SearchSuggestSongLoaded(u64, Result<Vec<crate::api::Track>, crate::error::AppError>),
     /// Hover over search result song
-    HoverSearchSong(Option<u64>),
+    HoverSearchSong(Option<i64>),
     /// Hover over search result card (album/playlist)
     HoverSearchCard(Option<u64>),
     /// Play search result song
@@ -1037,6 +1067,16 @@ impl std::fmt::Debug for Message {
             Self::CacheStatsReady(_) => simple!("CacheStatsReady"),
             Self::RefreshCacheStats => simple!("RefreshCacheStats"),
             Self::EnforceCacheLimit => simple!("EnforceCacheLimit"),
+            Self::CacheLimitEnforced => simple!("CacheLimitEnforced"),
+            Self::LyricsCacheMiss(id) => simple!("LyricsCacheMiss", "id={}", id),
+            Self::AdjacentLyricsPrepared(id, generation, _) => {
+                simple!(
+                    "AdjacentLyricsPrepared",
+                    "id={}, generation={}",
+                    id,
+                    generation
+                )
+            }
             Self::UpdateAudioOutputDevice(_) => simple!("UpdateAudioOutputDevice"),
             Self::UpdateDiscordEnabled(b) => simple!("UpdateDiscordEnabled", "{}", b),
             Self::UpdateOverseasCompatibility(enabled) => {
@@ -1360,6 +1400,16 @@ impl std::fmt::Debug for Message {
                 )
             }
             Self::SearchFailed(e) => simple!("SearchFailed", "{}", e.error),
+            Self::SearchPageInputChanged(_) => simple!("SearchPageInputChanged"),
+            Self::RadioDetailLoaded(_, _, _) => simple!("RadioDetailLoaded"),
+            Self::RadioProgramsLoaded(_, _, _, _) => simple!("RadioProgramsLoaded"),
+            Self::SearchPageJump => simple!("SearchPageJump"),
+            Self::SearchSuggestDue(_) => simple!("SearchSuggestDue"),
+            Self::SearchSuggestLoaded(_, _) => simple!("SearchSuggestLoaded"),
+            Self::SearchSuggestDismiss => simple!("SearchSuggestDismiss"),
+            Self::SearchSuggestMove(_) => simple!("SearchSuggestMove"),
+            Self::SearchSuggestPick(_) => simple!("SearchSuggestPick"),
+            Self::SearchSuggestSongLoaded(_, _) => simple!("SearchSuggestSongLoaded"),
             Self::SearchPageChanged(page) => simple!("SearchPageChanged", "{}", page),
             Self::HoverSearchSong(id) => simple!("HoverSearchSong", "{:?}", id),
             Self::HoverSearchCard(id) => simple!("HoverSearchCard", "{:?}", id),

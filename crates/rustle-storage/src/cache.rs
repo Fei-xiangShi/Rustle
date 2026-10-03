@@ -2,12 +2,13 @@
 //!
 //! Handles cache size calculation, cleanup, and automatic eviction.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, warn};
 
 use rustle_application::ports::cache::{AudioCacheStore, CachePublisher};
 use rustle_domain::audio::QualityLevel as NcmQualityLevel;
@@ -215,6 +216,12 @@ pub struct AudioCacheManifest {
     pub format: String,
 }
 
+fn is_manifest_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.ends_with(".manifest.json"))
+}
+
 pub fn audio_manifest_path(path: &Path) -> PathBuf {
     let stem = path
         .file_stem()
@@ -326,7 +333,7 @@ fn write_manifest(
 }
 
 /// Information about a cached file
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CacheEntry {
     path: PathBuf,
     size: u64,
@@ -561,49 +568,120 @@ pub fn clear_all_cache() -> ClearResult {
     result
 }
 
-/// Enforce cache size limit by deleting oldest files
+/// Files touched more recently than this are never evicted: they are either
+/// still being written (temp files) or belong to the track that is playing or
+/// preloading, whose mtime is refreshed by [`touch_cache_entry`] on every hit.
+const EVICTION_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Mark a cache entry (and its audio manifest, if any) as recently used so
+/// size-limit eviction behaves as LRU rather than oldest-written-first.
+pub fn touch_cache_entry(path: &Path) {
+    let now = SystemTime::now();
+    for target in [path.to_path_buf(), audio_manifest_path(path)] {
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(&target) {
+            let _ = file.set_modified(now);
+        }
+    }
+}
+
+/// Enforce cache size limit by deleting least recently used files
 ///
 /// Returns the number of bytes freed
 pub fn enforce_cache_limit(max_cache_mb: u64) -> ClearResult {
-    let max_bytes = max_cache_mb * 1024 * 1024;
+    evict_entries(
+        collect_all_entries(),
+        max_cache_mb.saturating_mul(1024 * 1024),
+        SystemTime::now(),
+    )
+}
+
+fn evict_entries(all_entries: Vec<CacheEntry>, max_bytes: u64, now: SystemTime) -> ClearResult {
     let mut result = ClearResult::default();
-
-    // Collect all cache entries
-    let mut all_entries = collect_all_entries();
-
     // Calculate current total size
     let current_size: u64 = all_entries.iter().map(|e| e.size).sum();
 
     if current_size <= max_bytes {
-        info!(
+        debug!(
             "Cache size {} MB is within limit {} MB",
             current_size / (1024 * 1024),
-            max_cache_mb
+            max_bytes / (1024 * 1024)
         );
         return result;
     }
 
-    // Sort by modification time (oldest first)
-    all_entries.sort_by_key(|a| a.modified);
+    // Audio manifests are evicted together with their data file; evicting a
+    // manifest alone would silently invalidate a still-present audio file.
+    let manifests: HashMap<PathBuf, CacheEntry> = all_entries
+        .iter()
+        .filter(|entry| is_manifest_path(&entry.path))
+        .map(|entry| (entry.path.clone(), entry.clone()))
+        .collect();
+    let mut grouped: HashMap<PathBuf, Vec<CacheEntry>> = HashMap::new();
+    for entry in all_entries.iter().filter(|e| !is_manifest_path(&e.path)) {
+        let manifest_path = audio_manifest_path(&entry.path);
+        let key = if manifests.contains_key(&manifest_path) {
+            manifest_path
+        } else {
+            entry.path.clone()
+        };
+        grouped.entry(key).or_default().push(entry.clone());
+    }
+    for (path, manifest) in manifests {
+        // Append the sidecar last, including when several extensions share it.
+        grouped.entry(path).or_default().push(manifest);
+    }
+    let mut groups: Vec<_> = grouped
+        .into_values()
+        .map(|group| {
+            (
+                group.iter().map(|entry| entry.modified).max().unwrap(),
+                group,
+            )
+        })
+        .collect();
+
+    // Least recently used first
+    groups.sort_by_key(|(recency, _)| *recency);
 
     let mut freed: u64 = 0;
     let target_free = current_size - max_bytes;
 
-    // Delete oldest files until we're under the limit
-    for entry in all_entries {
+    // Delete least recently used files until we're under the limit
+    for (recency, group) in groups {
         if freed >= target_free {
             break;
         }
+        if now.duration_since(recency).unwrap_or_default() < EVICTION_GRACE {
+            continue;
+        }
+        // A hit after the directory scan still receives the full grace period.
+        if group.iter().any(|entry| {
+            fs::metadata(&entry.path)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() < EVICTION_GRACE
+                })
+        }) {
+            continue;
+        }
 
-        match fs::remove_file(&entry.path) {
-            Ok(_) => {
-                freed += entry.size;
-                result.files_deleted += 1;
-                result.bytes_freed += entry.size;
-            }
-            Err(e) => {
-                warn!("Failed to delete cache file {:?}: {}", entry.path, e);
-                result.errors += 1;
+        for entry in group {
+            match fs::remove_file(&entry.path) {
+                Ok(_) => {
+                    freed += entry.size;
+                    result.files_deleted += 1;
+                    result.bytes_freed += entry.size;
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        continue;
+                    }
+                    warn!("Failed to delete cache file {:?}: {}", entry.path, e);
+                    result.errors += 1;
+                    // Never invalidate remaining audio when deleting its data
+                    // failed (for example because Windows still has it open).
+                    break;
+                }
             }
         }
     }
@@ -642,12 +720,14 @@ pub fn cleanup_temp_files(download_dir: Option<&Path>) -> ClearResult {
 
     // Clean cache directories
     for dir in cache_directories() {
-        cleanup_temp_files_in_dir(&dir, &mut result);
+        cleanup_temp_files_in_dir(&dir, false, &mut result);
     }
-    cleanup_temp_files_in_dir(&cache_dir(), &mut result);
+    cleanup_temp_files_in_dir(&cache_dir(), false, &mut result);
 
+    // The download directory is user-visible, so only remove temp files that
+    // were created by `unique_temp_path`, never arbitrary user `.tmp` files.
     if let Some(download_dir) = download_dir {
-        cleanup_temp_files_in_dir(download_dir, &mut result);
+        cleanup_temp_files_in_dir(download_dir, true, &mut result);
     }
 
     if result.files_deleted > 0 {
@@ -660,7 +740,26 @@ pub fn cleanup_temp_files(download_dir: Option<&Path>) -> ClearResult {
     result
 }
 
-fn cleanup_temp_files_in_dir(dir: &Path, result: &mut ClearResult) {
+/// Whether `name` matches the `.{name}.{pid}.{nonce}.{counter}.tmp` format
+/// produced by [`unique_temp_path`].
+fn is_app_temp_file_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix('.')
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(4, '.');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+    };
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_some_and(|value| !value.is_empty())
+}
+
+fn cleanup_temp_files_in_dir(dir: &Path, app_temp_only: bool, result: &mut ClearResult) {
     if !dir.exists() {
         return;
     }
@@ -680,7 +779,13 @@ fn cleanup_temp_files_in_dir(dir: &Path, result: &mut ClearResult) {
         }
 
         // Check if it's a .tmp file
-        let is_tmp = path.extension().map(|e| e == "tmp").unwrap_or(false);
+        let is_tmp = if app_temp_only {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(is_app_temp_file_name)
+        } else {
+            path.extension().map(|e| e == "tmp").unwrap_or(false)
+        };
         let is_qr = dir == cache_dir()
             && path
                 .file_name()
@@ -707,6 +812,16 @@ fn cleanup_temp_files_in_dir(dir: &Path, result: &mut ClearResult) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn app_temp_name_matches_unique_temp_path_only() {
+        let generated = unique_temp_path(Path::new("dir/Song - Artist.flac"));
+        let name = generated.file_name().unwrap().to_str().unwrap();
+        assert!(is_app_temp_file_name(name));
+        assert!(!is_app_temp_file_name("user-notes.tmp"));
+        assert!(!is_app_temp_file_name(".hidden.tmp"));
+        assert!(!is_app_temp_file_name(".song.flac.12.ab.3.tmp"));
+    }
+
     fn test_root(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -715,6 +830,115 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rustle-cache-{label}-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn eviction_entry(path: &Path) -> CacheEntry {
+        let metadata = fs::metadata(path).unwrap();
+        CacheEntry {
+            path: path.to_owned(),
+            size: metadata.len(),
+            modified: metadata.modified().unwrap(),
+        }
+    }
+
+    #[test]
+    fn download_cleanup_preserves_unrelated_user_temp_files() {
+        let root = test_root("user-temp-cleanup");
+        let user_file = root.join("notes.tmp");
+        let app_file = unique_temp_path(&root.join("song.flac"));
+        fs::write(&user_file, b"user content").unwrap();
+        fs::write(&app_file, b"incomplete").unwrap();
+        let mut result = ClearResult::default();
+        cleanup_temp_files_in_dir(&root, true, &mut result);
+        assert_eq!(result.files_deleted, 1);
+        assert_eq!(fs::read(&user_file).unwrap(), b"user content");
+        assert!(!app_file.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_audio_deletion_preserves_its_manifest() {
+        let root = test_root("eviction-failure");
+        let audio = root.join("7.flac");
+        // A directory reliably makes remove_file fail on every platform,
+        // without changing permissions or depending on open-handle semantics.
+        fs::create_dir(&audio).unwrap();
+        let manifest = audio_manifest_path(&audio);
+        fs::write(&manifest, b"manifest").unwrap();
+        let result = evict_entries(
+            vec![eviction_entry(&audio), eviction_entry(&manifest)],
+            0,
+            SystemTime::now() + EVICTION_GRACE + Duration::from_secs(1),
+        );
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.files_deleted, 0);
+        assert!(manifest.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_manifest_is_deleted_once_after_all_audio_extensions() {
+        let root = test_root("eviction-extensions");
+        let first = root.join("7.flac");
+        let second = root.join("7.mp3");
+        let manifest = audio_manifest_path(&first);
+        for path in [&first, &second, &manifest] {
+            fs::write(path, b"cache").unwrap();
+        }
+        let result = evict_entries(
+            [&first, &second, &manifest]
+                .map(|path| eviction_entry(path))
+                .to_vec(),
+            0,
+            SystemTime::now() + EVICTION_GRACE + Duration::from_secs(1),
+        );
+        assert_eq!(result.errors, 0);
+        assert_eq!(result.files_deleted, 3);
+        assert_eq!(result.bytes_freed, 15);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn later_maintenance_evicts_entries_after_the_grace_expires() {
+        let root = test_root("eviction-retry");
+        let audio = root.join("7.flac");
+        let manifest = audio_manifest_path(&audio);
+        fs::write(&audio, b"audio").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+        let entries = vec![eviction_entry(&audio), eviction_entry(&manifest)];
+        let now = SystemTime::now();
+        assert_eq!(evict_entries(entries.clone(), 0, now).files_deleted, 0);
+        let retry = evict_entries(entries, 0, now + EVICTION_GRACE + Duration::from_secs(1));
+        assert_eq!(retry.files_deleted, 2);
+        assert!(!audio.exists());
+        assert!(!manifest.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cache_hit_after_the_scan_preserves_the_whole_group() {
+        let root = test_root("eviction-hit");
+        let audio = root.join("7.flac");
+        let manifest = audio_manifest_path(&audio);
+        let old = SystemTime::now() - EVICTION_GRACE - Duration::from_secs(5);
+        for path in [&audio, &manifest] {
+            fs::write(path, b"cache").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let entries = vec![eviction_entry(&audio), eviction_entry(&manifest)];
+        touch_cache_entry(&audio);
+        assert_eq!(
+            evict_entries(entries, 0, SystemTime::now()).files_deleted,
+            0
+        );
+        assert!(audio.exists());
+        assert!(manifest.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

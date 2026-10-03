@@ -17,8 +17,8 @@ pub use message::{
 pub(crate) use state::ImageEntry;
 pub use state::{
     App, ContextMenuState, CoreState, DiscoverPageState, DiscoverViewMode, DownloadTab, ImageState,
-    LibraryState, LyricsDisplayMode, PlaybackSessionState, Route, SearchPageState, SearchTab,
-    SongEditDialogState, UiState, UserInfo,
+    LibraryState, LyricsDisplayMode, PlaybackSessionState, Route, SEARCH_PAGE_SIZE,
+    SearchPageState, SearchSuggestionsState, SearchTab, SongEditDialogState, UiState, UserInfo,
 };
 pub use update::song_resolver::ResolvedAudioQuality;
 
@@ -103,11 +103,12 @@ impl App {
     /// Create new application instance
     pub fn new() -> (Self, Task<Message>) {
         crate::observability::set_runtime_phase(crate::observability::RuntimePhase::Application);
-        // 0. Clean up orphan temp files from interrupted downloads
-        crate::cache::cleanup_temp_files();
-
         // 1. Load settings first to initialize locale correctly
         let settings = crate::features::Settings::load();
+
+        // Clean up orphan temp files from interrupted downloads in the
+        // configured (not default) download directory.
+        crate::cache::cleanup_temp_files(&settings);
         let locale = {
             let lang = Language::from_code(&settings.display.language).unwrap_or_default();
             Locale::new(lang)
@@ -326,6 +327,9 @@ impl App {
 
         // Batch all subscriptions
         iced::Subscription::batch([
+            // Maintenance outlives playback/download events and retries entries
+            // once their ten-minute grace expires, including while hidden.
+            iced::time::every(Duration::from_secs(60)).map(|_| Message::EnforceCacheLimit),
             update::audio_index::subscription(self.core.settings.storage.effective_download_dir()),
             keyboard_sub,
             close_request_sub,

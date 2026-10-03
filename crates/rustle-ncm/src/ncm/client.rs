@@ -21,6 +21,8 @@ const NCM_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAGE_DOWNLOAD_ATTEMPTS: usize = 2;
 const LOGIN_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const RADIO_PROGRAM_INTERVAL: Duration = Duration::from_secs(1);
+const RADIO_PROGRAM_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
 const CLIENT_LOG_DOMAIN: &str = "https://clientlog.music.163.com";
 
 // Keep the forwarded address stable across clones, logins, and client rebuilds.
@@ -103,6 +105,7 @@ pub struct NcmClient {
     session_path: Arc<PathBuf>,
     anonymous_bootstrap: Arc<tokio::sync::Mutex<()>>,
     login_refresh: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    radio_program_gate: Arc<tokio::sync::Mutex<Option<Instant>>>,
     proxy: Option<String>,
     quality: Arc<AtomicU32>,
     overseas_compatibility: Arc<AtomicBool>,
@@ -162,6 +165,7 @@ impl NcmClient {
             session_path: Arc::new(session_path),
             anonymous_bootstrap: Arc::new(tokio::sync::Mutex::new(())),
             login_refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            radio_program_gate: Arc::new(tokio::sync::Mutex::new(None)),
             proxy,
             quality: Arc::new(AtomicU32::new(DEFAULT_QUALITY)),
             overseas_compatibility: Arc::new(AtomicBool::new(false)),
@@ -1143,6 +1147,40 @@ impl NcmClient {
         mapper::search(&response.body, search_type)
     }
 
+    pub async fn search_suggestions(&self, keyword: &str) -> Result<Vec<SearchSuggestion>> {
+        let query = self
+            .query()
+            .param("keywords", keyword.trim())
+            .param("type", "web");
+        let response =
+            Self::request_with_timeout("search_suggest", self.client.search_suggest(&query))
+                .await?;
+        mapper::search_suggestions(&response.body)
+    }
+
+    pub async fn radio_detail(&self, id: u64) -> Result<RadioDetail> {
+        let query = self.query().param("rid", &id.to_string());
+        let response =
+            Self::request_with_timeout("dj_detail", self.client.dj_detail(&query)).await?;
+        mapper::radio_detail(&response.body)
+    }
+
+    pub async fn radio_programs(&self, id: u64, offset: u32, limit: u32) -> Result<RadioPrograms> {
+        let query = self
+            .query()
+            .param("rid", &id.to_string())
+            .param("limit", &limit.to_string())
+            .param("offset", &offset.to_string());
+        let response = paced_radio_program_request(
+            &self.radio_program_gate,
+            RADIO_PROGRAM_INTERVAL,
+            &RADIO_PROGRAM_BACKOFF,
+            || Self::request_with_timeout("dj_program", self.client.dj_program(&query)),
+        )
+        .await?;
+        mapper::radio_programs(&response.body)
+    }
+
     pub async fn artist_albums(&self, artist_id: u64, limit: u32) -> Result<Vec<AlbumSummary>> {
         let query = self
             .query()
@@ -1201,6 +1239,40 @@ impl NcmClient {
             &requested_track_ids,
             retried_after_code_512,
         )
+    }
+}
+
+/// Share pacing across cloned clients and route changes. Only explicit service
+/// throttling is retried; authentication, missing resources and protocol errors
+/// must remain visible. Cancellation drops the lock, retaining its cooldown.
+async fn paced_radio_program_request<T, Attempt, AttemptFuture>(
+    gate: &tokio::sync::Mutex<Option<Instant>>,
+    interval: Duration,
+    backoff: &[Duration],
+    mut attempt: Attempt,
+) -> Result<T>
+where
+    Attempt: FnMut() -> AttemptFuture,
+    AttemptFuture: Future<Output = Result<T>>,
+{
+    let mut next_request = gate.lock().await;
+    let mut retries = backoff.iter();
+    loop {
+        if let Some(deadline) = *next_request {
+            tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+        }
+        *next_request = Some(Instant::now() + interval);
+        match attempt().await {
+            Err(error) if error.is_rate_limited() => {
+                let delay = retries.next();
+                *next_request =
+                    Some(Instant::now() + delay.copied().unwrap_or(interval).max(interval));
+                if delay.is_none() {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
     }
 }
 
@@ -1478,6 +1550,74 @@ mod tests {
             }
         ));
         assert_eq!(error.code(), ErrorCode::NetworkTimeout);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn radio_throttling_retries_are_bounded_and_do_not_retry_authentication() {
+        let gate = tokio::sync::Mutex::new(None);
+        let backoff = [Duration::ZERO; 2];
+        let mut attempts = 0;
+        let error = paced_radio_program_request(&gate, Duration::ZERO, &backoff, || {
+            attempts += 1;
+            async {
+                Err::<(), _>(NcmError::Upstream(ncm_api_rs::NcmError::Api {
+                    code: 406,
+                    msg: "throttled".into(),
+                }))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is_rate_limited());
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = paced_radio_program_request(&gate, Duration::ZERO, &backoff, || {
+            attempts += 1;
+            async { Err::<(), _>(NcmError::Authentication("expired".into())) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::AuthenticationRequired);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn radio_retry_recovers_and_clones_share_the_next_request_deadline() {
+        let client = NcmClient::new();
+        let cloned = client.clone();
+        assert!(Arc::ptr_eq(
+            &client.radio_program_gate,
+            &cloned.radio_program_gate
+        ));
+        let mut attempts = 0;
+        let interval = Duration::from_millis(5);
+        let result =
+            paced_radio_program_request(&client.radio_program_gate, interval, &[interval], || {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt == 1 {
+                        Err(NcmError::Upstream(ncm_api_rs::NcmError::Api {
+                            code: 406,
+                            msg: String::new(),
+                        }))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 2);
+        let deadline = cloned.radio_program_gate.lock().await.unwrap();
+        paced_radio_program_request(&cloned.radio_program_gate, interval, &[], || async {
+            assert!(Instant::now() >= deadline);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

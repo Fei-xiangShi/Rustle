@@ -262,6 +262,13 @@ impl App {
             .current_online_track(ncm_id)
             .or_else(|| {
                 self.ui
+                    .search
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == ncm_id)
+            })
+            .or_else(|| {
+                self.ui
                     .home
                     .current_ncm_playlist_songs
                     .iter()

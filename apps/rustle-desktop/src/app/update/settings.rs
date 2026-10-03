@@ -476,10 +476,24 @@ impl App {
                 Some(Task::none())
             }
             Message::EnforceCacheLimit => {
+                if self.ui.cache_limit_in_flight {
+                    return Some(Task::none());
+                }
+                self.ui.cache_limit_in_flight = true;
                 let max_mb = self.core.settings.storage.max_cache_mb;
                 Some(Task::perform(
                     async move {
-                        let result = cache::enforce_cache_limit(max_mb);
+                        let result = match tokio::task::spawn_blocking(move || {
+                            cache::enforce_cache_limit(max_mb)
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                tracing::warn!(%error, "Cache limit worker failed; will retry on the next maintenance tick");
+                                return Message::CacheLimitEnforced;
+                            }
+                        };
                         if result.files_deleted > 0 {
                             tracing::info!(
                                 "Cache limit enforced: {} files deleted, {} MB freed",
@@ -487,10 +501,14 @@ impl App {
                                 result.mb_freed()
                             );
                         }
-                        Message::RefreshCacheStats
+                        Message::CacheLimitEnforced
                     },
                     |m| m,
                 ))
+            }
+            Message::CacheLimitEnforced => {
+                self.ui.cache_limit_in_flight = false;
+                Some(self.refresh_cache_stats())
             }
             Message::UpdateAudioOutputDevice(device) => {
                 if let Err(error) = self.switch_audio_output_device(device.clone()) {

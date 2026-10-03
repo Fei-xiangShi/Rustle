@@ -279,6 +279,28 @@ pub struct RadioSummary {
     pub program_count: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct RadioDetail {
+    pub radio: RadioSummary,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RadioPrograms {
+    pub tracks: Vec<Track>,
+    /// Number of server records, including programs without a playable mainSong.
+    pub received: u32,
+    pub more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSuggestion {
+    pub id: u64,
+    pub kind: SearchType,
+    pub title: String,
+    pub subtitle: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum TrackAvailability {
     Free,

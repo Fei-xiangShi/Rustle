@@ -25,6 +25,7 @@ pub struct TopBarView<'a> {
     pub locale: Locale,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    pub search_suggestions: &'a crate::app::SearchSuggestionsState,
     pub search_query: &'a str,
     pub is_logged_in: bool,
     pub user_info: Option<&'a UserInfo>,
@@ -41,6 +42,7 @@ pub fn view<'a>(view: TopBarView<'a>) -> Element<'a, Message> {
         can_go_back,
         can_go_forward,
         search_query,
+        search_suggestions,
         is_logged_in,
         user_info,
         image_state,
@@ -331,8 +333,13 @@ pub fn view<'a>(view: TopBarView<'a>) -> Element<'a, Message> {
     .padding(tokens.space(5.0));
 
     // Search bar (left, after nav buttons)
-    let desktop_search_bar =
-        search_bar::view(search_query, locale, SearchBarStyle::top_bar(&context, 0.0));
+    let desktop_search_bar = search_bar::view(
+        search_query,
+        locale,
+        SearchBarStyle::top_bar(&context, 0.0),
+        search_suggestions,
+        context,
+    );
 
     let menu_button: Element<'a, Message> = if context.profile == LayoutProfile::Narrow {
         let button = button(widgets::centered_button_content(

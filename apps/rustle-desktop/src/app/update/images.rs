@@ -240,9 +240,7 @@ impl App {
                 ));
             }
             Message::SearchResultsLoaded(payload)
-                if self.ui.search.keyword == payload.context.keyword
-                    && self.ui.search.active_tab == payload.context.tab
-                    && self.ui.search.current_page == payload.context.page =>
+                if self.search_request_is_current(&payload.context) =>
             {
                 match payload.context.tab {
                     crate::app::state::SearchTab::Songs => {
@@ -264,6 +262,24 @@ impl App {
                     crate::app::state::SearchTab::Radios => {
                         refs.extend(remote_radio_covers(&payload.radios));
                     }
+                }
+            }
+            Message::RadioDetailLoaded(generation, id, Ok(detail))
+                if *generation == self.ui.playlist_page.ncm_load_generation
+                    && self.ui.current_route == Route::Podcast(*id)
+                    && detail.radio.id == *id =>
+            {
+                refs.push(RemoteImage::detail(
+                    ImageKind::RadioCover,
+                    *id,
+                    &detail.radio.cover_url,
+                ));
+                if detail.radio.creator.id != 0 {
+                    refs.push(RemoteImage::new(
+                        ImageKind::UserAvatar,
+                        detail.radio.creator.id,
+                        &detail.radio.creator.avatar_url,
+                    ));
                 }
             }
             Message::NcmPlaylistDetailLoaded(generation, detail)
@@ -781,6 +797,12 @@ impl App {
 
         let path_string = path.to_string_lossy().to_string();
         match kind {
+            ImageKind::RadioCover
+                if page.kind == crate::ui::pages::playlist::DetailPageKind::Podcast
+                    && page.id == super::podcast::podcast_page_id(id) =>
+            {
+                set_detail_cover(page, palette, path_string);
+            }
             ImageKind::PlaylistCover
                 if page.kind == crate::ui::pages::playlist::DetailPageKind::Playlist
                     && page.id == ncm_playlist_page_id(id) =>

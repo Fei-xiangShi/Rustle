@@ -384,6 +384,29 @@ pub fn tracks_from_array(items: Option<&Vec<Value>>, album_override: Option<&Val
         .collect()
 }
 
+fn playback_quality(item: &Value) -> Option<NcmQualityLevel> {
+    match item.get("level") {
+        Some(Value::String(level)) if !level.is_empty() => {
+            return super::models::quality_from_api_level(level);
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        _ => return None,
+    }
+    // DJ audio can return a usable URL with level=null. Infer only regular
+    // lossy quality from the actual codec/bitrate, never from the user's
+    // requested Hi-Res/Dolby level (which would also poison cache identity).
+    let format = item.get("type")?.as_str()?;
+    if !format.eq_ignore_ascii_case("mp3") && !format.eq_ignore_ascii_case("aac") {
+        return None;
+    }
+    match item.get("br").and_then(as_u32)? {
+        1..=128_000 => Some(NcmQualityLevel::Standard),
+        128_001..=192_000 => Some(NcmQualityLevel::Higher),
+        192_001..=320_000 => Some(NcmQualityLevel::ExHigh),
+        _ => None,
+    }
+}
+
 pub fn track_urls(value: &Value, requested_level: NcmQualityLevel) -> Result<Vec<TrackUrl>> {
     if !code_ok(value) {
         return Err(NcmError::business("track URL request failed"));
@@ -400,10 +423,7 @@ pub fn track_urls(value: &Value, requested_level: NcmQualityLevel) -> Result<Vec
                 .and_then(Value::as_str)
                 .map(normalized_audio_url)
                 .unwrap_or_default();
-            let level = item
-                .get("level")
-                .and_then(Value::as_str)
-                .and_then(super::models::quality_from_api_level)?;
+            let level = playback_quality(item)?;
             (!url.is_empty()).then(|| TrackUrl {
                 id,
                 url,
@@ -652,6 +672,48 @@ mod quality_tests {
             NcmQualityLevel::ExHigh,
         )
         .expect("url response");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn podcast_urls_with_null_level_preserve_actual_lossy_quality() {
+        for (bitrate, expected) in [
+            (128_000, NcmQualityLevel::Standard),
+            (192_000, NcmQualityLevel::Higher),
+            (320_000, NcmQualityLevel::ExHigh),
+        ] {
+            let urls = track_urls(
+                &json!({"code": 200, "data": [{
+                    "id": 556929063, "code": 200, "url": "https://cdn/program.mp3",
+                    "level": null, "br": bitrate, "type": "mp3", "size": 1024
+                }]}),
+                NcmQualityLevel::HiRes,
+            )
+            .unwrap();
+            assert_eq!(urls.len(), 1);
+            assert_eq!(urls[0].id, 556929063);
+            assert_eq!(urls[0].requested_level, NcmQualityLevel::HiRes);
+            assert_eq!(urls[0].level, expected);
+            assert_eq!(urls[0].rate, bitrate);
+        }
+        let urls = track_urls(
+            &json!({"code": 200, "data": [{
+                "id": 7, "url": "https://cdn/program.aac", "br": 128000, "type": "aac"
+            }]}),
+            NcmQualityLevel::HiRes,
+        )
+        .unwrap();
+        assert_eq!(urls[0].level, NcmQualityLevel::Standard);
+    }
+
+    #[test]
+    fn missing_level_fallback_does_not_invent_urls_or_premium_quality() {
+        let urls = track_urls(&json!({"code": 200, "data": [
+            {"id": 1, "url": null, "level": null, "br": 320000, "type": "mp3"},
+            {"id": 2, "url": "https://cdn/audio", "level": null, "br": 0, "type": "mp3"},
+            {"id": 3, "url": "https://cdn/audio", "level": null, "br": 999000, "type": "flac"},
+            {"id": 4, "url": "https://cdn/audio", "level": "future-quality", "br": 320000, "type": "mp3"}
+        ]}), NcmQualityLevel::HiRes).unwrap();
         assert!(urls.is_empty());
     }
 
@@ -1377,6 +1439,67 @@ mod search_tests {
     use super::*;
 
     #[test]
+    fn web_suggestions_preserve_category_identity_and_ignore_malformed_items() {
+        let items = search_suggestions(&json!({"code": 200, "result": {
+            "songs": [{"id": 7, "name": "Song", "artists": [{"name": "A"}, {"name": "B"}]},
+                {"name": "missing ID"}, {"id": 0, "name": "invalid"}],
+            "artists": [{"id": 7, "name": "Artist"}],
+            "albums": [{"id": 8, "name": "Album", "artist": {"name": "A"}}],
+            "playlists": null
+        }}))
+        .unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, SearchType::Songs);
+        assert_eq!(items[0].subtitle, "A / B");
+        assert_eq!(items[1].kind, SearchType::Artists);
+        assert_eq!(items[2].subtitle, "A");
+        assert!(
+            search_suggestions(&json!({"code": 200}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(search_suggestions(&json!({"code": 500})).is_err());
+    }
+
+    #[test]
+    fn radio_programs_use_audio_ids_and_count_unplayable_records_for_offsets() {
+        let page = radio_programs(&json!({"code": 200, "more": true, "programs": [
+            {"id": 10, "name": "Episode", "mainSong": {"id": 99, "duration": 123000},
+             "coverUrl": "https://example.com/episode.jpg", "radio": {"name": "Radio"},
+             "dj": {"userId": 33, "nickname": "Host"}},
+            {"id": 11, "name": "Unavailable"}
+        ]}))
+        .unwrap();
+        assert_eq!(page.received, 2);
+        assert!(page.more);
+        assert_eq!(page.tracks.len(), 1);
+        let track = &page.tracks[0];
+        assert_eq!(track.id, 99);
+        assert_eq!(track.title, "Episode");
+        assert_eq!(track.duration_ms, 123000);
+        assert_eq!(track.cover_url(), "https://example.com/episode.jpg");
+        assert_eq!(track.album.name, "Radio");
+        assert_eq!(track.artists[0].name, "Host");
+        assert_eq!(track.artists[0].id, 0);
+        assert!(radio_programs(&json!({"code": 500})).is_err());
+        assert!(radio_programs(&json!({"code": 200})).is_err());
+    }
+
+    #[test]
+    fn radio_detail_uses_data_envelope_and_preserves_host() {
+        let detail = radio_detail(&json!({"code": 200, "data": {
+            "id": 12, "name": "Radio", "desc": "Description", "programCount": 201,
+            "picUrl": "https://example.com/radio.jpg", "dj": {"userId": 5, "nickname": "Host"}
+        }}))
+        .unwrap();
+        assert_eq!(detail.radio.id, 12);
+        assert_eq!(detail.radio.program_count, 201);
+        assert_eq!(detail.radio.creator.id, 5);
+        assert_eq!(detail.description, "Description");
+        assert!(radio_detail(&json!({"code": 200, "data": {}})).is_err());
+    }
+
+    #[test]
     fn maps_video_search_results() {
         let value = json!({
             "code": 200,
@@ -1432,4 +1555,116 @@ mod search_tests {
         assert_eq!(response.radios[0].creator.nickname, "Test Host");
         assert_eq!(response.radios[0].program_count, 24);
     }
+}
+
+/// Desktop suggestions use the web contract, not Android's `allMatch` keywords.
+pub fn search_suggestions(value: &Value) -> Result<Vec<SearchSuggestion>> {
+    if !code_ok(value) {
+        return Err(NcmError::business("search suggestions failed"));
+    }
+    let result = value.get("result").unwrap_or(&Value::Null);
+    let mut suggestions = Vec::new();
+    for (key, kind) in [
+        ("songs", SearchType::Songs),
+        ("artists", SearchType::Artists),
+        ("albums", SearchType::Albums),
+        ("playlists", SearchType::Playlists),
+    ] {
+        for item in result
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(5)
+        {
+            let Some(id) = item.get("id").and_then(as_u64).filter(|id| *id > 0) else {
+                continue;
+            };
+            let title = str_value(item, "name");
+            if title.trim().is_empty() {
+                continue;
+            }
+            let subtitle = match kind {
+                SearchType::Songs => {
+                    artists_from_array(item.get("artists").and_then(Value::as_array))
+                        .iter()
+                        .map(|artist| artist.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                }
+                SearchType::Albums => item
+                    .get("artist")
+                    .map(|artist| str_value(artist, "name"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            suggestions.push(SearchSuggestion {
+                id,
+                kind,
+                title,
+                subtitle,
+            });
+        }
+    }
+    Ok(suggestions)
+}
+
+pub fn radio_detail(value: &Value) -> Result<RadioDetail> {
+    if !code_ok(value) {
+        return Err(NcmError::business("radio detail failed"));
+    }
+    let data = value
+        .get("data")
+        .ok_or_else(|| NcmError::protocol("radio detail missing"))?;
+    let radio =
+        radio_summary_from_value(data).ok_or_else(|| NcmError::protocol("radio id missing"))?;
+    Ok(RadioDetail {
+        radio,
+        description: str_value(data, "desc"),
+    })
+}
+
+pub fn radio_programs(value: &Value) -> Result<RadioPrograms> {
+    if !code_ok(value) {
+        return Err(NcmError::business("radio programs failed"));
+    }
+    let programs = value
+        .get("programs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| NcmError::protocol("radio programs missing"))?;
+    let tracks = programs
+        .iter()
+        .filter_map(|program| {
+            // Program IDs identify episodes; only mainSong.id identifies playable audio.
+            let mut track = track_from_value(program.get("mainSong")?, None).ok()?;
+            if track.id == 0 {
+                return None;
+            }
+            let title = str_value(program, "name");
+            if !title.is_empty() {
+                track.title = title;
+            }
+            let cover = str_value(program, "coverUrl");
+            if !cover.is_empty() {
+                track.album.image_url = cover;
+            }
+            if let Some(radio) = program.get("radio") {
+                track.album.name = str_value(radio, "name");
+            }
+            if let Some(dj) = program.get("dj") {
+                // DJ user IDs must never be passed to artist-detail endpoints.
+                track.artists = vec![ArtistSummary {
+                    id: 0,
+                    name: str_value(dj, "nickname"),
+                    image_url: String::new(),
+                }];
+            }
+            Some(track)
+        })
+        .collect();
+    Ok(RadioPrograms {
+        tracks,
+        received: programs.len() as u32,
+        more: value.get("more").and_then(Value::as_bool).unwrap_or(false),
+    })
 }

@@ -33,54 +33,20 @@ pub struct LyricsPreloadManager {
 }
 
 impl LyricsPreloadManager {
-    fn has_best_cache(ncm_id: u64) -> bool {
-        crate::features::lyrics::has_cached_best_lyrics(ncm_id)
-    }
-
     fn has_any_cache(ncm_id: u64) -> bool {
-        crate::features::lyrics::load_cached_lyrics(ncm_id).is_some()
+        crate::features::lyrics::has_cached_lyrics(ncm_id)
     }
 
-    pub fn should_schedule_warmup(&mut self, song_id: i64, ncm_id: u64) -> bool {
-        // Only the versioned multi-source selection cache is complete. Legacy
-        // LRC/YRC files still need one automatic upgrade attempt.
-        if Self::has_best_cache(ncm_id) {
-            self.mark_ready(song_id, ncm_id);
-            return false;
-        }
-
-        if self
-            .entries
-            .get(&song_id)
-            .is_some_and(|entry| entry.status == LyricsPreloadStatus::Ready)
-        {
-            self.entries.remove(&song_id);
-            return true;
-        }
-
-        !matches!(
-            self.entries.get(&song_id).map(|entry| entry.status),
-            Some(LyricsPreloadStatus::Fetching) | Some(LyricsPreloadStatus::Failed)
-        )
+    pub fn should_schedule_warmup(&self, song_id: i64) -> bool {
+        // Validate version and full content in the background fetch, once per
+        // session. UI scheduling must never deserialize the cache to probe it.
+        !self.entries.contains_key(&song_id)
     }
 
     pub fn begin_warmup(&mut self, song_id: i64, ncm_id: u64) -> bool {
-        if Self::has_best_cache(ncm_id) {
-            self.mark_ready(song_id, ncm_id);
-            return false;
-        }
-
-        if self
-            .entries
-            .get(&song_id)
-            .is_some_and(|entry| entry.status == LyricsPreloadStatus::Ready)
-        {
-            self.entries.remove(&song_id);
-        }
-
         if matches!(
             self.entries.get(&song_id).map(|entry| entry.status),
-            Some(LyricsPreloadStatus::Fetching)
+            Some(LyricsPreloadStatus::Fetching | LyricsPreloadStatus::Ready)
         ) {
             return false;
         }
@@ -155,6 +121,42 @@ impl LyricsPreloadManager {
                 status: LyricsPreloadStatus::Fetching,
                 last_error: None,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warmup_is_scheduled_once_and_display_joins_the_pending_fetch() {
+        let mut manager = LyricsPreloadManager::default();
+        assert!(manager.should_schedule_warmup(-42));
+        assert!(manager.begin_warmup(-42, 42));
+        assert!(!manager.should_schedule_warmup(-42));
+        assert!(!manager.begin_warmup(-42, 42));
+        assert_eq!(
+            manager.register_display_fetch(-42, 42),
+            DisplayFetchAction::AwaitExisting
+        );
+        manager.mark_ready(-42, 42);
+        assert!(!manager.should_schedule_warmup(-42));
+        assert!(!manager.begin_warmup(-42, 42));
+    }
+
+    #[test]
+    fn invalid_ready_cache_can_fall_back_to_a_single_online_fetch() {
+        let mut manager = LyricsPreloadManager::default();
+        manager.mark_ready(-42, 42);
+        manager.finish_warmup(-42, Err("Cached lyrics are unavailable".into()));
+        assert_eq!(
+            manager.register_display_fetch(-42, 42),
+            DisplayFetchAction::StartFetch
+        );
+        assert_eq!(
+            manager.register_display_fetch(-42, 42),
+            DisplayFetchAction::AwaitExisting
         );
     }
 }

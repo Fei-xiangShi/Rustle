@@ -6,7 +6,7 @@ pub use audio::{prepare_song_tags, tagged_audio_cache_store};
 pub use rustle_storage::cache::{
     CacheStats, ClearResult, cache_publisher, calculate_cache_stats, cleanup_temp_file,
     clear_all_cache, enforce_cache_limit, is_audio_cache_complete, playlists_cache_dir,
-    publish_or_reuse, publish_replace, unique_temp_path,
+    publish_or_reuse, publish_replace, touch_cache_entry, unique_temp_path,
 };
 
 /// Load a cached NCM playlist snapshot.
@@ -81,9 +81,7 @@ pub async fn save_ncm_playlist_cache(detail: &crate::api::PlaylistDetail) {
 
 /// Preserve the historical startup cleanup behavior while storage stays
 /// independent from the root settings model.
-pub fn cleanup_temp_files() -> ClearResult {
-    let download_dir = crate::features::Settings::default()
-        .storage
-        .effective_download_dir();
+pub fn cleanup_temp_files(settings: &crate::features::Settings) -> ClearResult {
+    let download_dir = settings.storage.effective_download_dir();
     rustle_storage::cache::cleanup_temp_files(Some(&download_dir))
 }

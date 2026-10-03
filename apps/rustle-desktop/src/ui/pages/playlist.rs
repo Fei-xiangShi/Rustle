@@ -65,6 +65,7 @@ pub struct PlaylistView {
 pub enum DetailPageKind {
     Playlist,
     Album,
+    Podcast,
     User,
     Artist,
 }
@@ -170,12 +171,15 @@ fn view_for_context<'a>(view: DetailPageView<'a>) -> Element<'a, Message> {
     });
 
     // Build song list header using the reusable component
-    let columns = if playlist.is_local {
+    let mut columns = if playlist.is_local {
         PlaylistColumns::local()
     } else {
         PlaylistColumns::online()
     }
     .for_context(context);
+    if playlist.kind == DetailPageKind::Podcast {
+        columns.show_like = false;
+    }
     let song_list_header = playlist_view::build_header(locale, columns, context);
 
     // Use virtual list for song rows
@@ -275,7 +279,7 @@ fn detail_gradient_colors(
         top,
         middle: theme::lerp_color(top, bottom, 0.55),
         middle_stop: match snapshot.kind {
-            DetailPageKind::Playlist | DetailPageKind::Album => 0.55,
+            DetailPageKind::Playlist | DetailPageKind::Album | DetailPageKind::Podcast => 0.55,
             DetailPageKind::User | DetailPageKind::Artist => 0.58,
         },
     }
@@ -484,6 +488,7 @@ fn build_header<'a>(
     // Playlist type label - larger font
     let type_label_text = match playlist.kind {
         DetailPageKind::Playlist => locale.get(Key::PlaylistTypeLabel).to_string(),
+        DetailPageKind::Podcast => "播客".to_string(),
         DetailPageKind::Album => locale.get(Key::AlbumTypeLabel).to_string(),
         DetailPageKind::User => locale.get(Key::UserTypeLabel).to_string(),
         DetailPageKind::Artist => locale.get(Key::ArtistTypeLabel).to_string(),
@@ -629,12 +634,16 @@ fn build_header<'a>(
         })
         .font(iced::Font::DEFAULT.weight(BOLD_WEIGHT));
 
-    let owner_action =
-        if playlist.kind == DetailPageKind::Playlist && !is_local && playlist.creator_id != 0 {
-            Some(Message::OpenUser(playlist.creator_id))
-        } else {
-            owner_artist_id.map(Message::OpenArtist)
-        };
+    let owner_action = if matches!(
+        playlist.kind,
+        DetailPageKind::Playlist | DetailPageKind::Podcast
+    ) && !is_local
+        && playlist.creator_id != 0
+    {
+        Some(Message::OpenUser(playlist.creator_id))
+    } else {
+        owner_artist_id.map(Message::OpenArtist)
+    };
 
     let owner_info: Element<'static, Message> = if let Some(action) = owner_action {
         container(
@@ -708,11 +717,13 @@ fn build_header<'a>(
     );
     stats_items.push(Space::new().width(tokens.space(6.0)).into());
     stats_items.push(
-        text(
+        text(if playlist.kind == DetailPageKind::Podcast {
+            format!("{song_count} 期节目")
+        } else {
             locale
                 .get(Key::PlaylistSongCount)
-                .replace("{}", &song_count.to_string()),
-        )
+                .replace("{}", &song_count.to_string())
+        })
         .size(tokens.text(TextRole::Body))
         .style(|theme| text::Style {
             color: Some(theme::text_secondary(theme)),
@@ -781,6 +792,17 @@ fn playlist_page_cover_handle<'a>(
             .and_then(|id| {
                 image_state.get_with_fallback(
                     crate::image::ImageKind::PlaylistCover,
+                    id,
+                    crate::image::ImageVariant::Detail,
+                )
+            }),
+        DetailPageKind::Podcast => playlist
+            .id
+            .checked_sub(i64::MIN / 2)
+            .and_then(|id| u64::try_from(id).ok())
+            .and_then(|id| {
+                image_state.get_with_fallback(
+                    crate::image::ImageKind::RadioCover,
                     id,
                     crate::image::ImageVariant::Detail,
                 )
@@ -862,7 +884,11 @@ fn playlist_owner_avatar_handle<'a>(
     playlist: &PlaylistView,
     image_state: &'a ImageState,
 ) -> Option<&'a iced::widget::image::Handle> {
-    if playlist.kind == DetailPageKind::Playlist && playlist.creator_id != 0 {
+    if matches!(
+        playlist.kind,
+        DetailPageKind::Playlist | DetailPageKind::Podcast
+    ) && playlist.creator_id != 0
+    {
         return image_state.get(crate::image::ImageKind::UserAvatar, playlist.creator_id);
     }
     playlist
@@ -1036,7 +1062,11 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
         label: locale.get(Key::PlaylistPlayAll).to_string(),
         icon_svg: icons::PLAY,
         icon_id: IconId::PlayButton,
-        on_press: Message::PlayPlaylist(playlist_id),
+        on_press: if playlist.kind == DetailPageKind::Podcast && playlist.songs.is_empty() {
+            Message::Noop
+        } else {
+            Message::PlayPlaylist(playlist_id)
+        },
         emphasized: true,
         selected: false,
         hover_progress: icon_animations.get_progress(&IconId::PlayButton),
@@ -1046,7 +1076,7 @@ pub(crate) fn build_controls<'a>(view: DetailControls<'a>) -> Element<'a, Messag
     // Build controls row
     let mut action_items: Vec<Element<'a, Message>> = vec![play_btn];
 
-    if is_artist || is_user || is_album {
+    if is_artist || is_user || is_album || playlist.kind == DetailPageKind::Podcast {
         // Artist page keeps only play and search controls.
     } else if is_local && playlist_id != -1 {
         // For local playlists (but not recently played), show edit button with animated color

@@ -4,24 +4,18 @@
 //! with tabbed navigation and pagination.
 
 use iced::widget::text::{Ellipsis, Wrapping};
-use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Element, Fill, Length, Padding};
 
+use crate::app::SEARCH_PAGE_SIZE as PAGE_SIZE;
 use crate::app::{ImageState, Message, SearchPageState, SearchTab};
 use crate::i18n::{Key, Locale};
 use crate::image::ImageKind;
-use crate::ui::animation::{SmoothScrollEvent, SmoothScrollTarget};
 use crate::ui::components::cover_image;
+use crate::ui::components::playlist_view::{self, PlaylistColumns, SongListView};
 use crate::ui::responsive::{LayoutProfile, ResponsiveContext, TextRole, playlist_card_metrics};
 use crate::ui::theme::BOLD_WEIGHT;
 use crate::ui::{theme, widgets};
-
-use crate::ui::primitives::virtual_list::VirtualList;
-
-/// Page size for pagination
-const PAGE_SIZE: u32 = 50;
-// Visual dimensions are 1080P reference pixels resolved through `UiTokens`.
-const SONG_ROW_HEIGHT: f32 = 64.0;
 
 /// Build the search results page view
 pub fn view<'a>(
@@ -29,8 +23,17 @@ pub fn view<'a>(
     image_state: &'a ImageState,
     locale: Locale,
     context: ResponsiveContext,
+    liked_songs: Option<&'a std::collections::HashSet<u64>>,
+    current_playing_id: Option<i64>,
 ) -> Element<'a, Message> {
-    view_for_context(state, image_state, locale, context)
+    view_for_context(
+        state,
+        image_state,
+        locale,
+        context,
+        liked_songs,
+        current_playing_id,
+    )
 }
 
 fn view_for_context<'a>(
@@ -38,6 +41,8 @@ fn view_for_context<'a>(
     image_state: &'a ImageState,
     locale: Locale,
     context: ResponsiveContext,
+    liked_songs: Option<&'a std::collections::HashSet<u64>>,
+    current_playing_id: Option<i64>,
 ) -> Element<'a, Message> {
     let tokens = context.tokens;
     if state.keyword.is_empty() {
@@ -65,7 +70,7 @@ fn view_for_context<'a>(
     } else {
         row![
             title
-                .width(Fill)
+                .width(Length::Shrink)
                 .wrapping(Wrapping::None)
                 .ellipsis(Ellipsis::End),
             related
@@ -110,105 +115,43 @@ fn view_for_context<'a>(
     // Content area
     let content: Element<'a, Message> = if state.loading {
         loading_state(context)
+    } else if state.error.is_some() {
+        container(
+            column![
+                text("搜索失败，请重试").size(tokens.text(TextRole::Body)),
+                button(text("重试").size(tokens.text(TextRole::Label)))
+                    .padding(tokens.space(10.0))
+                    .on_press(Message::SearchSubmit)
+                    .style(move |theme, status| theme::secondary_button(
+                        theme,
+                        status,
+                        tokens.theme_metrics()
+                    ))
+            ]
+            .spacing(tokens.space(12.0))
+            .align_x(Alignment::Center),
+        )
+        .center(Fill)
+        .into()
     } else {
         match state.active_tab {
             SearchTab::Songs => {
                 if state.tracks.is_empty() {
                     empty_results_state(&state.keyword, context)
                 } else {
-                    // Use VirtualList for high performance song list
-                    let song_count = state.tracks.len();
-                    let songs = &state.tracks;
-                    let song_animations = &state.song_animations;
-                    let current_page = state.current_page;
-                    let song_row_height = tokens.size(SONG_ROW_HEIGHT);
-
-                    let table_header = search_table_header(context);
-
-                    let virtual_list =
-                        VirtualList::new(song_count, song_row_height, tokens, move |index| {
-                            if index >= songs.len() {
-                                return Space::new().height(song_row_height).into();
-                            }
-
-                            let song = &songs[index];
-                            let hover_progress = song_animations.get_progress(&song.id);
-                            let index_num = current_page * PAGE_SIZE + index as u32 + 1;
-                            let duration_secs = song.duration_ms / 1000;
-                            let duration_str =
-                                format!("{}:{:02}", duration_secs / 60, duration_secs % 60);
-                            let quality_label = song
-                                .quality_options
-                                .iter()
-                                .max_by_key(|option| option.level.priority())
-                                .map(|option| option.level.short_name().to_string());
-                            let availability_label = song.availability.label();
-                            let availability_restricted = song.availability.is_restricted();
-                            let quality_badge: Element<'static, Message> = quality_label
-                                .map(|label| -> Element<'static, Message> {
-                                    text(label)
-                                        .size(tokens.text(TextRole::Caption))
-                                        .style(|_theme| iced::widget::text::Style {
-                                            color: Some(theme::accent(_theme)),
-                                        })
-                                        .into()
-                                })
-                                .unwrap_or_else(|| -> Element<'static, Message> {
-                                    Space::new().width(0).into()
-                                });
-                            let availability_badge: Element<'static, Message> =
-                                if availability_label.is_empty() {
-                                    Space::new().width(0).into()
-                                } else {
-                                    text(availability_label)
-                                        .size(tokens.text(TextRole::Caption))
-                                        .style(move |theme| iced::widget::text::Style {
-                                            color: Some(if availability_restricted {
-                                                theme::accent(theme)
-                                            } else {
-                                                theme::text_muted(theme)
-                                            }),
-                                        })
-                                        .into()
-                                };
-
-                            search_song_row(
-                                song,
-                                index_num,
-                                duration_str,
-                                quality_badge,
-                                availability_badge,
-                                hover_progress,
-                                context,
-                            )
-                        })
-                        .keyed_by(move |index| {
-                            songs
-                                .get(index)
-                                .map(|song| (song.id, current_page, index))
-                                .unwrap_or((0, current_page, index))
-                        })
-                        .state(state.scroll_state.clone())
-                        .on_item_hover(move |index| {
-                            if index < songs.len() {
-                                Message::HoverSearchSong(Some(songs[index].id))
-                            } else {
-                                Message::HoverSearchSong(None)
-                            }
-                        })
-                        .on_empty_area(Message::HoverSearchSong(None))
-                        .on_smooth_scroll(|delta| {
-                            Message::SmoothScroll(SmoothScrollEvent::Requested {
-                                target: SmoothScrollTarget::SearchSongs,
-                                delta,
-                            })
-                        })
-                        .on_smooth_scroll_cancel(Message::SmoothScroll(
-                            SmoothScrollEvent::Cancelled {
-                                target: SmoothScrollTarget::SearchSongs,
-                            },
-                        ))
-                        .height(Length::Fill);
+                    let columns = PlaylistColumns::online().for_context(context);
+                    let table_header = playlist_view::build_header(locale, columns, context);
+                    let virtual_list = playlist_view::build_search_list(SongListView {
+                        songs: &state.song_views,
+                        filtered_indices: None,
+                        image_state,
+                        song_animations: &state.song_animations,
+                        liked_songs,
+                        columns,
+                        scroll_state: state.scroll_state.clone(),
+                        current_playing_id,
+                        context,
+                    });
 
                     let list_section = column![
                         table_header,
@@ -217,23 +160,7 @@ fn view_for_context<'a>(
                     ]
                     .padding(Padding::new(tokens.space(32.0)).top(0.0));
 
-                    if state.total_count > PAGE_SIZE {
-                        column![
-                            list_section.height(Fill),
-                            Space::new().height(tokens.space(16.0)),
-                            pagination(state, context),
-                            Space::new().height(tokens.space(32.0)),
-                        ]
-                        .height(Fill)
-                        .into()
-                    } else {
-                        column![
-                            list_section.height(Fill),
-                            Space::new().height(tokens.space(32.0)),
-                        ]
-                        .height(Fill)
-                        .into()
-                    }
+                    list_section.height(Fill).into()
                 }
             }
             SearchTab::Albums
@@ -253,14 +180,7 @@ fn view_for_context<'a>(
                     empty_results_state(&state.keyword, context)
                 } else {
                     let grid = grid_results(state, image_state, state.active_tab, context);
-                    let mut col = column![grid];
-
-                    if state.total_count > PAGE_SIZE {
-                        col = col
-                            .push(Space::new().height(tokens.space(24.0)))
-                            .push(pagination(state, context));
-                    }
-                    col = col.push(Space::new().height(tokens.space(40.0)));
+                    let col = column![grid, Space::new().height(tokens.space(24.0))];
 
                     col.padding(Padding::new(tokens.space(32.0)).top(0.0))
                         .into()
@@ -271,142 +191,19 @@ fn view_for_context<'a>(
         }
     };
 
-    container(column![header_section, content].width(Fill).height(Fill))
+    let mut body = column![header_section, container(content).height(Fill).width(Fill)];
+    if state.total_count > PAGE_SIZE || state.current_page > 0 {
+        body = body.push(
+            container(pagination(state, context)).padding([tokens.space(12.0), tokens.space(16.0)]),
+        );
+    }
+    container(body.width(Fill).height(Fill))
         .width(Fill)
         .height(Fill)
         .style(theme::main_content)
         .into()
 }
 
-fn search_song_row<'a>(
-    song: &'a crate::api::Track,
-    index_num: u32,
-    duration: String,
-    quality_badge: Element<'static, Message>,
-    availability_badge: Element<'static, Message>,
-    hover_progress: f32,
-    context: ResponsiveContext,
-) -> Element<'a, Message> {
-    let tokens = context.tokens;
-    let badges = row![quality_badge, availability_badge]
-        .spacing(tokens.space(6.0))
-        .width(Fill);
-
-    let row_content: Element<'a, Message> = if matches!(
-        context.profile,
-        LayoutProfile::Tablet | LayoutProfile::Narrow
-    ) {
-        let metadata = format!("{} · {}", song.artist_names(), song.album.name);
-        row![
-            text(format!("{:02}", index_num))
-                .size(tokens.text(TextRole::Label))
-                .width(tokens.size(36.0))
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                }),
-            column![
-                text(song.title.as_str())
-                    .size(tokens.text(TextRole::BodyLarge))
-                    .width(Fill)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsis(iced::widget::text::Ellipsis::End)
-                    .style(move |theme| iced::widget::text::Style {
-                        color: Some(theme::animated_text(theme, hover_progress)),
-                    }),
-                badges,
-                text(metadata)
-                    .size(tokens.text(TextRole::Caption))
-                    .width(Fill)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsis(iced::widget::text::Ellipsis::End)
-                    .style(|theme| iced::widget::text::Style {
-                        color: Some(theme::text_secondary(theme)),
-                    }),
-            ]
-            .spacing(tokens.space(3.0))
-            .width(Fill),
-            text(duration)
-                .size(tokens.text(TextRole::Label))
-                .width(tokens.size(60.0))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsis(iced::widget::text::Ellipsis::End)
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                }),
-        ]
-        .spacing(tokens.space(8.0))
-        .align_y(Alignment::Center)
-        .into()
-    } else {
-        row![
-            text(format!("{:02}", index_num))
-                .size(tokens.text(TextRole::Label))
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                })
-                .width(tokens.size(40.0)),
-            column![
-                text(song.title.as_str())
-                    .size(tokens.text(TextRole::Body))
-                    .width(Fill)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsis(iced::widget::text::Ellipsis::End)
-                    .style(move |theme| iced::widget::text::Style {
-                        color: Some(theme::animated_text(theme, hover_progress)),
-                    }),
-                badges,
-            ]
-            .width(Fill),
-            text(song.artist_names())
-                .size(tokens.text(TextRole::Label))
-                .width(Length::FillPortion(2))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsis(iced::widget::text::Ellipsis::End)
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_secondary(theme)),
-                }),
-            text(song.album.name.as_str())
-                .size(tokens.text(TextRole::Label))
-                .width(Length::FillPortion(2))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsis(iced::widget::text::Ellipsis::End)
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                }),
-            text(duration)
-                .size(tokens.text(TextRole::Label))
-                .width(tokens.size(60.0))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsis(iced::widget::text::Ellipsis::End)
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                }),
-        ]
-        .spacing(tokens.space(12.0))
-        .align_y(Alignment::Center)
-        .into()
-    };
-
-    button(row_content)
-        .style(move |theme, status| {
-            song_row_style(
-                theme,
-                status,
-                hover_progress,
-                tokens.radius(crate::ui::responsive::RadiusRole::Small),
-            )
-        })
-        .on_press(Message::PlaySearchSong(song.id))
-        .width(Fill)
-        .padding(
-            Padding::new(tokens.space(10.0))
-                .left(tokens.space(12.0))
-                .right(tokens.space(12.0)),
-        )
-        .into()
-}
-
-/// Search tabs component
 fn search_tabs(
     active_tab: SearchTab,
     locale: Locale,
@@ -488,93 +285,6 @@ fn search_tabs(
     .into()
 }
 
-/// Search table header
-fn search_table_header(context: ResponsiveContext) -> Element<'static, Message> {
-    let tokens = context.tokens;
-    let mut items: Vec<Element<'static, Message>> = vec![
-        text("#")
-            .size(tokens.text(TextRole::Caption))
-            .style(|theme| iced::widget::text::Style {
-                color: Some(theme::text_muted(theme)),
-            })
-            .width(tokens.size(40.0))
-            .into(),
-        text("标题")
-            .size(tokens.text(TextRole::Caption))
-            .style(|theme| iced::widget::text::Style {
-                color: Some(theme::text_muted(theme)),
-            })
-            .width(Fill)
-            .into(),
-    ];
-    if !matches!(
-        context.profile,
-        LayoutProfile::Tablet | LayoutProfile::Narrow
-    ) {
-        items.push(
-            text("歌手")
-                .size(tokens.text(TextRole::Caption))
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                })
-                .width(Length::FillPortion(2))
-                .into(),
-        );
-        items.push(
-            text("专辑")
-                .size(tokens.text(TextRole::Caption))
-                .style(|theme| iced::widget::text::Style {
-                    color: Some(theme::text_muted(theme)),
-                })
-                .width(Length::FillPortion(2))
-                .into(),
-        );
-    }
-    items.push(
-        text("时长")
-            .size(tokens.text(TextRole::Caption))
-            .style(|theme| iced::widget::text::Style {
-                color: Some(theme::text_muted(theme)),
-            })
-            .width(tokens.size(60.0))
-            .into(),
-    );
-    row(items)
-        .spacing(tokens.space(12.0))
-        .padding(
-            Padding::new(tokens.space(8.0))
-                .left(tokens.space(12.0))
-                .right(tokens.space(12.0)),
-        )
-        .into()
-}
-
-/// Song row style with hover animation
-fn song_row_style(
-    theme: &iced::Theme,
-    status: button::Status,
-    hover_progress: f32,
-    radius: f32,
-) -> button::Style {
-    let bg = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            theme::hover_bg_alpha(theme, 0.08 + 0.04 * hover_progress)
-        }
-        _ => theme::hover_bg_alpha(theme, 0.04 * hover_progress),
-    };
-
-    button::Style {
-        background: Some(iced::Background::Color(bg)),
-        text_color: theme::text_primary(theme),
-        border: iced::Border {
-            radius: radius.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-/// Grid view for albums and playlists
 fn grid_results<'a>(
     state: &'a SearchPageState,
     image_state: &'a ImageState,
@@ -851,20 +561,38 @@ fn pagination<'a>(state: &'a SearchPageState, context: ResponsiveContext) -> Ele
                 .right(tokens.space(16.0)),
         )
         .style(move |theme, status| theme::secondary_button(theme, status, tokens.theme_metrics()))
-        .on_press_maybe(if current_page > 0 {
+        .on_press_maybe(if current_page > 0 && !state.loading {
             Some(Message::SearchPageChanged(current_page - 1))
         } else {
             None
         });
     items.push(prev_btn.into());
 
-    // Page info
+    let page_input = text_input("页码", &state.page_input)
+        .id(iced::widget::Id::new("search_page_input"))
+        .on_input(Message::SearchPageInputChanged)
+        .on_submit(Message::SearchPageJump)
+        .width(tokens.size(64.0))
+        .padding(tokens.space(8.0))
+        .size(tokens.text(TextRole::Body))
+        .style(move |theme, status| {
+            let mut style = text_input::default(theme, status);
+            style.border.radius = tokens.size(8.0).into();
+            style
+        });
+    items.push(page_input.into());
     items.push(
-        text(format!("{} / {}", current_page + 1, total_pages))
+        text(format!("/ {total_pages}"))
             .size(tokens.text(TextRole::Body))
-            .style(|theme| iced::widget::text::Style {
-                color: Some(theme::text_secondary(theme)),
+            .into(),
+    );
+    items.push(
+        button(text("跳转").size(tokens.text(TextRole::Label)))
+            .padding(tokens.space(8.0))
+            .style(move |theme, status| {
+                theme::secondary_button(theme, status, tokens.theme_metrics())
             })
+            .on_press(Message::SearchPageJump)
             .into(),
     );
 
@@ -876,7 +604,7 @@ fn pagination<'a>(state: &'a SearchPageState, context: ResponsiveContext) -> Ele
                 .right(tokens.space(16.0)),
         )
         .style(move |theme, status| theme::secondary_button(theme, status, tokens.theme_metrics()))
-        .on_press_maybe(if current_page + 1 < total_pages {
+        .on_press_maybe(if current_page + 1 < total_pages && !state.loading {
             Some(Message::SearchPageChanged(current_page + 1))
         } else {
             None
@@ -885,7 +613,7 @@ fn pagination<'a>(state: &'a SearchPageState, context: ResponsiveContext) -> Ele
 
     container(
         row(items)
-            .spacing(tokens.space(16.0))
+            .spacing(tokens.space(8.0))
             .align_y(Alignment::Center),
     )
     .width(Fill)

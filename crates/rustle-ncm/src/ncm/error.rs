@@ -60,6 +60,18 @@ impl NcmError {
         )
     }
 
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::Upstream(
+                ncm_api_rs::NcmError::Api {
+                    code: 406 | 429,
+                    ..
+                } | ncm_api_rs::NcmError::RateLimited(_)
+            )
+        )
+    }
+
     pub(crate) fn is_playback_auth_candidate(&self) -> bool {
         self.is_authentication() || matches!(self, Self::PlaybackUnavailable { .. })
     }
@@ -103,6 +115,25 @@ impl NcmError {
 impl From<NcmError> for AppError {
     fn from(error: NcmError) -> Self {
         let code = error.code();
+        if error.is_rate_limited() {
+            return AppError::with_source(code, "音乐服务请求过于频繁，请稍后重试", error)
+                .with_recovery(RecoveryHint::Retry);
+        }
+        if matches!(error, NcmError::PlaybackUnavailable { .. }) {
+            return AppError::with_source(code, "未获取到可用的音频播放地址", error)
+                .with_recovery(RecoveryHint::None);
+        }
+        if let NcmError::Upstream(ncm_api_rs::NcmError::Api {
+            code: service_code, ..
+        }) = &error
+        {
+            return AppError::with_source(
+                code,
+                format!("音乐服务返回错误（代码 {service_code}）"),
+                error,
+            )
+            .with_recovery(RecoveryHint::None);
+        }
         let summary = match code {
             ErrorCode::AuthenticationRequired => "Please sign in to continue",
             ErrorCode::BusinessRejected => "The music service rejected the operation",
@@ -135,5 +166,39 @@ mod tests {
         assert_eq!(auth.code(), ErrorCode::AuthenticationRequired);
         assert_eq!(business.code(), ErrorCode::BusinessRejected);
         assert_eq!(protocol.code(), ErrorCode::ProtocolInvalidResponse);
+    }
+
+    #[test]
+    fn throttling_has_safe_feedback_and_a_retry_hint() {
+        for code in [406, 429, 503] {
+            let error = NcmError::Upstream(ncm_api_rs::NcmError::from_api(
+                code,
+                "private response".into(),
+            ));
+            assert!(error.is_rate_limited());
+            let app: AppError = error.into();
+            assert_eq!(app.recovery(), RecoveryHint::Retry);
+            assert!(!app.to_string().contains("private response"));
+        }
+        assert!(
+            !NcmError::Upstream(ncm_api_rs::NcmError::Api {
+                code: 404,
+                msg: String::new()
+            })
+            .is_rate_limited()
+        );
+    }
+
+    #[test]
+    fn unavailable_audio_is_distinct_from_a_server_rejection() {
+        let unavailable: AppError = NcmError::PlaybackUnavailable { song_id: 7 }.into();
+        assert_eq!(unavailable.user_summary(), "未获取到可用的音频播放地址");
+        let rejected: AppError = NcmError::Upstream(ncm_api_rs::NcmError::Api {
+            code: 403,
+            msg: "private upstream payload".into(),
+        })
+        .into();
+        assert!(rejected.user_summary().contains("403"));
+        assert!(!rejected.user_summary().contains("private upstream payload"));
     }
 }

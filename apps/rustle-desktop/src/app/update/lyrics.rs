@@ -423,6 +423,32 @@ impl App {
             }
 
             // Handle pre-computed engine lines
+            Message::AdjacentLyricsPrepared(song_id, generation, lines) => {
+                if !self
+                    .playback
+                    .lyrics_render_manager
+                    .finish_engine_preparation(*song_id, *generation, lines.is_some())
+                {
+                    return Some(Task::none());
+                }
+                match lines {
+                    Some(lines) => self
+                        .handle_lyrics(&Message::LyricsEngineLinesReady(*song_id, lines.clone())),
+                    None => Some(Task::none()),
+                }
+            }
+            Message::LyricsCacheMiss(song_id) => {
+                if self.ui.lyrics.pending_song_id != Some(*song_id) || *song_id >= 0 {
+                    return Some(Task::none());
+                }
+                self.playback
+                    .lyrics_preload_manager
+                    .finish_warmup(*song_id, Err("Cached lyrics are unavailable".into()));
+                Some(Task::done(Message::FetchLyricsOnline(
+                    *song_id,
+                    (-*song_id) as u64,
+                )))
+            }
             Message::LyricsEngineLinesReady(song_id, engine_lines) => {
                 // Evicted adjacent work must not recreate cache entries/jobs.
                 if self.ui.lyrics.displayed_song_id != Some(*song_id)
@@ -812,25 +838,39 @@ impl App {
             } else {
                 continue;
             };
-            let Some(raw_lines) = crate::features::lyrics::load_cached_lyrics(ncm_id) else {
+            if !crate::features::lyrics::has_cached_lyrics(ncm_id) {
                 continue;
-            };
-            if !self
+            }
+            let Some(generation) = self
                 .playback
                 .lyrics_render_manager
                 .begin_engine_preparation(song_id)
-            {
+            else {
                 continue;
-            }
-            let ui_lines = crate::application::lyrics::project_lyrics(raw_lines);
+            };
 
             tracing::info!(
                 "Background render prep: preparing engine lines for adjacent song {}",
                 song_id
             );
 
-            // Prepare engine lines (the handler will store in manager and trigger shaping)
-            tasks.push(Self::prepare_engine_lines_task(song_id, ui_lines));
+            // Read and parse the cache off the UI thread, then prepare engine
+            // lines (the handler will store in manager and trigger shaping).
+            tasks.push(Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        crate::features::lyrics::load_cached_lyrics(ncm_id)
+                            .map(crate::application::lyrics::project_lyrics)
+                            .map(|lines| Self::build_engine_lines(&lines))
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(song_id, %error, "Adjacent lyrics worker failed");
+                        None
+                    })
+                },
+                move |lines| Message::AdjacentLyricsPrepared(song_id, generation, lines),
+            ));
         }
 
         if tasks.is_empty() {
@@ -1235,7 +1275,7 @@ impl App {
     fn note_lyrics_cache_ready_if_available(&mut self, song_id: i64) {
         if song_id < 0 {
             let ncm_id = (-song_id) as u64;
-            if crate::features::lyrics::load_cached_lyrics(ncm_id).is_some() {
+            if crate::features::lyrics::has_cached_lyrics(ncm_id) {
                 self.playback
                     .lyrics_preload_manager
                     .mark_ready(song_id, ncm_id);
@@ -1262,15 +1302,42 @@ impl App {
             },
             move |lines| match lines {
                 Some(lines) => Message::LocalLyricsReady(song_id, lines),
-                None => Message::LyricsLoadFailed(
-                    song_id,
-                    crate::error::AppError::new(
-                        crate::error::ErrorCode::MediaReadFailed,
-                        "Cached lyrics are unavailable",
-                    ),
-                ),
+                None => Message::LyricsCacheMiss(song_id),
             },
         )
+    }
+
+    fn build_engine_lines(
+        lines_for_task: &[crate::application::lyrics::LyricLine],
+    ) -> std::sync::Arc<Vec<crate::features::lyrics::engine::LyricLineData>> {
+        let engine_lines: Vec<crate::features::lyrics::engine::LyricLineData> = lines_for_task
+            .iter()
+            .map(|line| {
+                let word_count = line.words.len();
+                crate::features::lyrics::engine::LyricLineData {
+                    text: line.text.clone(),
+                    words: line
+                        .words
+                        .iter()
+                        .enumerate()
+                        .map(|(i, w)| crate::features::lyrics::engine::WordData {
+                            text: w.word.clone(),
+                            start_ms: w.start_ms,
+                            end_ms: w.end_ms,
+                            emphasize: false,
+                            is_last_word: i == word_count.saturating_sub(1),
+                        })
+                        .collect(),
+                    translated: line.translated.clone(),
+                    romanized: line.romanized.clone(),
+                    start_ms: line.start_ms,
+                    end_ms: line.end_ms,
+                    is_duet: line.is_duet,
+                    is_bg: line.is_background,
+                }
+            })
+            .collect();
+        std::sync::Arc::new(engine_lines)
     }
 
     fn prepare_engine_lines_task(
@@ -1280,35 +1347,7 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let engine_lines: Vec<crate::features::lyrics::engine::LyricLineData> =
-                        lines_for_task
-                            .iter()
-                            .map(|line| {
-                                let word_count = line.words.len();
-                                crate::features::lyrics::engine::LyricLineData {
-                                    text: line.text.clone(),
-                                    words: line
-                                        .words
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, w)| crate::features::lyrics::engine::WordData {
-                                            text: w.word.clone(),
-                                            start_ms: w.start_ms,
-                                            end_ms: w.end_ms,
-                                            emphasize: false,
-                                            is_last_word: i == word_count.saturating_sub(1),
-                                        })
-                                        .collect(),
-                                    translated: line.translated.clone(),
-                                    romanized: line.romanized.clone(),
-                                    start_ms: line.start_ms,
-                                    end_ms: line.end_ms,
-                                    is_duet: line.is_duet,
-                                    is_bg: line.is_background,
-                                }
-                            })
-                            .collect();
-                    (song_id, std::sync::Arc::new(engine_lines))
+                    (song_id, Self::build_engine_lines(&lines_for_task))
                 })
                 .await
                 .ok()
@@ -1516,9 +1555,8 @@ impl App {
 
                     // Priority 2: Cached online lyrics (for NCM songs)
                     if is_ncm {
-                        if crate::features::lyrics::has_cached_best_lyrics(ncm_id)
-                            && let Some(cached_lines) =
-                                crate::features::lyrics::load_cached_lyrics(ncm_id)
+                        if let Some(cached_lines) =
+                            crate::features::lyrics::load_cached_best_lyrics(ncm_id)
                         {
                             let ui_lines = crate::application::lyrics::project_lyrics(cached_lines);
                             return Some((song_id, ui_lines, false));

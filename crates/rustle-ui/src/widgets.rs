@@ -16,6 +16,8 @@
 //! - **Widgets** (this module): Composable UI patterns
 //! - **Components** (`crate::components`): Reusable caller-driven composites
 
+mod anchored_popup;
+pub use anchored_popup::AnchoredPopup;
 mod centered_button_content;
 pub mod cover_play_button;
 mod crossfade_image;

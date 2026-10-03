@@ -5,7 +5,8 @@ pub(crate) use rustle_ncm::quality_api_level;
 pub use rustle_ncm::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, LikeProtocol, LikeResult, LoginInfo,
     NcmClient, NcmError, NcmQualityLevel, NcmResult, PRIVATE_RADAR_PLAYLIST_ID, PlaylistDetail,
-    PlaylistSummary, PlaylistTrackMutation, PlaylistTrackOperation, RadioSummary, ScrobbleResult,
-    SearchType, SongQualityDetail, SongQualityOption, Track, TrackAvailability, TrackUrl,
-    UserDetail, UserSummary, VideoSummary, VipInfo, VipTier,
+    PlaylistSummary, PlaylistTrackMutation, PlaylistTrackOperation, RadioDetail, RadioPrograms,
+    RadioSummary, ScrobbleResult, SearchSuggestion, SearchType, SongQualityDetail,
+    SongQualityOption, Track, TrackAvailability, TrackUrl, UserDetail, UserSummary, VideoSummary,
+    VipInfo, VipTier,
 };

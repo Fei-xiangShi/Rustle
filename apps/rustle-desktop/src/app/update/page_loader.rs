@@ -64,7 +64,7 @@ pub fn convert_ncm_tracks_to_views_with_offset(
                 Some(&track.title),
             );
 
-            crate::ui::components::playlist_view::SongItem::new(
+            let mut item = crate::ui::components::playlist_view::SongItem::new(
                 crate::ui::components::playlist_view::SongItemData {
                     id: -(track.id as i64),
                     cover_key: Some((crate::image::ImageKind::SongCover, track.id)),
@@ -77,7 +77,14 @@ pub fn convert_ncm_tracks_to_views_with_offset(
                     added_date: String::new(),
                     source,
                 },
-            )
+            );
+            item.quality_label = track
+                .quality_options
+                .iter()
+                .max_by_key(|option| option.level.priority())
+                .map(|option| option.level.short_name().to_string());
+            item.availability_label = track.availability.label().to_string();
+            item
         })
         .collect()
 }

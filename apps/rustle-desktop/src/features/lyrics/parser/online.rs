@@ -107,7 +107,8 @@ fn best_cache_path(ncm_id: u64) -> PathBuf {
     get_cache_path(ncm_id, ".best.json")
 }
 
-fn load_cached_best_lyrics(ncm_id: u64) -> Option<Vec<LyricLineOwned>> {
+/// Read and fully validate the selected cache. Call from a blocking worker.
+pub fn load_cached_best_lyrics(ncm_id: u64) -> Option<Vec<LyricLineOwned>> {
     let bytes = std::fs::read(best_cache_path(ncm_id)).ok()?;
     decode_cached_best_lyrics(&bytes)
 }
@@ -152,9 +153,13 @@ fn merge_cached_sidecar(
     }
 }
 
-/// Return whether the current multi-source selection cache exists.
-pub fn has_cached_best_lyrics(ncm_id: u64) -> bool {
-    load_cached_best_lyrics(ncm_id).is_some()
+/// Cheap metadata-only probe for any cached lyrics file. Content is validated
+/// later by [`load_cached_lyrics`] off the UI thread.
+pub fn has_cached_lyrics(ncm_id: u64) -> bool {
+    [".best.json", ".yrc", ".lrc"].iter().any(|suffix| {
+        std::fs::metadata(get_cache_path(ncm_id, suffix))
+            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    })
 }
 
 /// Load the selected multi-source result, with old Rustle caches retained as
@@ -707,7 +712,9 @@ pub async fn fetch_lyrics(
     metadata: OnlineLyricsMetadata,
     proxy_url: Option<String>,
 ) -> Result<Vec<LyricLineOwned>> {
-    if let Some(cached) = load_cached_best_lyrics(ncm_id) {
+    if let Some(cached) =
+        tokio::task::spawn_blocking(move || load_cached_best_lyrics(ncm_id)).await?
+    {
         tracing::debug!(ncm_id, "loaded multi-source lyrics cache");
         return Ok(cached);
     }
@@ -736,7 +743,9 @@ pub async fn fetch_lyrics(
         .into_iter()
         .max_by_key(|candidate| candidate.score)
     else {
-        if let Some(cached) = load_cached_lyrics(ncm_id) {
+        if let Some(cached) =
+            tokio::task::spawn_blocking(move || load_cached_lyrics(ncm_id)).await?
+        {
             tracing::debug!(ncm_id, "falling back to legacy lyrics cache");
             return Ok(cached);
         }
@@ -753,7 +762,12 @@ pub async fn fetch_lyrics(
         lines = best.lines.len(),
         "selected_best_lyrics_source"
     );
-    if let Err(error) = save_best_lyrics_cache(&best, ncm_id) {
+    let (best, saved) = tokio::task::spawn_blocking(move || {
+        let saved = save_best_lyrics_cache(&best, ncm_id);
+        (best, saved)
+    })
+    .await?;
+    if let Err(error) = saved {
         tracing::warn!(ncm_id, error = %error, "lyrics_cache_write_failed");
     }
     Ok(best.lines)
@@ -791,6 +805,23 @@ mod tests {
             ..cache
         };
         assert!(decode_cached_best_lyrics(&serde_json::to_vec(&cache).unwrap()).is_some());
+    }
+
+    #[test]
+    fn cache_header_alone_cannot_validate_corrupt_or_empty_lyrics() {
+        for lines in [
+            serde_json::json!([null]),
+            serde_json::json!([{}]),
+            serde_json::json!([]),
+        ] {
+            let cache = serde_json::json!({
+                "version": BEST_CACHE_VERSION,
+                "source": "qq_music",
+                "score": 10,
+                "lines": lines,
+            });
+            assert!(decode_cached_best_lyrics(&serde_json::to_vec(&cache).unwrap()).is_none());
+        }
     }
 
     #[test]

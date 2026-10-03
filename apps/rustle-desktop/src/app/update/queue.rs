@@ -138,7 +138,7 @@ impl App {
 
                 tracing::error!("Failed to resolve song: {}", reason);
                 // Use handle_playback_failure for consistent failure tracking
-                if let Some(idx) = self.playback.current_index {
+                if let Some(idx) = self.playback.pending_resolution_index.take() {
                     return Some(Task::batch([
                         Self::toast_error(format!("无法播放：{reason}")),
                         self.handle_playback_failure(idx, reason.user_summary()),

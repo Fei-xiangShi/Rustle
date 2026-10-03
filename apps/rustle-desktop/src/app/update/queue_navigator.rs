@@ -4,14 +4,18 @@
 //! across all play modes. All code that needs to determine which song comes next
 //! or previous should use this module.
 
+use std::collections::HashSet;
+
 use crate::database::DbSong;
 use crate::features::PlayMode;
 
 /// Stable shuffle navigation shared by preloading and actual playback.
 ///
 /// `remaining` is the current shuffled deck. A candidate is only removed when
-/// the app confirms that song as current, so speculative preload reads never
-/// advance navigation. `history` and `cursor` provide real Previous semantics.
+/// the app confirms that song as current or its playback fails; speculative
+/// preload reads never advance navigation. Failed entries stay excluded until
+/// successful manual playback or a queue/mode reset. `history` and `cursor`
+/// provide real Previous semantics without recording failed attempts as plays.
 #[derive(Debug, Clone, Default)]
 pub struct ShuffleCache {
     next: Option<usize>,
@@ -19,6 +23,7 @@ pub struct ShuffleCache {
     history: Vec<usize>,
     cursor: Option<usize>,
     remaining: Vec<usize>,
+    failed: HashSet<usize>,
     queue_len: usize,
     current: Option<usize>,
 }
@@ -36,12 +41,15 @@ impl ShuffleCache {
             return;
         }
 
+        self.failed.remove(&current);
         if self.current != Some(current) {
             let cursor = self.cursor.unwrap_or(0);
-            if self.history.get(cursor + 1) == Some(&current) {
-                self.cursor = Some(cursor + 1);
-            } else if cursor > 0 && self.history.get(cursor - 1) == Some(&current) {
-                self.cursor = Some(cursor - 1);
+            let forward = self.next_history_cursor();
+            let previous = self.previous_history_cursor();
+            if forward.is_some_and(|pos| self.history[pos] == current) {
+                self.cursor = forward;
+            } else if previous.is_some_and(|pos| self.history[pos] == current) {
+                self.cursor = previous;
             } else {
                 self.history.truncate(cursor.saturating_add(1));
                 self.history.push(current);
@@ -55,6 +63,10 @@ impl ShuffleCache {
     }
 
     fn reset_at(&mut self, queue_len: usize, current: usize) {
+        if self.queue_len != queue_len {
+            self.failed.clear();
+        }
+        self.failed.remove(&current);
         self.queue_len = queue_len;
         self.current = Some(current);
         self.history.clear();
@@ -66,10 +78,9 @@ impl ShuffleCache {
     }
 
     fn refill_deck(&mut self) {
-        let Some(current) = self.current else {
-            return;
-        };
-        self.remaining = (0..self.queue_len).filter(|idx| *idx != current).collect();
+        self.remaining = (0..self.queue_len)
+            .filter(|idx| Some(*idx) != self.current && !self.failed.contains(idx))
+            .collect();
 
         use rand::RngExt;
         let mut rng = rand::rng();
@@ -79,18 +90,22 @@ impl ShuffleCache {
         }
     }
 
-    fn refresh_adjacent(&mut self) {
-        let Some(cursor) = self.cursor else {
-            self.next = None;
-            self.prev = None;
-            return;
-        };
+    fn next_history_cursor(&self) -> Option<usize> {
+        (self.cursor? + 1..self.history.len()).find(|pos| {
+            Some(self.history[*pos]) != self.current && !self.failed.contains(&self.history[*pos])
+        })
+    }
 
-        self.prev = cursor
-            .checked_sub(1)
-            .and_then(|previous| self.history.get(previous).copied());
-        self.next = if let Some(forward) = self.history.get(cursor + 1).copied() {
-            Some(forward)
+    fn previous_history_cursor(&self) -> Option<usize> {
+        (0..self.cursor?).rev().find(|pos| {
+            Some(self.history[*pos]) != self.current && !self.failed.contains(&self.history[*pos])
+        })
+    }
+
+    fn refresh_adjacent(&mut self) {
+        self.prev = self.previous_history_cursor().map(|pos| self.history[pos]);
+        self.next = if let Some(forward) = self.next_history_cursor() {
+            Some(self.history[forward])
         } else {
             if self.remaining.is_empty() && self.queue_len > 1 {
                 self.refill_deck();
@@ -106,6 +121,18 @@ impl ShuffleCache {
             self.history.len(),
             self.remaining.len()
         );
+    }
+
+    /// Exclude an actual playback failure without committing it to history.
+    fn skip_failed(&mut self, queue_len: usize, failed_idx: usize) -> Option<usize> {
+        if self.queue_len != queue_len {
+            self.clear();
+            self.queue_len = queue_len;
+        }
+        self.failed.insert(failed_idx);
+        self.remaining.retain(|idx| *idx != failed_idx);
+        self.refresh_adjacent();
+        self.next
     }
 
     fn next_for(&self, queue_len: usize, current: Option<usize>) -> Option<usize> {
@@ -127,6 +154,7 @@ impl ShuffleCache {
         self.history.clear();
         self.cursor = None;
         self.remaining.clear();
+        self.failed.clear();
         self.queue_len = 0;
         self.current = None;
     }
@@ -253,11 +281,15 @@ pub fn needs_ncm_download(song: &DbSong) -> bool {
 pub fn skip_to_next_playable(
     queue_len: usize,
     failed_idx: usize,
-    _play_mode: PlayMode,
-    _shuffle_cache: &ShuffleCache,
+    play_mode: PlayMode,
+    shuffle_cache: &mut ShuffleCache,
 ) -> Option<usize> {
-    if queue_len == 0 {
+    if failed_idx >= queue_len {
         return None;
+    }
+
+    if play_mode == PlayMode::Shuffle {
+        return shuffle_cache.skip_failed(queue_len, failed_idx);
     }
 
     // If only one song in queue, can't skip to another
@@ -265,9 +297,7 @@ pub fn skip_to_next_playable(
         return None;
     }
 
-    // Always skip to next sequential song when a song fails
-    // This ensures we don't get stuck on the same failed song
-    // regardless of play mode
+    // Preserve the sequential failure fallback for the other playback modes.
     let next = (failed_idx + 1) % queue_len;
 
     // Make sure we're not returning the same index
@@ -336,5 +366,154 @@ mod tests {
 
         assert_eq!(cache.next, Some(0));
         assert_eq!(cache.prev, Some(0));
+    }
+
+    fn planned_shuffle() -> ShuffleCache {
+        ShuffleCache {
+            next: Some(1),
+            history: vec![0],
+            cursor: Some(0),
+            remaining: vec![2, 3, 1],
+            queue_len: 4,
+            current: Some(0),
+            ..ShuffleCache::default()
+        }
+    }
+
+    #[test]
+    fn shuffle_failure_advances_the_deck_and_does_not_replay_the_fallback() {
+        let mut cache = planned_shuffle();
+        let next = skip_to_next_playable(4, 1, PlayMode::Shuffle, &mut cache);
+        assert_eq!(next, Some(3));
+        cache.sync_current(4, next);
+        assert_eq!(cache.prev, Some(0));
+        assert_eq!(cache.next, Some(2));
+
+        // Multiple deck refills must never restore the failed candidate.
+        for _ in 0..12 {
+            let next = cache.next.unwrap();
+            assert_ne!(next, 1);
+            assert_ne!(Some(next), cache.current);
+            cache.sync_current(4, Some(next));
+        }
+    }
+
+    #[test]
+    fn shuffle_failure_skips_unavailable_history_without_recording_a_play() {
+        let mut cache = planned_shuffle();
+        cache.sync_current(4, Some(1));
+        cache.sync_current(4, Some(3));
+        cache.sync_current(4, Some(1));
+        cache.sync_current(4, Some(0));
+
+        let next = skip_to_next_playable(4, 1, PlayMode::Shuffle, &mut cache);
+        assert_eq!(next, Some(3));
+        cache.sync_current(4, next);
+        assert_eq!(cache.history, vec![0, 1, 3]);
+        assert_eq!(cache.prev, Some(0));
+        assert_eq!(cache.next, Some(2));
+        cache.sync_current(4, Some(0));
+        assert_eq!(cache.next, Some(3));
+    }
+
+    #[test]
+    fn shuffle_failure_stops_when_no_other_candidate_is_available() {
+        let mut cache = planned_shuffle();
+        assert_eq!(
+            skip_to_next_playable(4, 1, PlayMode::Shuffle, &mut cache),
+            Some(3)
+        );
+        assert_eq!(
+            skip_to_next_playable(4, 3, PlayMode::Shuffle, &mut cache),
+            Some(2)
+        );
+        assert_eq!(
+            skip_to_next_playable(4, 2, PlayMode::Shuffle, &mut cache),
+            None
+        );
+        assert_eq!(cache.history, vec![0]);
+        assert_eq!(cache.next, None);
+    }
+
+    #[test]
+    fn shuffle_failed_track_can_recover_after_manual_play_or_queue_reset() {
+        let mut cache = planned_shuffle();
+        skip_to_next_playable(4, 1, PlayMode::Shuffle, &mut cache);
+        cache.sync_current(4, Some(1));
+        cache.sync_current(4, Some(0));
+        assert_eq!(cache.next, Some(1));
+
+        skip_to_next_playable(4, 1, PlayMode::Shuffle, &mut cache);
+        cache.clear();
+        cache.sync_current(2, Some(0));
+        assert_eq!(cache.next, Some(1));
+    }
+
+    #[test]
+    fn shuffle_failure_before_first_play_does_not_create_fake_history() {
+        let mut cache = ShuffleCache::default();
+        assert_eq!(
+            skip_to_next_playable(2, 0, PlayMode::Shuffle, &mut cache),
+            Some(1)
+        );
+        cache.sync_current(2, Some(1));
+        assert_eq!(cache.prev, None);
+        assert_eq!(cache.next, None);
+        assert_eq!(cache.history, vec![1]);
+    }
+
+    #[test]
+    fn shuffle_failure_does_not_replay_current_through_repeated_history() {
+        let mut cache = ShuffleCache {
+            history: vec![0, 1, 0, 3],
+            remaining: vec![2],
+            ..planned_shuffle()
+        };
+        assert_eq!(
+            skip_to_next_playable(4, 1, PlayMode::Shuffle, &mut cache),
+            Some(3)
+        );
+        cache.sync_current(4, Some(3));
+        assert_eq!(cache.prev, Some(0));
+        cache.sync_current(4, Some(0));
+        assert_eq!(cache.prev, None);
+        assert_eq!(cache.next, Some(3));
+    }
+
+    #[test]
+    fn shuffle_failure_handles_current_track_and_invalid_queue_indices() {
+        let mut cache = planned_shuffle();
+        assert_eq!(
+            skip_to_next_playable(4, 0, PlayMode::Shuffle, &mut cache),
+            Some(1)
+        );
+        cache.sync_current(4, Some(1));
+        assert_eq!(cache.prev, None);
+
+        let next = cache.next;
+        assert_eq!(
+            skip_to_next_playable(4, 4, PlayMode::Shuffle, &mut cache),
+            None
+        );
+        assert_eq!(cache.next, next);
+        cache.clear();
+        assert_eq!(
+            skip_to_next_playable(1, 0, PlayMode::Shuffle, &mut cache),
+            None
+        );
+        assert_eq!(
+            skip_to_next_playable(0, 0, PlayMode::Shuffle, &mut cache),
+            None
+        );
+    }
+
+    #[test]
+    fn non_shuffle_failure_keeps_sequential_fallback() {
+        for mode in [PlayMode::Sequential, PlayMode::LoopAll, PlayMode::LoopOne] {
+            let mut cache = ShuffleCache::default();
+            assert_eq!(skip_to_next_playable(4, 3, mode, &mut cache), Some(0));
+            assert_eq!(skip_to_next_playable(1, 0, mode, &mut cache), None);
+            assert_eq!(skip_to_next_playable(0, 0, mode, &mut cache), None);
+        }
     }
 }

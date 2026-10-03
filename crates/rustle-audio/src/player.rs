@@ -1083,11 +1083,13 @@ impl AudioPlayer {
             )
         };
 
+        // Decode before tearing down the old sink so a failed reload keeps the
+        // current playback alive instead of leaving a sink-less "Playing" state.
+        let source = Self::decode_local_file(&path)?;
+
         if let Some(old_sink) = self.current_sink.take() {
             old_sink.stop();
         }
-
-        let source = Self::decode_local_file(&path)?;
         let duration = source.total_duration();
 
         let runtime = self

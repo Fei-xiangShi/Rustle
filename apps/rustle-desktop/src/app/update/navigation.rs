@@ -70,11 +70,6 @@ impl App {
                 Some(Task::none())
             }
 
-            Message::SearchChanged(query) => {
-                self.ui.search_query = query.clone();
-                Some(Task::none())
-            }
-
             Message::ImportLocalPlaylist => {
                 tracing::info!("Import local playlist");
                 Some(Task::perform(open_folder_dialog(), Message::FolderSelected))

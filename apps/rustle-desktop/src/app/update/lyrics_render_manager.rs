@@ -38,6 +38,7 @@ pub struct LyricsRenderEntry {
     pub font_size: f32,
     pub font_family: Option<String>,
     pub shape_generation: u64,
+    preparation_generation: Option<u64>,
     pending: Option<LyricsShapeRequest>,
 }
 
@@ -74,17 +75,42 @@ impl LyricsRenderManager {
 
     /// Reserve adjacent preparation before dispatch, including a two-song queue
     /// where next and previous resolve to the same song.
-    pub fn begin_engine_preparation(&mut self, song_id: i64) -> bool {
+    pub fn begin_engine_preparation(&mut self, song_id: i64) -> Option<u64> {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.entries.entry(song_id) {
-            entry.insert(LyricsRenderEntry::default());
-            true
+            self.next_generation = self.next_generation.wrapping_add(1);
+            let reservation = entry.insert(LyricsRenderEntry::default());
+            reservation.preparation_generation = Some(self.next_generation);
+            Some(self.next_generation)
         } else {
-            false
+            None
         }
+    }
+
+    /// Release only the matching reservation. A failed read must be retryable;
+    /// an evicted or superseded worker cannot release another job's ownership.
+    pub fn finish_engine_preparation(
+        &mut self,
+        song_id: i64,
+        generation: u64,
+        success: bool,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&song_id) else {
+            return false;
+        };
+        if entry.preparation_generation != Some(generation) {
+            return false;
+        }
+        if success {
+            entry.preparation_generation = None;
+        } else {
+            self.entries.remove(&song_id);
+        }
+        true
     }
 
     pub fn store_engine_lines(&mut self, song_id: i64, lines: Arc<Vec<LyricLineData>>) {
         let entry = self.entries.entry(song_id).or_default();
+        entry.preparation_generation = None;
         if entry
             .engine_lines
             .as_ref()
@@ -310,7 +336,32 @@ mod tests {
     #[test]
     fn adjacent_engine_preparation_is_reserved_once() {
         let mut manager = manager();
-        assert!(manager.begin_engine_preparation(2));
-        assert!(!manager.begin_engine_preparation(2));
+        assert!(manager.begin_engine_preparation(2).is_some());
+        assert!(manager.begin_engine_preparation(2).is_none());
+    }
+
+    #[test]
+    fn failed_preparation_retries_and_old_completion_cannot_release_new_job() {
+        let mut manager = manager();
+        let first = manager.begin_engine_preparation(2).unwrap();
+        assert!(manager.finish_engine_preparation(2, first, false));
+        let retry = manager.begin_engine_preparation(2).unwrap();
+        assert!(!manager.finish_engine_preparation(2, first, false));
+        assert!(!manager.finish_engine_preparation(2, first, true));
+        assert!(manager.begin_engine_preparation(2).is_none());
+        manager.retain(&[]);
+        let replacement = manager.begin_engine_preparation(2).unwrap();
+        assert!(!manager.finish_engine_preparation(2, retry, true));
+        assert!(manager.finish_engine_preparation(2, replacement, true));
+    }
+
+    #[test]
+    fn display_result_supersedes_pending_adjacent_preparation() {
+        let mut manager = manager();
+        let generation = manager.begin_engine_preparation(2).unwrap();
+        manager.store_engine_lines(2, Arc::new(vec![LyricLineData::default()]));
+        assert!(!manager.finish_engine_preparation(2, generation, false));
+        assert!(!manager.finish_engine_preparation(2, generation, true));
+        assert!(manager.get(2).unwrap().engine_lines.is_some());
     }
 }

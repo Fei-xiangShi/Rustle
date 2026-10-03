@@ -171,11 +171,14 @@ fn find_complete_audio_cache(
     expected_size: Option<u64>,
 ) -> Option<PathBuf> {
     // A stale file with a different extension must not hide a valid cache.
-    crate::utils::cached_audio_candidates(directory, stem).find(|path| {
+    let path = crate::utils::cached_audio_candidates(directory, stem).find(|path| {
         crate::cache::is_audio_cache_complete(path, song_id, quality, expected_size)
             && rustle_storage::cache::read_audio_manifest(path)
                 .is_some_and(|manifest| manifest.source_size.is_some())
-    })
+    })?;
+    // Keep frequently played tracks at the back of the LRU eviction order.
+    crate::cache::touch_cache_entry(&path);
+    Some(path)
 }
 
 /// Check if a song needs resolution (NCM song without local file)

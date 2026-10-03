@@ -2171,6 +2171,7 @@ pub enum Route {
     AudioEngine,
     Playlist(i64),
     NcmPlaylist(u64),
+    Podcast(u64),
     User(u64),
     Artist(u64),
     Album(u64),
@@ -2192,6 +2193,7 @@ impl Route {
             Self::AudioEngine => Some(NavItem::AudioEngine),
             Self::Playlist(_)
             | Self::NcmPlaylist(_)
+            | Self::Podcast(_)
             | Self::User(_)
             | Self::Artist(_)
             | Self::Album(_)
@@ -2210,6 +2212,7 @@ impl Route {
             self,
             Self::Playlist(_)
                 | Self::NcmPlaylist(_)
+                | Self::Podcast(_)
                 | Self::User(_)
                 | Self::Artist(_)
                 | Self::Album(_)
@@ -2484,6 +2487,7 @@ pub struct UiState {
 
     // Cache statistics
     pub cache_stats: Option<crate::cache::CacheStats>,
+    pub cache_limit_in_flight: bool,
 
     // Context menu
     pub context_menu: Option<ContextMenuState>,
@@ -2579,6 +2583,7 @@ impl UiState {
             my_playlists_expanded: true,
             collected_playlists_expanded: true,
             cache_stats: None,
+            cache_limit_in_flight: false,
             context_menu: None,
             song_edit_dialog: None,
             download_tab: Default::default(),
@@ -2606,6 +2611,7 @@ impl UiState {
                 ncm_cache_baseline: None,
                 ncm_replace_songs_on_chunk: false,
                 ncm_load_generation: 0,
+                podcast_request: None,
                 online_tracks: Vec::new(),
                 online_track_owner: None,
             },
@@ -2827,6 +2833,7 @@ pub struct PlaylistPageState {
     /// a new token so a request from an earlier visit cannot update the page
     /// after the user has switched away and back.
     pub ncm_load_generation: u64,
+    pub podcast_request: Option<iced::task::Handle>,
     /// Raw NCM tracks that produced the current detail-page rows.
     online_tracks: Vec<Track>,
     /// Exact page/generation allowed to read or mutate `online_tracks`.
@@ -2857,6 +2864,7 @@ impl Default for PlaylistPageState {
             ncm_cache_baseline: None,
             ncm_replace_songs_on_chunk: false,
             ncm_load_generation: 0,
+            podcast_request: None,
             online_tracks: Vec::new(),
             online_track_owner: None,
         }
@@ -2865,9 +2873,16 @@ impl Default for PlaylistPageState {
 
 impl PlaylistPageState {
     pub fn advance_load_generation(&mut self) -> u64 {
+        self.cancel_podcast_request();
         self.ncm_load_generation = self.ncm_load_generation.wrapping_add(1);
         self.clear_online_tracks();
         self.ncm_load_generation
+    }
+
+    pub fn cancel_podcast_request(&mut self) {
+        if let Some(handle) = self.podcast_request.take() {
+            handle.abort();
+        }
     }
 
     pub fn begin_online_tracks(&mut self, page_id: i64, generation: u64) -> bool {
@@ -3099,6 +3114,24 @@ mod playlist_online_track_state_tests {
     }
 
     #[test]
+    fn leaving_or_reloading_a_podcast_aborts_pending_network_work() {
+        let mut state = PlaylistPageState::default();
+        let (_, handle) = iced::Task::perform(async {}, |_| ()).abortable();
+        let observer = handle.clone();
+        state.podcast_request = Some(handle);
+        state.cancel_podcast_request();
+        assert!(observer.is_aborted());
+        assert!(state.podcast_request.is_none());
+
+        let (_, handle) = iced::Task::perform(async {}, |_| ()).abortable();
+        let observer = handle.clone();
+        state.podcast_request = Some(handle);
+        state.advance_load_generation();
+        assert!(observer.is_aborted());
+        assert!(state.podcast_request.is_none());
+    }
+
+    #[test]
     fn owned_tracks_replace_append_and_reject_stale_generations() {
         let mut state = PlaylistPageState::default();
         let generation = state.advance_load_generation();
@@ -3247,7 +3280,70 @@ impl SearchTab {
 }
 
 /// Search page state
+pub const SEARCH_PAGE_SIZE: u32 = 50;
+
+#[derive(Debug, Default)]
+pub struct SearchSuggestionsState {
+    pub generation: u64,
+    pub open: bool,
+    pub loading: bool,
+    pub items: Vec<crate::api::SearchSuggestion>,
+    pub selected: Option<usize>,
+    pub pending: Option<iced::task::Handle>,
+}
+
+impl SearchSuggestionsState {
+    pub fn accepts(&self, generation: u64) -> bool {
+        self.open && self.generation == generation
+    }
+
+    pub fn close(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.open = false;
+        self.loading = false;
+        self.selected = None;
+        if let Some(handle) = self.pending.take() {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_suggestion_tests {
+    use super::SearchSuggestionsState;
+
+    #[test]
+    fn editing_dismissal_and_reopening_reject_queued_responses_and_cancel_work() {
+        let (_, pending) = iced::Task::perform(async {}, |_| ()).abortable();
+        let observer = pending.clone();
+        let mut state = SearchSuggestionsState {
+            open: true,
+            loading: true,
+            pending: Some(pending),
+            selected: Some(2),
+            ..Default::default()
+        };
+        let old_generation = state.generation;
+        assert!(state.accepts(old_generation));
+        state.close();
+        assert!(observer.is_aborted());
+        assert!(!state.loading);
+        assert!(state.selected.is_none());
+        assert!(!state.accepts(old_generation));
+        state.open = true;
+        assert!(!state.accepts(old_generation));
+        assert!(state.accepts(state.generation));
+        state.close();
+        assert!(!state.accepts(state.generation));
+    }
+}
+
 pub struct SearchPageState {
+    pub request_generation: u64,
+    pub error: Option<crate::error::AppError>,
+    pub suggestions: SearchSuggestionsState,
+    pub page_input: String,
+    pub song_views: Vec<crate::ui::components::playlist_view::SongItem>,
     /// Current search keyword
     pub keyword: String,
     /// Active search tab
@@ -3273,7 +3369,7 @@ pub struct SearchPageState {
     /// Virtual list scroll state for efficient rendering of search results
     pub scroll_state: std::rc::Rc<std::cell::RefCell<crate::ui::widgets::VirtualListState>>,
     /// Hover animations for song list
-    pub song_animations: HoverAnimations<u64>,
+    pub song_animations: HoverAnimations<i64>,
     /// Hover animations for grid cards
     pub card_animations: HoverAnimations<u64>,
 }
@@ -3281,6 +3377,11 @@ pub struct SearchPageState {
 impl Default for SearchPageState {
     fn default() -> Self {
         Self {
+            request_generation: 0,
+            error: None,
+            suggestions: Default::default(),
+            page_input: "1".into(),
+            song_views: Vec::new(),
             keyword: String::new(),
             active_tab: SearchTab::default(),
             tracks: Vec::new(),

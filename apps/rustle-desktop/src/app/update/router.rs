@@ -40,9 +40,11 @@ impl App {
     fn sync_route_state(&mut self, route: &Route) -> bool {
         let previous_route = self.ui.current_route.clone();
         self.close_route_overlays();
+        self.ui.search.suggestions.close();
         self.reset_route_transient_state();
 
         if previous_route != *route {
+            self.ui.playlist_page.cancel_podcast_request();
             self.ui.image_state.cancel_pending_and_inflight();
             self.ui.smooth_scroll.cancel_all();
 
@@ -90,6 +92,7 @@ impl App {
             }
             Route::Playlist(_)
             | Route::NcmPlaylist(_)
+            | Route::Podcast(_)
             | Route::User(_)
             | Route::Artist(_)
             | Route::Album(_) => {
@@ -105,13 +108,21 @@ impl App {
             }
             Route::Search { keyword, tab, page } => {
                 self.clear_playlist_route_markers();
+                if self.ui.search.keyword != *keyword || self.ui.search.active_tab != *tab {
+                    self.ui.search.total_count = 0;
+                }
                 self.ui.search.keyword = keyword.clone();
                 self.ui.search.active_tab = *tab;
                 self.ui.search.current_page = *page;
-                self.ui.search.loading = should_reload_search;
+                self.ui.search.page_input = (page + 1).to_string();
+                self.ui.search.loading |= should_reload_search;
                 self.ui.search_query = keyword.clone();
                 if should_reload_search {
+                    self.ui.search.request_generation =
+                        self.ui.search.request_generation.wrapping_add(1);
+                    self.ui.search.error = None;
                     self.ui.search.tracks.clear();
+                    self.ui.search.song_views.clear();
                     self.ui.search.artists.clear();
                     self.ui.search.albums.clear();
                     self.ui.search.playlists.clear();
@@ -189,6 +200,7 @@ impl App {
             ]),
             Route::Artist(id) => self.open_artist_route(*id),
             Route::Album(id) => self.open_album_route(*id),
+            Route::Podcast(id) => self.open_podcast_route(*id),
             Route::RecentlyPlayed => {
                 if let Some(db) = &self.core.db {
                     let db = db.clone();
@@ -267,7 +279,8 @@ impl App {
     fn should_reload_search(&self, route: &Route) -> bool {
         match route {
             Route::Search { keyword, tab, page } => {
-                self.ui.search.keyword != *keyword
+                self.ui.search.error.is_some()
+                    || self.ui.search.keyword != *keyword
                     || self.ui.search.active_tab != *tab
                     || self.ui.search.current_page != *page
             }
