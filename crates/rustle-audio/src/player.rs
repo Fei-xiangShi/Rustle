@@ -17,10 +17,123 @@ use rodio::{Decoder, MixerDeviceSink as OutputStream, Player as Sink, Source};
 use super::automix::{TransitionDirective, TransitionKind};
 use super::chain::{AudioProcessingChain, PlaybackProcessingRuntime};
 use super::device::{AudioDevice, OutputFailureCallback, open_output};
-use super::streaming::{SharedBuffer, StreamingBuffer, StreamingReaderCancellation};
+use super::streaming::{
+    DecoderStarvationGate, SharedBuffer, StarvationStats, StreamingBuffer,
+    StreamingReaderCancellation,
+};
 
-pub(crate) type PreparedStreamingSource = Decoder<StreamingBuffer>;
 pub type PlaybackResult<T> = Result<T, PlaybackError>;
+
+/// Local-file decoder probed off the control actor.
+pub(crate) type PreparedLocalSource = Decoder<BufReader<File>>;
+
+/// Open and probe a local file. Runs on preparation workers for preloads so
+/// disk latency never stalls the control actor's maintenance.
+pub(crate) fn decode_local_source(path: &Path) -> PlaybackResult<PreparedLocalSource> {
+    let file = File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PlaybackError::FileNotFound(path.display().to_string())
+        } else {
+            PlaybackError::IoError(error.to_string())
+        }
+    })?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let reader = BufReader::new(file);
+
+    Decoder::builder()
+        .with_data(reader)
+        .with_byte_len(file_len)
+        .with_seekable(true)
+        .build()
+        .map_err(|error| PlaybackError::DecodeError(error.to_string()))
+}
+
+/// Streaming decoder guarded against blocking inside the output callback.
+///
+/// Rodio pulls every playing source from the device callback. When playback
+/// catches up with the download, the gate emits whole silent frames instead
+/// of letting the decoder block in `SharedBuffer::read_at`; the control actor
+/// observes the engaged flag and enters `Buffering`. Silent time is reported
+/// through `StarvationStats` so the user-visible position does not drift.
+pub(crate) struct PreparedStreamingSource {
+    decoder: Decoder<StreamingBuffer>,
+    gate: DecoderStarvationGate,
+    silence_remaining: u16,
+    frame_position: u16,
+}
+
+impl PreparedStreamingSource {
+    fn new(decoder: Decoder<StreamingBuffer>, gate: DecoderStarvationGate) -> Self {
+        Self {
+            decoder,
+            gate,
+            silence_remaining: 0,
+            frame_position: 0,
+        }
+    }
+
+    /// Publish gate telemetry into the playback runtime that owns this source.
+    pub(crate) fn with_starvation_stats(mut self, stats: StarvationStats) -> Self {
+        self.gate.bind_stats(stats);
+        self
+    }
+}
+
+impl Iterator for PreparedStreamingSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.silence_remaining > 0 {
+            self.silence_remaining -= 1;
+            return Some(0.0);
+        }
+        let channels = self.decoder.channels().get();
+        if self.frame_position == 0 && self.gate.should_gate() {
+            // Emit a whole frame so interleaving and span accounting stay
+            // aligned for the downstream channel/sample-rate converters.
+            self.gate
+                .record_gated_frame(self.decoder.sample_rate().get());
+            self.silence_remaining = channels.saturating_sub(1);
+            return Some(0.0);
+        }
+        let sample = self.decoder.next()?;
+        self.frame_position += 1;
+        if self.frame_position >= channels {
+            self.frame_position = 0;
+        }
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.decoder.size_hint()
+    }
+}
+
+impl Source for PreparedStreamingSource {
+    fn current_span_len(&self) -> Option<usize> {
+        self.decoder.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.decoder.channels()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.decoder.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.decoder.total_duration()
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        self.decoder.try_seek(pos)?;
+        self.silence_remaining = 0;
+        self.frame_position = 0;
+        self.gate.reset();
+        Ok(())
+    }
+}
 
 /// Build the decoder outside the audio control actor.
 ///
@@ -47,11 +160,13 @@ pub(crate) fn prepare_streaming_source(
         return Err(error);
     }
 
+    let gate = DecoderStarvationGate::new(&buffer);
     Decoder::builder()
         .with_data(buffer)
         .with_byte_len(byte_len)
         .with_seekable(true)
         .build()
+        .map(|decoder| PreparedStreamingSource::new(decoder, gate))
         .map_err(|error| PlaybackError::DecodeError(error.to_string()))
 }
 
@@ -240,23 +355,8 @@ impl AudioPlayer {
         self.state.lock().unwrap().volume
     }
 
-    fn decode_local_file(path: &Path) -> PlaybackResult<Decoder<BufReader<File>>> {
-        let file = File::open(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                PlaybackError::FileNotFound(path.display().to_string())
-            } else {
-                PlaybackError::IoError(error.to_string())
-            }
-        })?;
-        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let reader = BufReader::new(file);
-
-        Decoder::builder()
-            .with_data(reader)
-            .with_byte_len(file_len)
-            .with_seekable(true)
-            .build()
-            .map_err(|error| PlaybackError::DecodeError(error.to_string()))
+    fn decode_local_file(path: &Path) -> PlaybackResult<PreparedLocalSource> {
+        decode_local_source(path)
     }
 
     fn prepare_runtime(&self, fade_in: bool) -> PlaybackProcessingRuntime {
@@ -329,14 +429,13 @@ impl AudioPlayer {
         Ok(())
     }
 
-    /// Create a preload sink for external use (by PreloadManager)
-    /// Returns (Sink, Duration) - sink is paused and ready for playback
-    pub fn create_preload_sink(
+    /// Create a paused preload sink from a local decoder probed off the
+    /// control actor. Returns (Sink, Duration, runtime).
+    pub(crate) fn create_preload_sink_prepared_local(
         &self,
-        path: &Path,
+        source: PreparedLocalSource,
         track_gain: f32,
     ) -> PlaybackResult<(Sink, Duration, PlaybackProcessingRuntime)> {
-        let source = Self::decode_local_file(path)?;
         let duration = source.total_duration().unwrap_or(Duration::ZERO);
 
         let runtime = self.prepare_runtime(false);
@@ -497,6 +596,7 @@ impl AudioPlayer {
             "Prepared a paused streaming source"
         );
 
+        let source = source.with_starvation_stats(runtime.starvation_stats());
         let processed = self.chain.apply(source, track_gain, runtime.clone());
 
         let sink = Sink::connect_new(self._stream.mixer());
@@ -597,6 +697,7 @@ impl AudioPlayer {
         let actual_duration = source.total_duration().unwrap_or(duration);
 
         let runtime = self.prepare_runtime(false);
+        let source = source.with_starvation_stats(runtime.starvation_stats());
         let processed = self.chain.apply(source, track_gain, runtime.clone());
 
         let sink = Sink::connect_new(self._stream.mixer());
@@ -619,7 +720,11 @@ impl AudioPlayer {
                 transition.group.0
             )));
         }
+        // A source that already reached its natural end has nothing left to
+        // crossfade; promote with a clean start instead of fading in against
+        // silence.
         Ok(self.current_sink.is_some()
+            && !self.is_finished()
             && self
                 .state
                 .lock()
@@ -643,9 +748,13 @@ impl AudioPlayer {
         reader_cancellation: Option<StreamingReaderCancellation>,
         outgoing_shared_buffer: Option<SharedBuffer>,
         mut transition: TransitionDirective,
+        preseeked_entry: Option<Duration>,
     ) -> PlaybackResult<()> {
         self.pending_pause_fade = false;
         let can_overlap = self.preloaded_will_overlap(&transition)?;
+        // Where the paused local preload decoder currently sits. Automix may
+        // have moved it to the planned entry when the transition was scheduled.
+        let mut sink_entry = preseeked_entry.unwrap_or(Duration::ZERO);
 
         if can_overlap {
             if is_streaming
@@ -681,9 +790,28 @@ impl AudioPlayer {
             let outgoing_automix_gain_db = old_runtime.automix_gain_db();
             transition = prepare_transition_for_handoff(
                 transition,
-                self.position_offset.saturating_add(old_sink.get_pos()),
-                |entry| !is_streaming && sink.try_seek(entry).is_ok(),
+                self.position_offset
+                    .saturating_add(old_sink.get_pos())
+                    .saturating_sub(old_runtime.starvation_gated_duration()),
+                |entry| {
+                    if is_streaming {
+                        return false;
+                    }
+                    if sink_entry == entry {
+                        return true;
+                    }
+                    let seeked = sink.try_seek(entry).is_ok();
+                    if seeked {
+                        sink_entry = entry;
+                    }
+                    seeked
+                },
             );
+            // A late or manual fallback starts from the beginning even when
+            // the scheduled Automix entry was applied ahead of time.
+            if !is_streaming && sink_entry != transition.entry {
+                let _ = sink.try_seek(transition.entry);
+            }
             let crossfade = transition.duration;
             let advanced = transition.kind == TransitionKind::Automix;
             old_sink.set_speed(1.0);
@@ -727,6 +855,10 @@ impl AudioPlayer {
                 buffer.clear_buffer_callback();
             }
             self.stop();
+            if !is_streaming && !sink_entry.is_zero() {
+                // Without an overlap there is no Automix entry to honor.
+                let _ = sink.try_seek(Duration::ZERO);
+            }
             if is_streaming
                 && !reader_cancellation
                     .as_ref()
@@ -796,6 +928,7 @@ impl AudioPlayer {
             "Prepared a streaming source for playback"
         );
 
+        let source = source.with_starvation_stats(runtime.starvation_stats());
         let processed = self.chain.apply(source, track_gain, runtime.clone());
 
         let sink = Sink::connect_new(self._stream.mixer());
@@ -842,7 +975,7 @@ impl AudioPlayer {
                 return;
             }
 
-            let current_pos = self.position_offset.saturating_add(sink.get_pos());
+            let current_pos = self.sink_position(sink);
             sink.pause();
             sink.set_volume(self.get_sink_volume());
 
@@ -867,7 +1000,7 @@ impl AudioPlayer {
             return false;
         }
         if let Some(sink) = self.current_sink.as_ref() {
-            let current_pos = self.position_offset.saturating_add(sink.get_pos());
+            let current_pos = self.sink_position(sink);
             sink.pause();
             sink.set_volume(self.get_sink_volume());
             if let Ok(mut state) = self.state.lock() {
@@ -913,6 +1046,11 @@ impl AudioPlayer {
     /// Resume playback with optional fade in
     pub fn resume_with_fade(&mut self, fade_in: bool) {
         if let Some(sink) = &self.current_sink {
+            if let Some(runtime) = self.current_runtime.as_ref() {
+                // A paused sink is not pulled, so a starvation flag from
+                // before the pause is stale; the gate republishes it if needed.
+                runtime.clear_starvation_engaged();
+            }
             let interrupted_pause_fade = self.pending_pause_fade;
             self.pending_pause_fade = false;
             let target_volume = self.get_sink_volume();
@@ -953,6 +1091,11 @@ impl AudioPlayer {
     }
 
     pub fn play_sink(&self) {
+        if let Some(runtime) = self.current_runtime.as_ref() {
+            // The paused sink was not pulled, so the gate could not clear the
+            // flag itself; it republishes it on the next starved frame.
+            runtime.clear_starvation_engaged();
+        }
         if let Some(sink) = &self.current_sink {
             sink.play();
             if let Ok(mut state) = self.state.lock() {
@@ -1017,8 +1160,14 @@ impl AudioPlayer {
             state.volume = volume;
         }
 
+        let volume = self.get_sink_volume();
         if let Some(sink) = &self.current_sink {
-            sink.set_volume(self.get_sink_volume());
+            sink.set_volume(volume);
+        }
+        // The outgoing track of a crossfade is still audible; user volume
+        // must apply to it too, otherwise mute/lowering lags by the fade.
+        if let Some(transition) = &self.outgoing_transition {
+            transition.sink.set_volume(volume);
         }
     }
 
@@ -1228,6 +1377,7 @@ impl AudioPlayer {
         self.chain.refresh_eq_coefficients();
         let runtime = self.prepare_runtime(false);
         self.chain.activate_runtime(Some(&runtime));
+        let source = source.with_starvation_stats(runtime.starvation_stats());
         let processed = self.chain.apply(source, track_gain, runtime.clone());
         let sink = Sink::connect_new(self._stream.mixer());
         sink.append(processed);
@@ -1262,9 +1412,11 @@ impl AudioPlayer {
 
         let position = if let Some(sink) = &self.current_sink {
             if matches!(state.status, PlaybackStatus::Paused) {
-                state.paused_position.unwrap_or_else(|| sink.get_pos())
+                state
+                    .paused_position
+                    .unwrap_or_else(|| self.sink_position(sink))
             } else {
-                self.position_offset.saturating_add(sink.get_pos())
+                self.sink_position(sink)
             }
         } else {
             self.detached_seek_position.unwrap_or(Duration::ZERO)
@@ -1282,61 +1434,43 @@ impl AudioPlayer {
         }
     }
 
-    /// Check if playback finished
+    /// Whether the current source has been fully decoded.
+    ///
+    /// Only the sample-driven end signal counts. Metadata duration is never
+    /// used here: it can be shorter than the real audio (which would cut the
+    /// tail) and a longer value is already covered by the end signal.
     pub fn is_finished(&self) -> bool {
-        if self
-            .current_runtime
-            .as_ref()
-            .is_some_and(PlaybackProcessingRuntime::natural_end_reached)
-        {
-            return true;
-        }
-        if let Some(sink) = &self.current_sink {
-            let state = self.state.lock().unwrap();
-            let position = self.position_offset.saturating_add(sink.get_pos());
-            let duration = state.duration;
+        self.current_sink.is_some()
+            && self
+                .current_runtime
+                .as_ref()
+                .is_some_and(PlaybackProcessingRuntime::natural_end_reached)
+    }
 
-            // Don't consider finished if we just started or if paused/stopped
-            if state.status != PlaybackStatus::Playing {
-                return false;
-            }
+    /// A fade-out pause is still ramping and has not paused the sink yet.
+    pub(crate) fn has_pending_pause(&self) -> bool {
+        self.pending_pause_fade
+    }
 
-            // Need valid duration to determine if finished
-            if duration.as_secs_f32() <= 0.0 {
-                return false;
-            }
+    /// The streaming decoder gate is emitting silence for the current sink.
+    pub(crate) fn starvation_engaged(&self) -> bool {
+        self.current_sink.is_some()
+            && self
+                .current_runtime
+                .as_ref()
+                .is_some_and(PlaybackProcessingRuntime::starvation_engaged)
+    }
 
-            // Don't consider finished if position is very early
-            if position.as_secs_f32() < 5.0 {
-                return false;
-            }
-
-            // Check if we've reached near the end of the track
-            // Use a small tolerance (0.5s) to account for timing variations
-            if position.as_secs_f32() >= duration.as_secs_f32() - 0.5 {
-                tracing::debug!(
-                    "is_finished: reached end at {:.1}s / {:.1}s",
-                    position.as_secs_f32(),
-                    duration.as_secs_f32()
-                );
-                return true;
-            }
-
-            // Also check if sink is empty AND we're very close to the end (95%)
-            // Also check if sink is empty and we're past 95% of duration
-            if sink.empty() && position.as_secs_f32() > duration.as_secs_f32() * 0.95 {
-                tracing::debug!(
-                    "is_finished: sink empty near end at {:.1}s / {:.1}s",
-                    position.as_secs_f32(),
-                    duration.as_secs_f32()
-                );
-                return true;
-            }
-
-            false
-        } else {
-            false
-        }
+    /// User-visible position of `sink`, excluding silence the streaming gate
+    /// inserted while the retained window was empty.
+    fn sink_position(&self, sink: &Sink) -> Duration {
+        let gated = self.current_runtime.as_ref().map_or(
+            Duration::ZERO,
+            PlaybackProcessingRuntime::starvation_gated_duration,
+        );
+        self.position_offset
+            .saturating_add(sink.get_pos())
+            .saturating_sub(gated)
     }
 }
 

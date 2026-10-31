@@ -1142,6 +1142,25 @@ impl AudioClockScheduler {
         action.underrun = now > action.at.saturating_add(self.horizon);
         Some(action)
     }
+
+    /// Audio-clock time of the next pending action.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.actions.front().map(|action| action.at)
+    }
+
+    /// Take `group` immediately, regardless of its deadline. Used when the
+    /// outgoing source ended before the audio clock reached the deadline
+    /// (e.g. metadata duration longer than the real audio); such a handoff
+    /// is always late.
+    pub fn force(&mut self, group: ScheduleGroup) -> Option<ScheduledAction> {
+        let index = self
+            .actions
+            .iter()
+            .position(|action| action.group == group)?;
+        let mut action = self.actions.remove(index)?;
+        action.underrun = true;
+        Some(action)
+    }
 }
 
 pub const SCHEDULER_HORIZON_MS: u64 = 1_500;
@@ -1552,6 +1571,19 @@ mod tests {
         scheduler.schedule(group, Duration::from_secs(1));
         scheduler.cancel(group);
         assert!(scheduler.poll(Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn scheduler_force_takes_a_pending_group_as_late() {
+        let mut scheduler = AudioClockScheduler::new(Duration::from_millis(SCHEDULER_HORIZON_MS));
+        scheduler.schedule(ScheduleGroup(4), Duration::from_secs(200));
+        assert_eq!(scheduler.next_deadline(), Some(Duration::from_secs(200)));
+        assert!(scheduler.force(ScheduleGroup(5)).is_none());
+        let forced = scheduler.force(ScheduleGroup(4)).expect("pending group");
+        assert_eq!(forced.group, ScheduleGroup(4));
+        assert!(forced.underrun);
+        assert_eq!(scheduler.next_deadline(), None);
+        assert!(scheduler.poll(Duration::from_secs(300)).is_none());
     }
 
     #[test]

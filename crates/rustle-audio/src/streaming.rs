@@ -38,6 +38,9 @@ const CACHE_BACKFILL_CHUNK_BYTES: u64 = 512 * KIB;
 pub struct StreamingBufferPolicy {
     low_water_mark_bytes: u64,
     high_water_mark_bytes: u64,
+    startup_bytes: u64,
+    startup_chunk_bytes: u64,
+    decoder_gate_bytes: u64,
     range_chunk_bytes: u64,
     capacity_bytes: usize,
 }
@@ -46,11 +49,22 @@ impl StreamingBufferPolicy {
     const DEFAULT_BITRATE_BPS: u64 = 2_000_000;
     const LOW_SECONDS: u64 = 2;
     const HIGH_SECONDS: u64 = 8;
+    const STARTUP_SECONDS: u64 = 3;
     const CHUNK_SECONDS: u64 = 2;
-    const MIN_LOW_BYTES: u64 = 512 * KIB;
+    /// Byte floors only guard against degenerate bitrate metadata. They must
+    /// stay small enough that the second-based targets dominate for ordinary
+    /// lossy streams; otherwise a 128 kbps track would wait minutes of audio.
+    const MIN_LOW_BYTES: u64 = 64 * KIB;
     const MAX_LOW_BYTES: u64 = 4 * MIB;
-    const MIN_HIGH_BYTES: u64 = 2 * MIB;
+    const MIN_HIGH_BYTES: u64 = 256 * KIB;
     const MAX_HIGH_BYTES: u64 = 10 * MIB;
+    const MIN_STARTUP_BYTES: u64 = 96 * KIB;
+    const MIN_STARTUP_CHUNK_BYTES: u64 = 128 * KIB;
+    /// The real-time decoder is only pulled while at least this much
+    /// contiguous data is readable, so a packet decode never blocks inside
+    /// the output callback. Half a second covers the largest common packets.
+    const MIN_DECODER_GATE_BYTES: u64 = 32 * KIB;
+    const MAX_DECODER_GATE_BYTES: u64 = 256 * KIB;
     const MIN_CHUNK_BYTES: u64 = 512 * KIB;
     const MAX_CHUNK_BYTES: u64 = 4 * MIB;
     const MAX_CAPACITY_BYTES: u64 = 16 * MIB;
@@ -74,13 +88,43 @@ impl StreamingBufferPolicy {
         let capacity_bytes = high_water_mark_bytes
             .saturating_add(range_chunk_bytes)
             .min(Self::MAX_CAPACITY_BYTES) as usize;
+        let startup_bytes = bytes_per_second
+            .saturating_mul(Self::STARTUP_SECONDS)
+            .max(Self::MIN_STARTUP_BYTES)
+            .min(high_water_mark_bytes);
+        let startup_chunk_bytes = startup_bytes
+            .max(Self::MIN_STARTUP_CHUNK_BYTES)
+            .min(range_chunk_bytes);
+        let decoder_gate_bytes = (bytes_per_second / 2)
+            .clamp(Self::MIN_DECODER_GATE_BYTES, Self::MAX_DECODER_GATE_BYTES)
+            .min(low_water_mark_bytes);
 
         Self {
             low_water_mark_bytes,
             high_water_mark_bytes,
+            startup_bytes,
+            startup_chunk_bytes,
+            decoder_gate_bytes,
             range_chunk_bytes,
             capacity_bytes,
         }
+    }
+
+    /// Readable bytes required before a fresh decoder may start.
+    pub fn startup_bytes(self) -> u64 {
+        self.startup_bytes
+    }
+
+    /// Smaller first Range request used while the decoder has no reserve, so
+    /// startup and seek latency are not bound by a full refill chunk.
+    pub fn startup_chunk_bytes(self) -> u64 {
+        self.startup_chunk_bytes
+    }
+
+    /// Minimum contiguous readable bytes before the output-callback decoder
+    /// is allowed to pull another packet.
+    pub fn decoder_gate_bytes(self) -> u64 {
+        self.decoder_gate_bytes
     }
 
     pub fn low_water_mark_bytes(self) -> u64 {
@@ -118,11 +162,173 @@ impl StreamingBufferPolicy {
     ) -> bool {
         source_has_all_required_bytes || buffered_ahead >= self.high_water_mark_bytes
     }
+
+    /// Startup uses its own shorter reserve; resume after an underrun keeps
+    /// the high-watermark hysteresis so slow links do not oscillate.
+    pub fn can_start(self, available: u64, source_has_all_required_bytes: bool) -> bool {
+        source_has_all_required_bytes || available >= self.startup_bytes
+    }
 }
 
 impl Default for StreamingBufferPolicy {
     fn default() -> Self {
         Self::from_bitrate(None)
+    }
+}
+
+/// Copy `dst.len()` bytes starting at `start` out of a ring-backed deque using
+/// at most two slice copies instead of a per-byte iterator.
+fn copy_from_deque(data: &VecDeque<u8>, start: usize, dst: &mut [u8]) {
+    let (front, back) = data.as_slices();
+    if start >= front.len() {
+        let offset = start - front.len();
+        dst.copy_from_slice(&back[offset..offset + dst.len()]);
+        return;
+    }
+    let take = (front.len() - start).min(dst.len());
+    dst[..take].copy_from_slice(&front[start..start + take]);
+    let rest = dst.len() - take;
+    if rest > 0 {
+        dst[take..].copy_from_slice(&back[..rest]);
+    }
+}
+
+/// Per-playback starvation telemetry written by the output-callback decoder
+/// gate and read by the control actor.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StarvationStats {
+    inner: Arc<StarvationStatsInner>,
+}
+
+#[derive(Debug, Default)]
+struct StarvationStatsInner {
+    /// Wall-clock silence emitted instead of decoded audio. Rodio's position
+    /// counter advances for these samples, so the player subtracts it.
+    gated_nanos: AtomicU64,
+    /// The gate is currently holding the decoder back.
+    engaged: AtomicBool,
+}
+
+impl StarvationStats {
+    pub(crate) fn gated_duration(&self) -> Duration {
+        Duration::from_nanos(self.inner.gated_nanos.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn is_engaged(&self) -> bool {
+        self.inner.engaged.load(Ordering::Acquire)
+    }
+
+    /// Forget a stale engaged flag after the actor resumed a paused sink;
+    /// the gate republishes it on the next starved frame.
+    pub(crate) fn clear_engaged(&self) {
+        self.inner.engaged.store(false, Ordering::Release);
+    }
+
+    fn set_engaged(&self, engaged: bool) {
+        self.inner.engaged.store(engaged, Ordering::Release);
+    }
+
+    fn add_gated_nanos(&self, nanos: u64) {
+        self.inner.gated_nanos.fetch_add(nanos, Ordering::AcqRel);
+    }
+}
+
+/// Frames between availability checks while the decoder is healthy. At
+/// 44.1 kHz this is ~6 ms, far below the smallest gate reserve.
+const GATE_CHECK_INTERVAL_FRAMES: u32 = 256;
+
+/// Keeps the decoder that runs inside the output callback from entering the
+/// blocking `read_at` wait when playback catches up with the download.
+///
+/// The gate only covers the sequential "caught up with the retained window"
+/// case. Seeks and window misses keep their existing `read_at` semantics and
+/// are prepared on worker threads before a decoder is installed.
+pub(crate) struct DecoderStarvationGate {
+    inner: Arc<SharedBufferInner>,
+    reader_position: Arc<AtomicU64>,
+    min_bytes: u64,
+    stats: StarvationStats,
+    frames_until_check: u32,
+    gated: bool,
+    nanos_remainder: u64,
+}
+
+impl DecoderStarvationGate {
+    pub(crate) fn new(buffer: &StreamingBuffer) -> Self {
+        Self {
+            inner: Arc::clone(&buffer.shared.inner),
+            reader_position: Arc::clone(&buffer.reader_cancellation.position),
+            min_bytes: buffer.shared.policy().decoder_gate_bytes(),
+            stats: StarvationStats::default(),
+            frames_until_check: 0,
+            gated: false,
+            nanos_remainder: 0,
+        }
+    }
+
+    pub(crate) fn bind_stats(&mut self, stats: StarvationStats) {
+        stats.set_engaged(self.gated);
+        self.stats = stats;
+    }
+
+    /// Re-evaluate on the next frame (after a decoder seek).
+    pub(crate) fn reset(&mut self) {
+        self.frames_until_check = 0;
+        if self.gated {
+            self.gated = false;
+            self.stats.set_engaged(false);
+        }
+    }
+
+    /// Called once per frame boundary before pulling the decoder. Returns
+    /// `true` when the decoder must not be pulled for this frame.
+    pub(crate) fn should_gate(&mut self) -> bool {
+        if !self.gated {
+            if self.frames_until_check > 0 {
+                self.frames_until_check -= 1;
+                return false;
+            }
+            self.frames_until_check = GATE_CHECK_INTERVAL_FRAMES;
+        }
+        let position = self.reader_position.load(Ordering::Acquire);
+        let starving = self.inner.decoder_would_starve(position, self.min_bytes);
+        if starving != self.gated {
+            self.gated = starving;
+            self.stats.set_engaged(starving);
+        }
+        starving
+    }
+
+    /// Account one silent frame emitted in place of decoded audio.
+    pub(crate) fn record_gated_frame(&mut self, sample_rate: u32) {
+        let rate = u64::from(sample_rate.max(1));
+        let total = 1_000_000_000 + self.nanos_remainder;
+        self.nanos_remainder = total % rate;
+        self.stats.add_gated_nanos(total / rate);
+    }
+}
+
+impl SharedBufferInner {
+    /// Whether a decoder positioned at `position` inside the retained window
+    /// would block before `min_bytes` more bytes (or remote EOF) are readable.
+    fn decoder_would_starve(&self, position: u64, min_bytes: u64) -> bool {
+        if self.cancelled.load(Ordering::Acquire)
+            || !self.coordinator_active.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let total = self.total_size.load(Ordering::Acquire);
+        let downloaded = self.downloaded.load(Ordering::Acquire);
+        let base = self.base_offset.load(Ordering::Acquire);
+        if total > 0 && (position >= total || downloaded >= total) {
+            return false;
+        }
+        if position < base || position > downloaded {
+            return false;
+        }
+        let target = position.saturating_add(min_bytes);
+        let target = if total > 0 { target.min(total) } else { target };
+        downloaded < target && self.cached_prefix.load(Ordering::Acquire) < target
     }
 }
 
@@ -408,10 +614,27 @@ struct SharedBufferInner {
     cancelled: AtomicBool,
     error: RwLock<Option<PlaybackError>>,
     demand_stall_timeout: Duration,
+    /// Incremented before every `data_available` notification. A blocked
+    /// reader re-checks it while holding `wait_mutex`, so a producer update
+    /// that lands between the reader's state check and its wait is never lost.
+    data_generation: AtomicU64,
     data_available: Condvar,
     wait_mutex: Mutex<()>,
     next_callback_subscription: AtomicU64,
     buffer_callback: RwLock<Option<BufferCallbackEntry>>,
+}
+
+impl SharedBufferInner {
+    /// Publish a readable-state change to blocked decoder readers.
+    ///
+    /// The generation bump happens before taking `wait_mutex`; readers sample
+    /// the generation before inspecting state and re-check it under the same
+    /// mutex immediately before waiting.
+    fn wake_data_waiters(&self) {
+        self.data_generation.fetch_add(1, Ordering::AcqRel);
+        let _guard = self.wait_mutex.lock();
+        self.data_available.notify_all();
+    }
 }
 
 /// The reader is locked through publication, so no decoder can reopen a
@@ -457,7 +680,7 @@ impl Drop for CoordinatorGuard {
             .inner
             .coordinator_active
             .store(false, Ordering::Release);
-        self.buffer.inner.data_available.notify_all();
+        self.buffer.inner.wake_data_waiters();
         let mut in_flight = audio_in_flight().lock();
         let should_remove = in_flight
             .get(&self.key)
@@ -522,7 +745,7 @@ impl StreamingReaderCancellation {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
-            shared.data_available.notify_all();
+            shared.wake_data_waiters();
         }
     }
 
@@ -555,7 +778,7 @@ impl StreamingReaderCancellation {
                 shared
                     .active_reader_position
                     .store(self.position.load(Ordering::Acquire), Ordering::Release);
-                shared.data_available.notify_all();
+                shared.wake_data_waiters();
                 true
             }
             Err(active) if active == self.reader_id => {
@@ -576,7 +799,7 @@ impl StreamingReaderCancellation {
             shared
                 .active_reader_position
                 .store(position, Ordering::Release);
-            shared.data_available.notify_all();
+            shared.wake_data_waiters();
         }
     }
 
@@ -667,6 +890,7 @@ impl SharedBuffer {
                 cancelled: AtomicBool::new(false),
                 error: RwLock::new(None),
                 demand_stall_timeout,
+                data_generation: AtomicU64::new(0),
                 data_available: Condvar::new(),
                 wait_mutex: Mutex::new(()),
                 next_callback_subscription: AtomicU64::new(0),
@@ -751,7 +975,7 @@ impl SharedBuffer {
         self.inner
             .coordinator_active
             .store(active, Ordering::Release);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
     }
 
     /// Bytes retained ahead of the decoder's actual absolute read position.
@@ -775,7 +999,7 @@ impl SharedBuffer {
         self.inner
             .active_reader_position
             .store(position, Ordering::Release);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
     }
 
     /// Append bytes, evicting the oldest bytes when the fixed window is full.
@@ -794,9 +1018,14 @@ impl SharedBuffer {
             base = downloaded.saturating_add(chunk.len() as u64 - input.len() as u64);
             data.clear();
         }
-        while data.len() + input.len() > self.inner.capacity {
-            let _ = data.pop_front();
-            base = base.saturating_add(1);
+        let evict = (data.len() + input.len())
+            .saturating_sub(self.inner.capacity)
+            .min(data.len());
+        if evict > 0 {
+            // Bulk drain keeps the write-lock hold time independent of the
+            // chunk size; the decoder callback reads under this lock.
+            data.drain(..evict);
+            base = base.saturating_add(evict as u64);
         }
         data.extend(input.iter().copied());
         downloaded = downloaded.saturating_add(chunk.len() as u64);
@@ -807,7 +1036,7 @@ impl SharedBuffer {
             .store(downloaded, Ordering::Release);
         drop(data);
 
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         let total = self.inner.total_size.load(Ordering::Acquire);
         self.notify_callback(BufferEvent::CacheAdvanced {
             cached: downloaded,
@@ -842,9 +1071,9 @@ impl SharedBuffer {
         if required_evict > consumed.min(data.len()) {
             return false;
         }
-        for _ in 0..required_evict {
-            let _ = data.pop_front();
-            base = base.saturating_add(1);
+        if required_evict > 0 {
+            data.drain(..required_evict);
+            base = base.saturating_add(required_evict as u64);
         }
         data.extend(chunk.iter().copied());
         let end = start.saturating_add(chunk.len() as u64);
@@ -853,7 +1082,7 @@ impl SharedBuffer {
         self.inner.request_pending.store(false, Ordering::Release);
         drop(data);
         drop(_request);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         self.notify_callback(BufferEvent::CacheAdvanced {
             cached: self.cached_prefix(),
             total: self.total_size(),
@@ -890,7 +1119,7 @@ impl SharedBuffer {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
             .max(1);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         self.inner.request_changed.notify_waiters();
         epoch
     }
@@ -954,7 +1183,7 @@ impl SharedBuffer {
         } else {
             0
         };
-        self.policy().can_start_or_resume(
+        self.policy().can_start(
             available,
             self.total_size() > 0 && available >= self.total_size(),
         )
@@ -1023,6 +1252,9 @@ impl SharedBuffer {
         let mut last_progress = (self.base_offset(), self.downloaded());
         let mut last_progress_at = now();
         loop {
+            // Sample the wake generation before any state so the wait below
+            // can detect a producer update that raced with this iteration.
+            let observed_generation = self.inner.data_generation.load(Ordering::Acquire);
             let downloaded = self.inner.downloaded.load(Ordering::Acquire);
             let base = self.base_offset();
             let total = self.inner.total_size.load(Ordering::Acquire);
@@ -1099,9 +1331,7 @@ impl SharedBuffer {
                                 "retained window changed unexpectedly",
                             ));
                         }
-                        for (dst, src) in buf[..to_read].iter_mut().zip(data.iter().skip(start)) {
-                            *dst = *src;
-                        }
+                        copy_from_deque(&data, start, &mut buf[..to_read]);
                         return Ok(to_read);
                     }
                 }
@@ -1175,8 +1405,11 @@ impl SharedBuffer {
             // This enables seeking to positions that haven't been downloaded yet
             wait_count += 1;
 
+            // This path can run on the output callback thread; keep it at
+            // debug level so a starved decoder never formats/writes info logs
+            // while the device is waiting for samples.
             if wait_count == 1 {
-                tracing::info!(
+                tracing::debug!(
                     "read_at: blocking at position {} (downloaded: {}/{}, complete: {})",
                     position,
                     downloaded,
@@ -1184,7 +1417,7 @@ impl SharedBuffer {
                     is_complete
                 );
             } else if wait_count % 10 == 0 {
-                tracing::info!(
+                tracing::debug!(
                     "read_at: still waiting for data at position {} (downloaded: {}/{}, complete: {}, wait #{})",
                     position,
                     downloaded,
@@ -1194,6 +1427,11 @@ impl SharedBuffer {
                 );
             }
             let mut guard = self.inner.wait_mutex.lock();
+            if self.inner.data_generation.load(Ordering::Acquire) != observed_generation {
+                // A producer published new state after this iteration's
+                // snapshot; re-evaluate instead of sleeping a full period.
+                continue;
+            }
             let wait_for = Duration::from_millis(100)
                 .min(self.inner.demand_stall_timeout.saturating_sub(stalled_for));
             let _ = self.inner.data_available.wait_for(&mut guard, wait_for);
@@ -1291,14 +1529,14 @@ impl SharedBuffer {
     /// the audio module so ordinary callers cannot poison a shared cache key.
     pub(crate) fn cancel_coordinator(&self) {
         self.inner.cancelled.store(true, Ordering::Release);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         self.inner.request_changed.notify_waiters();
     }
 
     /// Set error state
     pub fn set_error(&self, error: PlaybackError) {
         *self.inner.error.write() = Some(error);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         self.inner.request_changed.notify_waiters();
     }
 
@@ -1309,7 +1547,7 @@ impl SharedBuffer {
         }
         *stored = Some(error);
         drop(stored);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         self.inner.request_changed.notify_waiters();
         true
     }
@@ -1318,13 +1556,13 @@ impl SharedBuffer {
     /// separately by `mark_cache_finalized`.
     pub fn mark_complete(&self) {
         self.inner.download_complete.store(true, Ordering::Release);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
         self.notify_callback(BufferEvent::Complete);
     }
 
     pub fn mark_cache_finalized(&self) {
         self.inner.cache_finalized.store(true, Ordering::Release);
-        self.inner.data_available.notify_all();
+        self.inner.wake_data_waiters();
     }
 
     /// Get contiguous cache progress as a fraction (0.0 to 1.0).
@@ -1958,18 +2196,22 @@ pub fn start_buffer_download(
             let ring_needs_refill = buffer_clone.policy().should_refill(buffered_ahead)
                 && buffer_clone.downloaded() < total_size;
             let cached_prefix = buffer_clone.cached_prefix();
+            let policy = buffer_clone.policy();
             let (start, feed_ring, chunk_bytes) = if let Some((_, offset)) = requested_window {
+                // A decoder miss (startup or seek) has no reserve yet: fetch
+                // a short first window so audio flows after one small RTT.
                 (
                     offset.min(total_size.saturating_sub(1)),
                     true,
-                    buffer_clone.policy().range_chunk_bytes(),
+                    policy.startup_chunk_bytes(),
                 )
             } else if ring_needs_refill {
-                (
-                    buffer_clone.downloaded(),
-                    true,
-                    buffer_clone.policy().range_chunk_bytes(),
-                )
+                let chunk_bytes = if buffered_ahead < policy.low_water_mark_bytes() {
+                    policy.startup_chunk_bytes()
+                } else {
+                    policy.range_chunk_bytes()
+                };
+                (buffer_clone.downloaded(), true, chunk_bytes)
             } else if cached_prefix < total_size {
                 // Keep the persistent cache moving while playback already has
                 // a healthy reserve. Small chunks bound the time before active
@@ -2219,6 +2461,100 @@ pub async fn wait_for_buffer_playable(buffer: &SharedBuffer, timeout_secs: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_targets_are_time_based_for_ordinary_bitrates() {
+        for bitrate in [128_000_u32, 320_000, 900_000] {
+            let policy = StreamingBufferPolicy::from_bitrate(Some(bitrate));
+            let bytes_per_second = u64::from(bitrate) / 8;
+            let seconds = |bytes: u64| bytes as f64 / bytes_per_second as f64;
+            // Startup no longer waits for a multi-megabyte floor.
+            assert!(seconds(policy.startup_bytes()) <= 6.5, "{bitrate}");
+            assert!(seconds(policy.high_water_mark_bytes()) <= 16.5, "{bitrate}");
+            assert!(policy.low_water_mark_bytes() < policy.high_water_mark_bytes());
+            assert!(policy.startup_bytes() <= policy.high_water_mark_bytes());
+            assert!(policy.decoder_gate_bytes() <= policy.low_water_mark_bytes());
+            assert!(policy.startup_chunk_bytes() <= policy.range_chunk_bytes());
+        }
+        let policy = StreamingBufferPolicy::from_bitrate(Some(320_000));
+        assert!(policy.can_start(policy.startup_bytes(), false));
+        assert!(!policy.can_start(policy.startup_bytes() - 1, false));
+        assert!(policy.can_start(0, true));
+    }
+
+    #[test]
+    fn deque_copy_handles_wrapped_storage() {
+        let mut data: VecDeque<u8> = VecDeque::with_capacity(8);
+        data.extend([0, 1, 2, 3, 4, 5, 6, 7]);
+        data.drain(..5);
+        data.extend([8, 9, 10, 11, 12]);
+        // Logical content is 5..=12 and spans both ring halves.
+        let mut out = [0_u8; 6];
+        copy_from_deque(&data, 1, &mut out);
+        assert_eq!(out, [6, 7, 8, 9, 10, 11]);
+        let mut tail = [0_u8; 2];
+        copy_from_deque(&data, 6, &mut tail);
+        assert_eq!(tail, [11, 12]);
+    }
+
+    #[test]
+    fn decoder_gate_holds_back_a_caught_up_reader_without_blocking() {
+        let policy = StreamingBufferPolicy::from_bitrate(Some(320_000));
+        let total = policy.decoder_gate_bytes() * 4;
+        let shared = SharedBuffer::with_policy(total, policy);
+        shared.set_coordinator_active_for_test(true);
+        let reader = StreamingBuffer::new(shared.clone());
+        let mut gate = DecoderStarvationGate::new(&reader);
+        let stats = StarvationStats::default();
+        gate.bind_stats(stats.clone());
+
+        // Less than one gate reserve is readable: the decoder must be held.
+        shared.append(&vec![0; (policy.decoder_gate_bytes() / 2) as usize]);
+        assert!(gate.should_gate());
+        assert!(stats.is_engaged());
+        gate.record_gated_frame(48_000);
+        assert!(stats.gated_duration() > Duration::ZERO);
+
+        // Enough data arrives: released on the next frame.
+        shared.append(&vec![0; policy.decoder_gate_bytes() as usize]);
+        assert!(!gate.should_gate());
+        assert!(!stats.is_engaged());
+
+        // Remote EOF in the window never gates, however little remains.
+        let remaining = total - shared.downloaded();
+        shared.append(&vec![0; remaining as usize]);
+        gate.reset();
+        assert!(!gate.should_gate());
+
+        // A stopped coordinator is left to `read_at`, which fails fast.
+        let idle = SharedBuffer::with_policy(total, policy);
+        let idle_reader = StreamingBuffer::new(idle.clone());
+        let mut idle_gate = DecoderStarvationGate::new(&idle_reader);
+        assert!(!idle_gate.should_gate());
+    }
+
+    #[test]
+    fn producer_update_between_check_and_wait_is_not_lost() {
+        let shared = SharedBuffer::with_capacity(64, 64);
+        shared.set_coordinator_active_for_test(true);
+        let reader_buffer = shared.clone();
+        let started = std::time::Instant::now();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0_u8; 4];
+            reader_buffer
+                .read_at(0, &mut buf)
+                .map(|read| (read, started.elapsed()))
+        });
+        // Publish while the reader is entering its wait.
+        std::thread::sleep(Duration::from_millis(5));
+        shared.append(&[1, 2, 3, 4]);
+        let (read, elapsed) = reader.join().expect("reader thread").expect("read");
+        assert_eq!(read, 4);
+        assert!(
+            elapsed < Duration::from_millis(90),
+            "woke after {elapsed:?}"
+        );
+    }
 
     #[derive(Debug, Default)]
     struct TestCacheStore {

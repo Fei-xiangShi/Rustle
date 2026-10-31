@@ -339,7 +339,9 @@ impl AudioHandle {
         })?;
         // Update position immediately so UI shows target position during seek.
         // This happens only after capacity and identity have both been secured.
-        self.state.set_position(position);
+        // The target is pinned until the actor dequeues the command, so a
+        // maintenance sample of the old position cannot snap the bar back.
+        self.state.begin_seek(position);
         permit.send(AudioCommand::Seek {
             context,
             nonce,

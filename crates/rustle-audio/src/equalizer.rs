@@ -4,8 +4,8 @@
 //! 31Hz, 62Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz, 16kHz
 
 use rodio::Source;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Standard 10-band equalizer center frequencies in Hz
 pub const EQ_FREQUENCIES: [f32; 10] = [
@@ -104,67 +104,84 @@ fn unity_coeffs() -> BiquadCoeffs {
     }
 }
 
-/// Shared equalizer parameters that can be updated in real-time
+/// Shared equalizer parameters that can be updated in real-time.
+///
+/// Only user settings are shared. Every `Equalizer` instance owns its sample
+/// rate (taken from its own source) and tracks the settings version it last
+/// applied, so concurrent sinks (current, preloaded, crossfading) never
+/// steal each other's update or compute coefficients for the wrong rate.
 #[derive(Clone)]
 pub struct EqualizerParams {
-    inner: Arc<RwLock<EqualizerParamsInner>>,
-    enabled: Arc<AtomicBool>,
-    coeffs_dirty: Arc<AtomicBool>,
+    inner: Arc<EqualizerParamsInner>,
 }
 
 struct EqualizerParamsInner {
-    gains: [f32; 10],
-    sample_rate: u32,
+    gain_bits: [AtomicU32; 10],
+    enabled: AtomicBool,
+    /// Bumped after every settings store; readers compare against the
+    /// version they applied. Lock-free so the output callback never waits.
+    version: AtomicU64,
+}
+
+impl Default for EqualizerParams {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EqualizerParams {
     /// Create new equalizer parameters
-    pub fn new(sample_rate: u32) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(EqualizerParamsInner {
-                gains: [0.0; 10],
-                sample_rate,
-            })),
-            enabled: Arc::new(AtomicBool::new(false)),
-            coeffs_dirty: Arc::new(AtomicBool::new(true)),
+            inner: Arc::new(EqualizerParamsInner {
+                gain_bits: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+                enabled: AtomicBool::new(false),
+                version: AtomicU64::new(1),
+            }),
         }
     }
 
     /// Enable or disable the equalizer
     pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Release);
-        self.coeffs_dirty.store(true, Ordering::Release);
+        self.inner.enabled.store(enabled, Ordering::Release);
+        self.bump();
     }
 
     /// Check if equalizer is enabled
     pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Acquire)
+        self.inner.enabled.load(Ordering::Acquire)
     }
 
     /// Set all 10 band gains at once (in dB, typically -12 to +12)
     pub fn set_gains(&self, gains: [f32; 10]) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.gains = gains;
+        for (slot, gain) in self.inner.gain_bits.iter().zip(gains) {
+            slot.store(gain.to_bits(), Ordering::Release);
         }
-        self.coeffs_dirty.store(true, Ordering::Release);
+        self.bump();
     }
 
-    /// Update sample rate (call when audio format changes)
-    pub fn set_sample_rate(&self, sample_rate: u32) {
-        if let Ok(mut inner) = self.inner.write()
-            && inner.sample_rate != sample_rate
-        {
-            inner.sample_rate = sample_rate;
-            self.coeffs_dirty.store(true, Ordering::Release);
-        }
-    }
-
-    /// 标记系数为脏，强制下次采样时重新计算
-    /// 切换曲目时使用，确保 EQ 正确初始化
+    /// Force every equalizer instance to recompute its coefficients.
     pub fn mark_dirty(&self) {
-        self.coeffs_dirty.store(true, Ordering::Release);
+        self.bump();
+    }
+
+    fn bump(&self) {
+        self.inner.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn version(&self) -> u64 {
+        self.inner.version.load(Ordering::Acquire)
+    }
+
+    fn gains(&self) -> [f32; 10] {
+        std::array::from_fn(|index| {
+            f32::from_bits(self.inner.gain_bits[index].load(Ordering::Acquire))
+        })
     }
 }
+
+/// Samples between checks for a source sample-rate change (span boundary).
+const SAMPLE_RATE_CHECK_INTERVAL: u32 = 1024;
 
 /// 10-band equalizer Source wrapper
 pub struct Equalizer<S>
@@ -181,6 +198,11 @@ where
     current_channel: usize,
     channels: u16,
     enabled: bool,
+    /// Settings version reflected in `coeffs`.
+    applied_version: u64,
+    /// Sample rate `coeffs` were computed for (this source's own rate).
+    sample_rate: u32,
+    samples_until_rate_check: u32,
 }
 
 impl<S> Equalizer<S>
@@ -192,12 +214,6 @@ where
         let channels = source.channels().get();
         let sample_rate = source.sample_rate().get();
 
-        // Update params with actual sample rate
-        params.set_sample_rate(sample_rate);
-
-        // 强制重新计算系数，新实例的系数是默认值
-        params.mark_dirty();
-
         let mut eq = Self {
             source,
             params,
@@ -206,23 +222,22 @@ where
             current_channel: 0,
             channels,
             enabled: false,
+            applied_version: 0,
+            sample_rate,
+            samples_until_rate_check: SAMPLE_RATE_CHECK_INTERVAL,
         };
 
         eq.update_coefficients();
         eq
     }
 
-    /// Update filter coefficients from current parameters
+    /// Recompute filter coefficients from the shared settings and this
+    /// source's own sample rate.
     fn update_coefficients(&mut self) {
-        let coeffs_dirty = self.params.coeffs_dirty.swap(false, Ordering::AcqRel);
-        if !coeffs_dirty {
-            return;
-        }
-
-        let (enabled, gains, sample_rate) = {
-            let inner = self.params.inner.read().unwrap();
-            (self.params.is_enabled(), inner.gains, inner.sample_rate)
-        };
+        // Read the version first: a concurrent store bumps it afterwards, so
+        // a torn read is always followed by another recompute.
+        self.applied_version = self.params.version();
+        let enabled = self.params.is_enabled();
         self.enabled = enabled;
 
         if !enabled {
@@ -231,11 +246,12 @@ where
             return;
         }
 
+        let gains = self.params.gains();
         // Q factor for each band - wider at low frequencies, narrower at high
         let q_values: [f32; 10] = [0.7, 0.8, 1.0, 1.2, 1.4, 1.4, 1.4, 1.2, 1.0, 0.8];
 
         for (i, &freq) in EQ_FREQUENCIES.iter().enumerate() {
-            self.coeffs[i] = calc_peaking_eq(freq, gains[i], sample_rate as f32, q_values[i]);
+            self.coeffs[i] = calc_peaking_eq(freq, gains[i], self.sample_rate as f32, q_values[i]);
         }
     }
 }
@@ -247,8 +263,17 @@ where
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Check if coefficients need updating
-        if self.params.coeffs_dirty.load(Ordering::Acquire) {
+        if self.samples_until_rate_check == 0 {
+            self.samples_until_rate_check = SAMPLE_RATE_CHECK_INTERVAL;
+            let sample_rate = self.source.sample_rate().get();
+            if sample_rate != self.sample_rate {
+                self.sample_rate = sample_rate;
+                self.applied_version = 0;
+            }
+        } else {
+            self.samples_until_rate_check -= 1;
+        }
+        if self.params.version() != self.applied_version {
             self.update_coefficients();
         }
 
@@ -271,9 +296,8 @@ where
             output = self.states[channel][i].process(coeff, output);
         }
 
-        // Soft clip to prevent harsh distortion
-        output = soft_clip(output);
-
+        // Peak protection is applied once, after the whole per-track chain
+        // (`SoftClipSource`); clipping here as well would double-process.
         self.current_channel = (self.current_channel + 1) % usize::from(self.channels.max(1));
         Some(output)
     }
@@ -311,17 +335,6 @@ where
             }
         }
         self.source.try_seek(pos)
-    }
-}
-
-/// Soft clipping function to prevent harsh digital clipping
-fn soft_clip(x: f32) -> f32 {
-    if x.abs() < 0.9 {
-        x
-    } else if x > 0.0 {
-        0.9 + 0.1 * ((x - 0.9) / 0.1).tanh()
-    } else {
-        -0.9 - 0.1 * ((-x - 0.9) / 0.1).tanh()
     }
 }
 
@@ -370,7 +383,7 @@ mod tests {
 
     #[test]
     fn allocates_filter_history_for_every_source_channel() {
-        let params = EqualizerParams::new(48_000);
+        let params = EqualizerParams::new();
         let mono = Equalizer::new(
             TestSource {
                 samples: vec![0.0].into_iter(),
@@ -393,6 +406,36 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_instances_each_apply_updates_at_their_own_rate() {
+        let params = EqualizerParams::new();
+        params.set_enabled(true);
+        let source = |sample_rate| TestSource {
+            samples: vec![0.0; 4096].into_iter(),
+            channels: 2,
+            sample_rate,
+        };
+        let mut playing = Equalizer::new(source(44_100), params.clone());
+        // Creating a preload at another rate must not retune the playing EQ.
+        let mut preload = Equalizer::new(source(48_000), params.clone());
+
+        params.set_gains([0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // Whichever instance runs first, both must observe the update.
+        let _ = preload.next();
+        let _ = playing.next();
+
+        assert_eq!(playing.sample_rate, 44_100);
+        assert_eq!(preload.sample_rate, 48_000);
+        assert_eq!(
+            playing.coeffs[2],
+            calc_peaking_eq(125.0, 6.0, 44_100.0, 1.0)
+        );
+        assert_eq!(
+            preload.coeffs[2],
+            calc_peaking_eq(125.0, 6.0, 48_000.0, 1.0)
+        );
+    }
+
+    #[test]
     fn bands_at_nyquist_boundary_are_unity_and_finite() {
         let coeffs = calc_peaking_eq(16_000.0, 12.0, 32_000.0, 0.8);
         assert_eq!(coeffs, unity_coeffs());
@@ -408,7 +451,7 @@ mod tests {
 
     #[test]
     fn multichannel_filter_history_does_not_bleed_between_channels() {
-        let params = EqualizerParams::new(48_000);
+        let params = EqualizerParams::new();
         params.set_enabled(true);
         params.set_gains([0.0, 0.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let source = TestSource {

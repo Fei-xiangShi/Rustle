@@ -417,7 +417,19 @@ struct PlaybackStateInner {
     pub total_cache_bytes: u64,
     /// Bytes immediately readable ahead of the active decoder.
     pub buffered_ahead_bytes: u64,
+    /// Wall-clock instant at which `position` was sampled, used to
+    /// extrapolate the display position between actor samples.
+    pub position_sampled_at: Option<std::time::Instant>,
+    /// Target published by `AudioHandle::seek` until the actor dequeues the
+    /// Seek command. Actor samples taken before that point describe the old
+    /// position and must not overwrite the optimistic target.
+    pub pending_seek_target: Option<Duration>,
 }
+
+/// Upper bound for extrapolating the display position past the latest actor
+/// sample: two maintenance periods. A stalled clock (starved stream, blocked
+/// device) therefore never runs ahead by more than this.
+const MAX_POSITION_EXTRAPOLATION: Duration = Duration::from_millis(150);
 
 impl Default for PlaybackStateInner {
     fn default() -> Self {
@@ -431,6 +443,18 @@ impl Default for PlaybackStateInner {
             cached_bytes: 0,
             total_cache_bytes: 0,
             buffered_ahead_bytes: 0,
+            position_sampled_at: None,
+            pending_seek_target: None,
+        }
+    }
+}
+
+impl PlaybackStateInner {
+    /// Record an audio-clock sample unless a UI seek is still in flight.
+    fn record_position(&mut self, position: Duration) {
+        if self.pending_seek_target.is_none() {
+            self.position = position;
+            self.position_sampled_at = Some(std::time::Instant::now());
         }
     }
 }
@@ -487,10 +511,47 @@ impl SharedPlaybackState {
         inner.status == PlaybackStatus::Stopped
     }
 
-    /// Get display positio
+    /// Position for continuous UI rendering (progress bar, lyrics).
+    ///
+    /// Returns the seek target while a seek is in flight. While playing it
+    /// extrapolates the latest audio-clock sample by the elapsed wall time
+    /// (bounded), so per-frame consumers advance smoothly between the
+    /// actor's periodic samples without waking the audio thread.
     pub fn display_position(&self) -> Duration {
         let inner = self.inner.read();
-        inner.position
+        if let Some(target) = inner.pending_seek_target {
+            return target;
+        }
+        if inner.status != PlaybackStatus::Playing {
+            return inner.position;
+        }
+        let elapsed = inner
+            .position_sampled_at
+            .map_or(Duration::ZERO, |sampled_at| {
+                sampled_at.elapsed().min(MAX_POSITION_EXTRAPOLATION)
+            });
+        let position = inner.position.saturating_add(elapsed);
+        if inner.duration.is_zero() {
+            position
+        } else {
+            position.min(inner.duration)
+        }
+    }
+
+    /// Publish an optimistic seek target from the UI thread.
+    pub(crate) fn begin_seek(&self, target: Duration) {
+        let mut inner = self.inner.write();
+        inner.position = target;
+        inner.position_sampled_at = Some(std::time::Instant::now());
+        inner.pending_seek_target = Some(target);
+    }
+
+    /// The actor dequeued the Seek command; its later samples are current.
+    pub(crate) fn finish_seek_handoff(&self) {
+        let mut inner = self.inner.write();
+        if inner.pending_seek_target.take().is_some() {
+            inner.position_sampled_at = Some(std::time::Instant::now());
+        }
     }
 
     /// Get contiguous disk-cache progress for the UI secondary track.
@@ -509,9 +570,9 @@ impl SharedPlaybackState {
         self.inner.write().status = status;
     }
 
-    /// Update position
+    /// Update position from the audio clock.
     pub fn set_position(&self, position: Duration) {
-        self.inner.write().position = position;
+        self.inner.write().record_position(position);
     }
 
     /// Update volume
@@ -539,6 +600,7 @@ impl SharedPlaybackState {
             PlaybackStatus::Stopped
         };
         inner.position = position;
+        inner.position_sampled_at = Some(std::time::Instant::now());
         inner.duration = duration;
         inner.volume = volume;
         inner.current_path = current_path;
@@ -563,7 +625,7 @@ impl SharedPlaybackState {
     pub fn update_from_info(&self, info: &super::PlaybackInfo) {
         let mut inner = self.inner.write();
         inner.status = info.status.clone();
-        inner.position = info.position;
+        inner.record_position(info.position);
         inner.duration = info.duration;
         inner.volume = info.volume;
     }
@@ -648,10 +710,13 @@ impl LatestControlMailbox {
     }
 
     pub fn take(&self) -> (Option<f32>, bool, Option<PlaybackContext>) {
+        // Clear the marker before draining: a producer that publishes after
+        // this point must enqueue a fresh wake, otherwise its value would sit
+        // in the mailbox until an unrelated event wakes the actor.
+        self.inner.wake_enqueued.store(false, Ordering::Release);
         let volume = self.inner.latest_volume.lock().take();
         let tick = self.inner.tick_pending.swap(false, Ordering::AcqRel);
         let shutdown = self.inner.shutdown.lock().take();
-        self.inner.wake_enqueued.store(false, Ordering::Release);
         (volume, tick, shutdown)
     }
 }
@@ -823,6 +888,62 @@ pub fn audio_event_channel() -> (AudioEventSender, AudioEventReceiver) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_position_pins_seek_target_until_the_actor_takes_the_command() {
+        let state = SharedPlaybackState::new();
+        state.update_from_info(&crate::PlaybackInfo {
+            status: PlaybackStatus::Paused,
+            position: Duration::from_secs(10),
+            duration: Duration::from_secs(200),
+            volume: 1.0,
+        });
+        state.begin_seek(Duration::from_secs(90));
+        // A maintenance sample of the old position must not snap back.
+        state.set_position(Duration::from_secs(10));
+        assert_eq!(state.display_position(), Duration::from_secs(90));
+        assert_eq!(state.get_info().position, Duration::from_secs(90));
+
+        state.finish_seek_handoff();
+        state.set_position(Duration::from_secs(91));
+        assert_eq!(state.display_position(), Duration::from_secs(91));
+    }
+
+    #[test]
+    fn display_position_extrapolates_only_while_playing_and_is_bounded() {
+        let state = SharedPlaybackState::new();
+        state.update_from_info(&crate::PlaybackInfo {
+            status: PlaybackStatus::Playing,
+            position: Duration::from_secs(5),
+            duration: Duration::from_secs(200),
+            volume: 1.0,
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let extrapolated = state.display_position();
+        assert!(extrapolated > Duration::from_secs(5));
+        assert!(extrapolated <= Duration::from_secs(5) + MAX_POSITION_EXTRAPOLATION);
+        assert_eq!(state.get_info().position, Duration::from_secs(5));
+
+        state.set_status(PlaybackStatus::Buffering {
+            position: Duration::from_secs(5),
+        });
+        assert_eq!(state.display_position(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn latest_controls_publish_after_take_enqueues_a_new_wake() {
+        let (tx, mut rx) = audio_command_channel();
+        let mailbox = LatestControlMailbox::new(tx);
+        mailbox.publish_tick();
+        assert!(rx.try_recv().is_ok());
+        let _ = mailbox.take();
+        mailbox.publish_volume(0.5);
+        assert!(
+            rx.try_recv().is_ok(),
+            "a post-take publish must wake the actor"
+        );
+        assert_eq!(mailbox.take().0, Some(0.5));
+    }
 
     #[test]
     fn latest_controls_overwrite_volume_and_coalesce_ticks() {

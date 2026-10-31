@@ -44,6 +44,7 @@ pub struct PlaybackProcessingRuntime {
     bass_control: BassAutomationControl,
     natural_end: Arc<AtomicBool>,
     analysis: AudioAnalysisData,
+    starvation: super::streaming::StarvationStats,
 }
 
 #[derive(Clone)]
@@ -63,7 +64,7 @@ impl AudioProcessingChain {
         Self {
             shared: Arc::new(AudioProcessingChainShared {
                 preamp_linear_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
-                eq_params: EqualizerParams::new(44100),
+                eq_params: EqualizerParams::new(),
                 analysis_enabled: AtomicBool::new(false),
                 analysis_decay_bits: AtomicU32::new(0.85_f32.to_bits()),
                 active_analysis: RwLock::new(idle_analysis.clone()),
@@ -142,11 +143,6 @@ impl AudioProcessingChain {
     // Chain configuration
     // ========================================================================
 
-    /// Update sample rate (called when audio format changes)
-    pub fn set_sample_rate(&self, sample_rate: u32) {
-        self.shared.eq_params.set_sample_rate(sample_rate);
-    }
-
     // ========================================================================
     // Runtime lifecycle
     // ========================================================================
@@ -193,9 +189,8 @@ impl AudioProcessingChain {
     where
         S: Source<Item = f32>,
     {
-        // Update sample rate from source
-        self.set_sample_rate(source.sample_rate().get());
-
+        // Each equalizer instance derives its sample rate from its own source;
+        // a preload at a different rate must not retune the playing track.
         ProcessedSource::new(source, self.shared.clone(), runtime, track_gain)
     }
 }
@@ -218,7 +213,27 @@ impl PlaybackProcessingRuntime {
             bass_control: BassAutomationControl::new(1.0),
             natural_end: Arc::new(AtomicBool::new(false)),
             analysis,
+            starvation: super::streaming::StarvationStats::default(),
         }
+    }
+
+    pub(crate) fn starvation_stats(&self) -> super::streaming::StarvationStats {
+        self.starvation.clone()
+    }
+
+    /// The streaming decoder gate is currently emitting silence because the
+    /// retained window ran dry.
+    pub(crate) fn starvation_engaged(&self) -> bool {
+        self.starvation.is_engaged()
+    }
+
+    pub(crate) fn clear_starvation_engaged(&self) {
+        self.starvation.clear_engaged();
+    }
+
+    /// Silence inserted by the decoder gate, excluded from playback position.
+    pub(crate) fn starvation_gated_duration(&self) -> std::time::Duration {
+        self.starvation.gated_duration()
     }
 
     pub fn fade_to(&self, volume: f32, duration: std::time::Duration) {

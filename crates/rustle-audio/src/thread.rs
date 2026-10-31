@@ -27,8 +27,8 @@ use super::output_recovery::{
     OutputStallDetector, PreparedOutputRecovery, should_retry_output,
 };
 use super::player::{
-    AudioPlayer, DetachedStreamingPlayback, PlaybackError, PlaybackResult, PreparedStreamingSource,
-    prepare_streaming_source,
+    AudioPlayer, DetachedStreamingPlayback, PlaybackError, PlaybackResult, PreparedLocalSource,
+    PreparedStreamingSource, decode_local_source, prepare_streaming_source,
 };
 use super::streaming::{
     SharedBuffer, SharedBufferHealth, StreamingBuffer, StreamingReaderCancellation,
@@ -50,19 +50,14 @@ const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_MAINTENANCE_INTERVAL: Duration =
     Duration::from_millis(super::automix::SCHEDULER_POLL_MS);
 
+/// Emits `AudioEvent::Finished` at most once per playback generation.
+///
+/// Only a natural end is ever published; stop, seek and transition paths
+/// simply `reset` the guard for the next source.
 #[derive(Default)]
 struct FinishedGuard {
     generation: Option<super::identity::PlaybackGeneration>,
     emitted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinishReason {
-    Natural,
-    Stop,
-    SeekRebuild,
-    TransitionDisposed,
-    Stale,
 }
 
 impl FinishedGuard {
@@ -71,14 +66,8 @@ impl FinishedGuard {
         self.emitted = false;
     }
 
-    fn try_mark(
-        &mut self,
-        generation: super::identity::PlaybackGeneration,
-        reason: FinishReason,
-    ) -> bool {
-        if reason != FinishReason::Natural {
-            return false;
-        }
+    /// Returns `true` exactly once for a naturally finished generation.
+    fn try_mark(&mut self, generation: super::identity::PlaybackGeneration) -> bool {
         if self.generation != Some(generation) {
             self.generation = Some(generation);
             self.emitted = false;
@@ -103,6 +92,9 @@ struct PreloadedSink {
     is_streaming: bool,
     shared_buffer: Option<SharedBuffer>,
     reader_cancellation: Option<StreamingReaderCancellation>,
+    /// Automix entry already applied to this paused local decoder when its
+    /// transition was scheduled, so the handoff does not seek on the deadline.
+    preseeked_entry: Option<Duration>,
 }
 
 struct ScheduledPreloadedTransition {
@@ -141,19 +133,38 @@ struct PreparedPlayback {
     mode: PlaybackPreparationMode,
 }
 
+enum PreloadSourceRequest {
+    Local {
+        path: PathBuf,
+    },
+    Streaming {
+        buffer: StreamingBuffer,
+        duration: Duration,
+    },
+}
+
 struct PreloadPreparationRequest {
     identity: super::identity::PreloadIdentity,
-    buffer: StreamingBuffer,
-    duration: Duration,
+    source: PreloadSourceRequest,
     track_gain: f32,
+}
+
+enum PreparedPreloadSource {
+    Local {
+        path: PathBuf,
+        source: PlaybackResult<PreparedLocalSource>,
+    },
+    Streaming {
+        shared_buffer: SharedBuffer,
+        reader_cancellation: StreamingReaderCancellation,
+        source: PlaybackResult<PreparedStreamingSource>,
+        duration: Duration,
+    },
 }
 
 struct PreparedPreload {
     identity: super::identity::PreloadIdentity,
-    shared_buffer: SharedBuffer,
-    reader_cancellation: StreamingReaderCancellation,
-    source: PlaybackResult<PreparedStreamingSource>,
-    duration: Duration,
+    source: PreparedPreloadSource,
     track_gain: f32,
 }
 
@@ -425,28 +436,45 @@ impl StreamingPreparationPool {
                 while let Ok(request) = preload_rx.recv() {
                     let PreloadPreparationRequest {
                         identity,
-                        buffer,
-                        duration,
+                        source,
                         track_gain,
                     } = request;
-                    let shared_buffer = buffer.shared().clone();
-                    let reader_cancellation = buffer.reader_cancellation();
                     let started = Instant::now();
-                    let source = prepare_streaming_source(buffer);
+                    // Local files are opened and probed here too, so disk
+                    // latency never stalls the actor while a track plays.
+                    let (source, success) = match source {
+                        PreloadSourceRequest::Local { path } => {
+                            let source = decode_local_source(&path);
+                            let success = source.is_ok();
+                            (PreparedPreloadSource::Local { path, source }, success)
+                        }
+                        PreloadSourceRequest::Streaming { buffer, duration } => {
+                            let shared_buffer = buffer.shared().clone();
+                            let reader_cancellation = buffer.reader_cancellation();
+                            let source = prepare_streaming_source(buffer);
+                            let success = source.is_ok();
+                            (
+                                PreparedPreloadSource::Streaming {
+                                    shared_buffer,
+                                    reader_cancellation,
+                                    source,
+                                    duration,
+                                },
+                                success,
+                            )
+                        }
+                    };
                     tracing::debug!(
                         request_id = identity.request_id,
                         generation = identity.generation.0,
                         elapsed_ms = started.elapsed().as_millis(),
-                        success = source.is_ok(),
-                        "Streaming preload preparation completed"
+                        success,
+                        "Preload preparation completed"
                     );
                     if result_tx
                         .blocking_send(StreamingPreparationResult::Preload(PreparedPreload {
                             identity,
-                            shared_buffer,
-                            reader_cancellation,
                             source,
-                            duration,
                             track_gain,
                         }))
                         .is_err()
@@ -1306,12 +1334,21 @@ async fn audio_thread_main(
     let mut next_maintenance = tokio::time::Instant::now() + CONTROL_MAINTENANCE_INTERVAL;
 
     loop {
+        // A scheduled transition must not wait for the coarse periodic tick:
+        // wake at its audio-clock deadline so the handoff lands within timer
+        // resolution instead of up to one maintenance interval late.
+        let wake_at = transition_wake_deadline(
+            transition_scheduler.next_deadline(),
+            &player.get_info(),
+            tokio::time::Instant::now(),
+        )
+        .map_or(next_maintenance, |deadline| deadline.min(next_maintenance));
         let event = next_control_event(
             &mut command_rx,
             &mut preparation_result_rx,
             &mut seek_result_rx,
             &mut output_recovery_result_rx,
-            next_maintenance,
+            wake_at,
         )
         .await;
         let now = tokio::time::Instant::now();
@@ -1422,11 +1459,16 @@ async fn audio_thread_main(
                 Instant::now(),
             );
             let playback_info = state.get_info();
+            // A naturally finished source and a decoder held back by the
+            // starvation gate both stop the clock without any device fault;
+            // neither may be reported as an output stall.
             let stall_eligible = !output_recovery.is_recovering()
                 && !output_recovery.output_broken
                 && player.has_current_sink()
                 && current_context.is_some()
-                && playback_info.status == PlaybackStatus::Playing;
+                && playback_info.status == PlaybackStatus::Playing
+                && !playback_reached_end(&player, current_buffer.as_ref())
+                && !player.starvation_engaged();
             let stalled = output_recovery.stall_detector.sample(
                 Instant::now(),
                 player.get_info().position,
@@ -1572,6 +1614,24 @@ async fn audio_thread_main(
                     &mut scheduled_transition,
                     &mut transition_scheduler,
                 );
+                if run_control_maintenance(
+                    &mut player,
+                    &buffer_mailbox,
+                    &latest_controls,
+                    &event_tx,
+                    &state,
+                    &generation,
+                    &preparation_pool,
+                    &mut current_buffer,
+                    &mut current_context,
+                    &mut finished_guard,
+                    &mut preloaded_sinks,
+                    &mut scheduled_transition,
+                    &mut transition_scheduler,
+                    maintenance_due,
+                ) {
+                    break;
+                }
                 continue;
             }
             ControlEvent::Command(cmd) => cmd,
@@ -1622,285 +1682,673 @@ async fn audio_thread_main(
             seek_worker.cancel_active();
             preparation_pool.cancel_active_playback();
         }
-        match cmd {
-            AudioCommand::Play {
-                context,
-                request_id,
-                path,
-                fade_in,
-                track_gain,
-            } => {
-                if !generation.accepts(&context) {
-                    let _ = finished_guard.try_mark(context.generation, FinishReason::Stale);
-                    continue;
-                }
-                finished_guard.reset();
-                cancel_current_streaming_buffer(&mut current_buffer);
-                // Local file playback
-                current_context = Some(context.clone());
-                handle_play(
-                    &mut player,
-                    &event_tx,
-                    &state,
+        // Every command path falls through to the shared maintenance pass
+        // below. Early exits must leave this block rather than `continue` the
+        // actor loop, otherwise a due maintenance tick (finish detection,
+        // transition deadlines, fade completion) would be silently dropped.
+        'command: {
+            match cmd {
+                AudioCommand::Play {
                     context,
                     request_id,
                     path,
                     fade_in,
                     track_gain,
-                );
-            }
-
-            AudioCommand::LoadPaused {
-                context,
-                request_id,
-                path,
-                position,
-                track_gain,
-            } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                finished_guard.reset();
-                cancel_current_streaming_buffer(&mut current_buffer);
-                current_context = Some(context.clone());
-                handle_load_paused(
-                    &mut player,
-                    &event_tx,
-                    &state,
-                    context,
-                    request_id,
-                    path,
-                    position,
-                    track_gain,
-                );
-            }
-
-            AudioCommand::LoadPausedStreaming {
-                context,
-                request_id,
-                buffer,
-                duration,
-                cache_path,
-                position,
-                track_gain,
-            } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                cancel_current_streaming_buffer(&mut current_buffer);
-                current_context = None;
-                player.stop();
-                update_state_from_player(&player, &state);
-                state.set_current_path(None);
-                let error_context = context.clone();
-                pause_after_preparation = None;
-                if let Err(error) = preparation_pool.prepare_playback(PlaybackPreparationRequest {
-                    context,
-                    request_id,
-                    buffer,
-                    duration,
-                    cache_path,
-                    track_gain,
-                    mode: PlaybackPreparationMode::LoadPaused { position },
-                }) {
-                    tracing::warn!(request_id, %error, "Streaming playback preparation rejected");
-                    let _ = event_tx.send(AudioEvent::Error {
-                        context: error_context,
-                        request_id: Some(request_id),
-                        error,
-                    });
-                }
-            }
-
-            AudioCommand::PlayAt {
-                context,
-                request_id,
-                path,
-                position,
-                fade_in,
-                track_gain,
-            } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                finished_guard.reset();
-                cancel_current_streaming_buffer(&mut current_buffer);
-                current_context = Some(context.clone());
-                handle_play_at(
-                    &mut player,
-                    &event_tx,
-                    &state,
-                    context,
-                    request_id,
-                    path,
-                    position,
-                    fade_in,
-                    track_gain,
-                );
-            }
-
-            AudioCommand::PlayStreaming {
-                context,
-                request_id,
-                buffer,
-                duration,
-                cache_path,
-                fade_in,
-                track_gain,
-            } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                cancel_current_streaming_buffer(&mut current_buffer);
-                current_context = None;
-                player.stop();
-                update_state_from_player(&player, &state);
-                state.set_current_path(None);
-                let error_context = context.clone();
-                pause_after_preparation = None;
-                if let Err(error) = preparation_pool.prepare_playback(PlaybackPreparationRequest {
-                    context,
-                    request_id,
-                    buffer,
-                    duration,
-                    cache_path,
-                    track_gain,
-                    mode: PlaybackPreparationMode::Play { fade_in },
-                }) {
-                    tracing::warn!(request_id, %error, "Streaming playback preparation rejected");
-                    let _ = event_tx.send(AudioEvent::Error {
-                        context: error_context,
-                        request_id: Some(request_id),
-                        error,
-                    });
-                }
-            }
-
-            AudioCommand::Pause { context, fade_out } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                if let Some(base) = output_recovery
-                    .base
-                    .as_mut()
-                    .filter(|base| base.context.as_ref() == Some(&context))
-                {
-                    base.intent = OutputRecoveryIntent::Paused;
-                    state.set_status(PlaybackStatus::Paused);
-                    let _ = event_tx.send(AudioEvent::Paused {
+                } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    finished_guard.reset();
+                    cancel_current_streaming_buffer(&mut current_buffer);
+                    // Local file playback
+                    current_context = Some(context.clone());
+                    handle_play(
+                        &mut player,
+                        &event_tx,
+                        &state,
                         context,
-                        request_id: None,
-                        position: base.position,
-                    });
-                    continue;
+                        request_id,
+                        path,
+                        fade_in,
+                        track_gain,
+                    );
                 }
-                if current_context.as_ref() != Some(&context) {
-                    pause_after_preparation = Some(context.clone());
+
+                AudioCommand::LoadPaused {
+                    context,
+                    request_id,
+                    path,
+                    position,
+                    track_gain,
+                } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    finished_guard.reset();
+                    cancel_current_streaming_buffer(&mut current_buffer);
+                    current_context = Some(context.clone());
+                    handle_load_paused(
+                        &mut player,
+                        &event_tx,
+                        &state,
+                        context,
+                        request_id,
+                        path,
+                        position,
+                        track_gain,
+                    );
                 }
-                if fade_out {
-                    player.pause_with_fade(true);
-                } else {
-                    player.pause();
+
+                AudioCommand::LoadPausedStreaming {
+                    context,
+                    request_id,
+                    buffer,
+                    duration,
+                    cache_path,
+                    position,
+                    track_gain,
+                } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    cancel_current_streaming_buffer(&mut current_buffer);
+                    current_context = None;
+                    player.stop();
                     update_state_from_player(&player, &state);
-                    let pos = player.get_info().position;
-                    let _ = event_tx.send(AudioEvent::Paused {
-                        context,
-                        request_id: None,
-                        position: pos,
-                    });
-                }
-            }
-
-            AudioCommand::Resume { context, fade_in } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                if let Some(base) = output_recovery
-                    .base
-                    .as_mut()
-                    .filter(|base| base.context.as_ref() == Some(&context))
-                {
-                    base.intent = OutputRecoveryIntent::Playing;
-                    continue;
-                }
-                if pause_after_preparation.as_ref() == Some(&context) {
+                    state.set_current_path(None);
+                    let error_context = context.clone();
                     pause_after_preparation = None;
-                }
-                if let Some(ref buf) = current_buffer {
-                    let remaining_bytes = buf.buffered_ahead();
-                    let source_has_all_required_bytes =
-                        buf.is_complete() || buf.remote_eof_reached();
-                    if buf
-                        .policy()
-                        .should_enter_buffering(remaining_bytes, source_has_all_required_bytes)
+                    if let Err(error) =
+                        preparation_pool.prepare_playback(PlaybackPreparationRequest {
+                            context,
+                            request_id,
+                            buffer,
+                            duration,
+                            cache_path,
+                            track_gain,
+                            mode: PlaybackPreparationMode::LoadPaused { position },
+                        })
                     {
-                        tracing::info!(
-                            "Resume: remaining {} bytes < {} (low water mark), entering Buffering",
-                            remaining_bytes,
-                            buf.policy().low_water_mark_bytes()
-                        );
-                        let position = player.get_info().position;
-                        enter_buffering(&mut player, &state, &event_tx, position, context.clone());
-                        continue;
+                        tracing::warn!(request_id, %error, "Streaming playback preparation rejected");
+                        let _ = event_tx.send(AudioEvent::Error {
+                            context: error_context,
+                            request_id: Some(request_id),
+                            error,
+                        });
                     }
                 }
 
-                if fade_in {
-                    player.resume_with_fade(true);
-                } else {
-                    player.resume();
-                }
-                update_state_from_player(&player, &state);
-                let _ = event_tx.send(AudioEvent::Resumed { context });
-            }
-
-            AudioCommand::Stop { context } => {
-                if !generation.accepts(&context) {
-                    continue;
-                }
-                cancel_current_streaming_buffer(&mut current_buffer);
-                current_context = None;
-                pause_after_preparation = None;
-                let _ = finished_guard.try_mark(context.generation, FinishReason::Stop);
-                player.stop();
-                update_state_from_player(&player, &state);
-                state.set_current_path(None);
-                let _ = event_tx.send(AudioEvent::Stopped {
-                    context: context.clone(),
-                });
-            }
-
-            AudioCommand::Seek {
-                context,
-                nonce,
-                position,
-            } => {
-                if context.cancellation.is_cancelled() {
-                    continue;
-                }
-                let recovery_seek = if output_recovery
-                    .base
-                    .as_ref()
-                    .is_some_and(|base| base.context.as_ref() == Some(&context))
-                {
-                    output_recovery.source_revision =
-                        output_recovery.source_revision.wrapping_add(1);
-                    if let Some(base) = output_recovery.base.as_mut() {
-                        base.source_revision = output_recovery.source_revision;
-                        base.position = position;
-                        base.pending_seek = Some(nonce);
+                AudioCommand::PlayAt {
+                    context,
+                    request_id,
+                    path,
+                    position,
+                    fade_in,
+                    track_gain,
+                } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
                     }
-                    state.set_position(position);
-                    true
-                } else {
-                    false
-                };
-                if recovery_seek {
-                    let _ = event_tx.send(AudioEvent::SeekStarted {
+                    finished_guard.reset();
+                    cancel_current_streaming_buffer(&mut current_buffer);
+                    current_context = Some(context.clone());
+                    handle_play_at(
+                        &mut player,
+                        &event_tx,
+                        &state,
+                        context,
+                        request_id,
+                        path,
+                        position,
+                        fade_in,
+                        track_gain,
+                    );
+                }
+
+                AudioCommand::PlayStreaming {
+                    context,
+                    request_id,
+                    buffer,
+                    duration,
+                    cache_path,
+                    fade_in,
+                    track_gain,
+                } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    cancel_current_streaming_buffer(&mut current_buffer);
+                    current_context = None;
+                    player.stop();
+                    update_state_from_player(&player, &state);
+                    state.set_current_path(None);
+                    let error_context = context.clone();
+                    pause_after_preparation = None;
+                    if let Err(error) =
+                        preparation_pool.prepare_playback(PlaybackPreparationRequest {
+                            context,
+                            request_id,
+                            buffer,
+                            duration,
+                            cache_path,
+                            track_gain,
+                            mode: PlaybackPreparationMode::Play { fade_in },
+                        })
+                    {
+                        tracing::warn!(request_id, %error, "Streaming playback preparation rejected");
+                        let _ = event_tx.send(AudioEvent::Error {
+                            context: error_context,
+                            request_id: Some(request_id),
+                            error,
+                        });
+                    }
+                }
+
+                AudioCommand::Pause { context, fade_out } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    if let Some(base) = output_recovery
+                        .base
+                        .as_mut()
+                        .filter(|base| base.context.as_ref() == Some(&context))
+                    {
+                        base.intent = OutputRecoveryIntent::Paused;
+                        state.set_status(PlaybackStatus::Paused);
+                        let _ = event_tx.send(AudioEvent::Paused {
+                            context,
+                            request_id: None,
+                            position: base.position,
+                        });
+                        break 'command;
+                    }
+                    if current_context.as_ref() != Some(&context) {
+                        pause_after_preparation = Some(context.clone());
+                    }
+                    // While buffering the sink is already silent and paused; a
+                    // fade envelope would not advance until data returns, which
+                    // would replay a fade-out after the user paused.
+                    let buffering =
+                        matches!(state.get_info().status, PlaybackStatus::Buffering { .. });
+                    if fade_out && !buffering {
+                        player.pause_with_fade(true);
+                    } else {
+                        player.pause();
+                        update_state_from_player(&player, &state);
+                        let pos = player.get_info().position;
+                        let _ = event_tx.send(AudioEvent::Paused {
+                            context,
+                            request_id: None,
+                            position: pos,
+                        });
+                    }
+                }
+
+                AudioCommand::Resume { context, fade_in } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    if let Some(base) = output_recovery
+                        .base
+                        .as_mut()
+                        .filter(|base| base.context.as_ref() == Some(&context))
+                    {
+                        base.intent = OutputRecoveryIntent::Playing;
+                        break 'command;
+                    }
+                    if pause_after_preparation.as_ref() == Some(&context) {
+                        pause_after_preparation = None;
+                    }
+                    if let Some(ref buf) = current_buffer {
+                        let remaining_bytes = buf.buffered_ahead();
+                        let source_has_all_required_bytes =
+                            buf.is_complete() || buf.remote_eof_reached();
+                        if buf
+                            .policy()
+                            .should_enter_buffering(remaining_bytes, source_has_all_required_bytes)
+                        {
+                            tracing::info!(
+                                "Resume: remaining {} bytes < {} (low water mark), entering Buffering",
+                                remaining_bytes,
+                                buf.policy().low_water_mark_bytes()
+                            );
+                            let position = player.get_info().position;
+                            enter_buffering(
+                                &mut player,
+                                &state,
+                                &event_tx,
+                                position,
+                                context.clone(),
+                            );
+                            break 'command;
+                        }
+                    }
+
+                    if fade_in {
+                        player.resume_with_fade(true);
+                    } else {
+                        player.resume();
+                    }
+                    update_state_from_player(&player, &state);
+                    let _ = event_tx.send(AudioEvent::Resumed { context });
+                }
+
+                AudioCommand::Stop { context } => {
+                    if !generation.accepts(&context) {
+                        break 'command;
+                    }
+                    cancel_current_streaming_buffer(&mut current_buffer);
+                    current_context = None;
+                    pause_after_preparation = None;
+                    player.stop();
+                    update_state_from_player(&player, &state);
+                    state.set_current_path(None);
+                    let _ = event_tx.send(AudioEvent::Stopped {
                         context: context.clone(),
-                        nonce,
-                        target_position: position,
                     });
+                }
+
+                AudioCommand::Seek {
+                    context,
+                    nonce,
+                    position,
+                } => {
+                    state.finish_seek_handoff();
+                    if context.cancellation.is_cancelled() {
+                        break 'command;
+                    }
+                    let recovery_seek = if output_recovery
+                        .base
+                        .as_ref()
+                        .is_some_and(|base| base.context.as_ref() == Some(&context))
+                    {
+                        output_recovery.source_revision =
+                            output_recovery.source_revision.wrapping_add(1);
+                        if let Some(base) = output_recovery.base.as_mut() {
+                            base.source_revision = output_recovery.source_revision;
+                            base.position = position;
+                            base.pending_seek = Some(nonce);
+                        }
+                        state.set_position(position);
+                        true
+                    } else {
+                        false
+                    };
+                    if recovery_seek {
+                        let _ = event_tx.send(AudioEvent::SeekStarted {
+                            context: context.clone(),
+                            nonce,
+                            target_position: position,
+                        });
+                        request_output_recovery(
+                            &mut output_recovery,
+                            &output_recovery_worker,
+                            &device_signals,
+                            &event_tx,
+                            &mut player,
+                            &state,
+                            current_context.as_ref(),
+                            current_buffer.as_ref(),
+                            &mut preloaded_sinks,
+                            &mut scheduled_transition,
+                            &mut transition_scheduler,
+                            OutputRecoveryReason::ExplicitRetry,
+                            None,
+                        );
+                        break 'command;
+                    }
+                    if current_context.as_ref() == Some(&context)
+                        && let Some(shared_buffer) = current_buffer.as_ref().cloned()
+                    {
+                        if !generation.accepts_seek(&context, nonce) {
+                            break 'command;
+                        }
+                        let _ = event_tx.send(AudioEvent::SeekStarted {
+                            context: context.clone(),
+                            nonce,
+                            target_position: position,
+                        });
+                        match player.take_streaming_sink_for_seek(position) {
+                            Ok(DetachedStreamingPlayback {
+                                sink,
+                                duration,
+                                cache_path,
+                                track_gain,
+                                was_paused,
+                            }) => {
+                                // The old decoder and the replacement decoder share
+                                // one retained window. Cancel the old reader before
+                                // starting the replacement so they cannot race the
+                                // authoritative reader position/window epoch.
+                                player.cancel_current_streaming_reader();
+                                sink.stop();
+                                let buffer = StreamingBuffer::new(shared_buffer.clone());
+                                let reader_cancellation = buffer.reader_cancellation();
+                                submit_streaming_seek(
+                                    &seek_worker,
+                                    &mut player,
+                                    &event_tx,
+                                    &state,
+                                    &generation,
+                                    &mut current_buffer,
+                                    &mut current_context,
+                                    StreamingSeekRequest {
+                                        context,
+                                        nonce,
+                                        position,
+                                        sink,
+                                        buffer,
+                                        reader_cancellation,
+                                        shared_buffer,
+                                        duration,
+                                        cache_path,
+                                        track_gain,
+                                        was_paused,
+                                    },
+                                )
+                            }
+                            Err(PlaybackError::Cancelled(_)) => {
+                                seek_worker.cancel_active();
+                                deferred_streaming_seeks.insert(
+                                    context.generation,
+                                    DeferredStreamingSeek {
+                                        context,
+                                        nonce,
+                                        position,
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(AudioEvent::SeekFailed {
+                                    context,
+                                    nonce,
+                                    error,
+                                });
+                            }
+                        }
+                    } else if current_context.as_ref() == Some(&context) && current_buffer.is_none()
+                    {
+                        handle_seek(
+                            &mut player,
+                            &event_tx,
+                            &state,
+                            &generation,
+                            context,
+                            nonce,
+                            position,
+                        );
+                    } else if generation.accepts_seek(&context, nonce) {
+                        let _ = event_tx.send(AudioEvent::SeekFailed {
+                            context,
+                            nonce,
+                            error: PlaybackError::ControlUnavailable(
+                                "audio source is still preparing".to_string(),
+                            ),
+                        });
+                    }
+                    finished_guard.reset();
+                }
+
+                AudioCommand::CreatePreloadSink {
+                    identity,
+                    path,
+                    track_gain,
+                } => {
+                    if !generation.accepts_preload(&identity) {
+                        break 'command;
+                    }
+                    let error_identity = identity.clone();
+                    if let Err(error) =
+                        preparation_pool.prepare_preload(PreloadPreparationRequest {
+                            identity,
+                            source: PreloadSourceRequest::Local { path },
+                            track_gain,
+                        })
+                    {
+                        tracing::warn!(
+                            request_id = error_identity.request_id,
+                            %error,
+                            "Local preload preparation rejected"
+                        );
+                        let _ = event_tx.send(AudioEvent::PreloadFailed {
+                            identity: error_identity,
+                            error,
+                        });
+                    }
+                }
+
+                AudioCommand::CreatePreloadSinkStreaming {
+                    identity,
+                    buffer,
+                    duration,
+                    track_gain,
+                } => {
+                    if !generation.accepts_preload(&identity) {
+                        break 'command;
+                    }
+                    let error_identity = identity.clone();
+                    if let Err(error) =
+                        preparation_pool.prepare_preload(PreloadPreparationRequest {
+                            identity,
+                            source: PreloadSourceRequest::Streaming { buffer, duration },
+                            track_gain,
+                        })
+                    {
+                        tracing::warn!(
+                            request_id = error_identity.request_id,
+                            %error,
+                            "Streaming preload preparation rejected"
+                        );
+                        let _ = event_tx.send(AudioEvent::PreloadFailed {
+                            identity: error_identity,
+                            error,
+                        });
+                    }
+                }
+
+                AudioCommand::PlayPreloaded {
+                    context: owner,
+                    identity,
+                    playback_request_id,
+                    fade_in,
+                    transition,
+                } => {
+                    if !generation.accepts(&owner) {
+                        break 'command;
+                    }
+                    let preloaded =
+                        match take_healthy_preloaded_sink(&mut preloaded_sinks, &identity) {
+                            Ok(preloaded) => preloaded,
+                            Err(failure) => {
+                                tracing::warn!(
+                                    request_id = identity.request_id,
+                                    generation = identity.generation.0,
+                                    error = %failure.error,
+                                    "Rejected preload before immediate promotion"
+                                );
+                                let _ = event_tx.send(AudioEvent::Error {
+                                    context: owner,
+                                    request_id: Some(playback_request_id),
+                                    error: failure.error,
+                                });
+                                break 'command;
+                            }
+                        };
+                    let will_overlap = match player.preloaded_will_overlap(&transition) {
+                        Ok(will_overlap) => will_overlap,
+                        Err(error) => {
+                            clear_preloaded_buffer_callback(&preloaded);
+                            let _ = event_tx.send(AudioEvent::Error {
+                                context: owner,
+                                request_id: Some(playback_request_id),
+                                error,
+                            });
+                            break 'command;
+                        }
+                    };
+                    let Some(context) = generation.activate_preloaded_generation(&identity) else {
+                        clear_preloaded_buffer_callback(&preloaded);
+                        break 'command;
+                    };
+                    finished_guard.reset();
+                    let outgoing_shared_buffer = if will_overlap {
+                        current_buffer
+                            .take()
+                            .inspect(SharedBuffer::clear_buffer_callback)
+                    } else {
+                        cancel_current_streaming_buffer(&mut current_buffer);
+                        None
+                    };
+                    // Keep the preload's source identity separate from the new playback generation.
+                    current_buffer = preloaded.shared_buffer.clone();
+                    current_context = Some(context.clone());
+                    handle_play_preloaded(
+                        &mut player,
+                        &buffer_mailbox,
+                        &event_tx,
+                        &state,
+                        context,
+                        playback_request_id,
+                        preloaded,
+                        outgoing_shared_buffer,
+                        fade_in,
+                        transition,
+                    );
+                }
+
+                AudioCommand::SchedulePreloadedTransition {
+                    owner,
+                    identity,
+                    playback_request_id,
+                    trigger_at,
+                    fade_in,
+                    transition,
+                } => {
+                    let owner_current = generation.accepts(&owner);
+                    let preload_ready = preloaded_sinks
+                        .get(&identity.request_id)
+                        .is_some_and(|preloaded| preloaded.identity == identity);
+                    if !owner_current {
+                        break 'command;
+                    }
+                    if !generation.accepts_preload(&identity)
+                        || owner.generation != identity.generation
+                        || owner.cancellation != identity.cancellation
+                        || !preload_ready
+                    {
+                        release_preloaded_identity(&mut preloaded_sinks, &identity);
+                        let _ = event_tx.send(AudioEvent::Error {
+                            context: owner,
+                            request_id: Some(playback_request_id),
+                            error: PlaybackError::Cancelled(
+                                "scheduled preload is no longer ready".to_string(),
+                            ),
+                        });
+                        break 'command;
+                    }
+                    if let Some(error) = preload_promotion_error(&preloaded_sinks, &identity) {
+                        tracing::warn!(
+                            request_id = identity.request_id,
+                            generation = identity.generation.0,
+                            %error,
+                            "Rejected unhealthy streaming preload before scheduling promotion"
+                        );
+                        release_preloaded_identity(&mut preloaded_sinks, &identity);
+                        let _ = event_tx.send(AudioEvent::Error {
+                            context: owner,
+                            request_id: Some(playback_request_id),
+                            error,
+                        });
+                        break 'command;
+                    }
+                    if let Some(existing) = scheduled_transition.as_ref() {
+                        if existing.identity == identity
+                            && existing.transition.group == transition.group
+                        {
+                            break 'command;
+                        }
+                        if existing.identity == identity {
+                            let existing = scheduled_transition
+                                .take()
+                                .expect("scheduled transition exists");
+                            transition_scheduler.cancel(existing.transition.group);
+                        } else {
+                            cancel_scheduled_transition(
+                                &mut scheduled_transition,
+                                &mut transition_scheduler,
+                                &mut preloaded_sinks,
+                            );
+                        }
+                    }
+                    preseek_automix_entry(&mut preloaded_sinks, &identity, &transition);
+                    transition_scheduler.schedule(transition.group, trigger_at);
+                    scheduled_transition = Some(ScheduledPreloadedTransition {
+                        owner,
+                        identity,
+                        playback_request_id,
+                        fade_in,
+                        transition,
+                    });
+                }
+
+                AudioCommand::CancelScheduledTransition { owner } => {
+                    if scheduled_transition
+                        .as_ref()
+                        .is_some_and(|scheduled| scheduled.owner == owner)
+                    {
+                        cancel_scheduled_transition(
+                            &mut scheduled_transition,
+                            &mut transition_scheduler,
+                            &mut preloaded_sinks,
+                        );
+                    }
+                }
+
+                AudioCommand::ReleasePreload { identity } => {
+                    if scheduled_transition
+                        .as_ref()
+                        .is_some_and(|scheduled| scheduled.identity == identity)
+                    {
+                        cancel_scheduled_transition(
+                            &mut scheduled_transition,
+                            &mut transition_scheduler,
+                            &mut preloaded_sinks,
+                        );
+                        break 'command;
+                    }
+                    // Exact-identity cleanup is allowed for stale generations; unlike publication,
+                    // releasing an old sink must not leak resources after generation rollover.
+                    if preloaded_sinks
+                        .get(&identity.request_id)
+                        .is_some_and(|preloaded| preloaded.identity == identity)
+                    {
+                        let preloaded = preloaded_sinks
+                            .remove(&identity.request_id)
+                            .expect("preload exists");
+                        cancel_preloaded_streaming_buffer(&preloaded);
+                        tracing::debug!("Released stale preload sink: identity={:?}", identity);
+                    }
+                }
+
+                AudioCommand::SwitchDevice { device_name } => {
+                    request_output_recovery(
+                        &mut output_recovery,
+                        &output_recovery_worker,
+                        &device_signals,
+                        &event_tx,
+                        &mut player,
+                        &state,
+                        current_context.as_ref(),
+                        current_buffer.as_ref(),
+                        &mut preloaded_sinks,
+                        &mut scheduled_transition,
+                        &mut transition_scheduler,
+                        OutputRecoveryReason::ManualSelection,
+                        Some(device_name),
+                    );
+                }
+
+                AudioCommand::RetryOutput => {
                     request_output_recovery(
                         &mut output_recovery,
                         &output_recovery_worker,
@@ -1916,382 +2364,25 @@ async fn audio_thread_main(
                         OutputRecoveryReason::ExplicitRetry,
                         None,
                     );
-                    continue;
                 }
-                let _ = finished_guard.try_mark(context.generation, FinishReason::SeekRebuild);
-                if current_context.as_ref() == Some(&context)
-                    && let Some(shared_buffer) = current_buffer.as_ref().cloned()
-                {
-                    if !generation.accepts_seek(&context, nonce) {
-                        continue;
-                    }
-                    let _ = event_tx.send(AudioEvent::SeekStarted {
-                        context: context.clone(),
-                        nonce,
-                        target_position: position,
-                    });
-                    match player.take_streaming_sink_for_seek(position) {
-                        Ok(DetachedStreamingPlayback {
-                            sink,
-                            duration,
-                            cache_path,
-                            track_gain,
-                            was_paused,
-                        }) => {
-                            // The old decoder and the replacement decoder share
-                            // one retained window. Cancel the old reader before
-                            // starting the replacement so they cannot race the
-                            // authoritative reader position/window epoch.
-                            player.cancel_current_streaming_reader();
-                            sink.stop();
-                            let buffer = StreamingBuffer::new(shared_buffer.clone());
-                            let reader_cancellation = buffer.reader_cancellation();
-                            submit_streaming_seek(
-                                &seek_worker,
-                                &mut player,
-                                &event_tx,
-                                &state,
-                                &generation,
-                                &mut current_buffer,
-                                &mut current_context,
-                                StreamingSeekRequest {
-                                    context,
-                                    nonce,
-                                    position,
-                                    sink,
-                                    buffer,
-                                    reader_cancellation,
-                                    shared_buffer,
-                                    duration,
-                                    cache_path,
-                                    track_gain,
-                                    was_paused,
-                                },
-                            )
-                        }
-                        Err(PlaybackError::Cancelled(_)) => {
-                            seek_worker.cancel_active();
-                            deferred_streaming_seeks.insert(
-                                context.generation,
-                                DeferredStreamingSeek {
-                                    context,
-                                    nonce,
-                                    position,
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            let _ = event_tx.send(AudioEvent::SeekFailed {
-                                context,
-                                nonce,
-                                error,
-                            });
-                        }
-                    }
-                } else if current_context.as_ref() == Some(&context) && current_buffer.is_none() {
-                    handle_seek(
-                        &mut player,
-                        &event_tx,
-                        &state,
-                        &generation,
-                        context,
-                        nonce,
-                        position,
-                    );
-                } else if generation.accepts_seek(&context, nonce) {
-                    let _ = event_tx.send(AudioEvent::SeekFailed {
-                        context,
-                        nonce,
-                        error: PlaybackError::ControlUnavailable(
-                            "audio source is still preparing".to_string(),
-                        ),
-                    });
-                }
-                finished_guard.reset();
-            }
 
-            AudioCommand::CreatePreloadSink {
-                identity,
-                path,
-                track_gain,
-            } => {
-                if !generation.accepts_preload(&identity) {
-                    continue;
-                }
-                handle_create_preload_sink(
-                    &player,
-                    &event_tx,
-                    &mut preloaded_sinks,
-                    identity,
-                    path,
-                    track_gain,
-                );
-            }
+                AudioCommand::LatestMailboxWake => {}
 
-            AudioCommand::CreatePreloadSinkStreaming {
-                identity,
-                buffer,
-                duration,
-                track_gain,
-            } => {
-                if !generation.accepts_preload(&identity) {
-                    continue;
-                }
-                let error_identity = identity.clone();
-                if let Err(error) = preparation_pool.prepare_preload(PreloadPreparationRequest {
-                    identity,
-                    buffer,
-                    duration,
-                    track_gain,
-                }) {
-                    tracing::warn!(
-                        request_id = error_identity.request_id,
-                        %error,
-                        "Streaming preload preparation rejected"
-                    );
-                    let _ = event_tx.send(AudioEvent::PreloadFailed {
-                        identity: error_identity,
-                        error,
-                    });
-                }
-            }
-
-            AudioCommand::PlayPreloaded {
-                context: owner,
-                identity,
-                playback_request_id,
-                fade_in,
-                transition,
-            } => {
-                if !generation.accepts(&owner) {
-                    continue;
-                }
-                let preloaded = match take_healthy_preloaded_sink(&mut preloaded_sinks, &identity) {
-                    Ok(preloaded) => preloaded,
-                    Err(failure) => {
-                        tracing::warn!(
-                            request_id = identity.request_id,
-                            generation = identity.generation.0,
-                            error = %failure.error,
-                            "Rejected preload before immediate promotion"
-                        );
-                        let _ = event_tx.send(AudioEvent::Error {
-                            context: owner,
-                            request_id: Some(playback_request_id),
-                            error: failure.error,
-                        });
-                        continue;
-                    }
-                };
-                let will_overlap = match player.preloaded_will_overlap(&transition) {
-                    Ok(will_overlap) => will_overlap,
-                    Err(error) => {
-                        clear_preloaded_buffer_callback(&preloaded);
-                        let _ = event_tx.send(AudioEvent::Error {
-                            context: owner,
-                            request_id: Some(playback_request_id),
-                            error,
-                        });
-                        continue;
-                    }
-                };
-                let Some(context) = generation.activate_preloaded_generation(&identity) else {
-                    clear_preloaded_buffer_callback(&preloaded);
-                    continue;
-                };
-                let _ =
-                    finished_guard.try_mark(context.generation, FinishReason::TransitionDisposed);
-                finished_guard.reset();
-                let outgoing_shared_buffer = if will_overlap {
-                    current_buffer
-                        .take()
-                        .inspect(SharedBuffer::clear_buffer_callback)
-                } else {
-                    cancel_current_streaming_buffer(&mut current_buffer);
-                    None
-                };
-                // Keep the preload's source identity separate from the new playback generation.
-                current_buffer = preloaded.shared_buffer.clone();
-                current_context = Some(context.clone());
-                handle_play_preloaded(
-                    &mut player,
-                    &buffer_mailbox,
-                    &event_tx,
-                    &state,
-                    context,
-                    playback_request_id,
-                    preloaded,
-                    outgoing_shared_buffer,
-                    fade_in,
-                    transition,
-                );
-            }
-
-            AudioCommand::SchedulePreloadedTransition {
-                owner,
-                identity,
-                playback_request_id,
-                trigger_at,
-                fade_in,
-                transition,
-            } => {
-                let owner_current = generation.accepts(&owner);
-                let preload_ready = preloaded_sinks
-                    .get(&identity.request_id)
-                    .is_some_and(|preloaded| preloaded.identity == identity);
-                if !owner_current {
-                    continue;
-                }
-                if !generation.accepts_preload(&identity)
-                    || owner.generation != identity.generation
-                    || owner.cancellation != identity.cancellation
-                    || !preload_ready
-                {
-                    release_preloaded_identity(&mut preloaded_sinks, &identity);
-                    let _ = event_tx.send(AudioEvent::Error {
-                        context: owner,
-                        request_id: Some(playback_request_id),
-                        error: PlaybackError::Cancelled(
-                            "scheduled preload is no longer ready".to_string(),
-                        ),
-                    });
-                    continue;
-                }
-                if let Some(error) = preload_promotion_error(&preloaded_sinks, &identity) {
-                    tracing::warn!(
-                        request_id = identity.request_id,
-                        generation = identity.generation.0,
-                        %error,
-                        "Rejected unhealthy streaming preload before scheduling promotion"
-                    );
-                    release_preloaded_identity(&mut preloaded_sinks, &identity);
-                    let _ = event_tx.send(AudioEvent::Error {
-                        context: owner,
-                        request_id: Some(playback_request_id),
-                        error,
-                    });
-                    continue;
-                }
-                if let Some(existing) = scheduled_transition.as_ref() {
-                    if existing.identity == identity
-                        && existing.transition.group == transition.group
-                    {
-                        continue;
-                    }
-                    if existing.identity == identity {
-                        let existing = scheduled_transition
-                            .take()
-                            .expect("scheduled transition exists");
-                        transition_scheduler.cancel(existing.transition.group);
-                    } else {
-                        cancel_scheduled_transition(
-                            &mut scheduled_transition,
-                            &mut transition_scheduler,
-                            &mut preloaded_sinks,
+                AudioCommand::BufferDataAvailable => {
+                    while let Some(update) = buffer_mailbox.take_latest() {
+                        handle_buffer_data_update(
+                            &mut player,
+                            &event_tx,
+                            &state,
+                            &generation,
+                            current_buffer.as_ref(),
+                            update,
                         );
                     }
                 }
-                transition_scheduler.schedule(transition.group, trigger_at);
-                scheduled_transition = Some(ScheduledPreloadedTransition {
-                    owner,
-                    identity,
-                    playback_request_id,
-                    fade_in,
-                    transition,
-                });
+
+                AudioCommand::DeviceSignalWake => {}
             }
-
-            AudioCommand::CancelScheduledTransition { owner } => {
-                if scheduled_transition
-                    .as_ref()
-                    .is_some_and(|scheduled| scheduled.owner == owner)
-                {
-                    cancel_scheduled_transition(
-                        &mut scheduled_transition,
-                        &mut transition_scheduler,
-                        &mut preloaded_sinks,
-                    );
-                }
-            }
-
-            AudioCommand::ReleasePreload { identity } => {
-                if scheduled_transition
-                    .as_ref()
-                    .is_some_and(|scheduled| scheduled.identity == identity)
-                {
-                    cancel_scheduled_transition(
-                        &mut scheduled_transition,
-                        &mut transition_scheduler,
-                        &mut preloaded_sinks,
-                    );
-                    continue;
-                }
-                // Exact-identity cleanup is allowed for stale generations; unlike publication,
-                // releasing an old sink must not leak resources after generation rollover.
-                if preloaded_sinks
-                    .get(&identity.request_id)
-                    .is_some_and(|preloaded| preloaded.identity == identity)
-                {
-                    let preloaded = preloaded_sinks
-                        .remove(&identity.request_id)
-                        .expect("preload exists");
-                    cancel_preloaded_streaming_buffer(&preloaded);
-                    tracing::debug!("Released stale preload sink: identity={:?}", identity);
-                }
-            }
-
-            AudioCommand::SwitchDevice { device_name } => {
-                request_output_recovery(
-                    &mut output_recovery,
-                    &output_recovery_worker,
-                    &device_signals,
-                    &event_tx,
-                    &mut player,
-                    &state,
-                    current_context.as_ref(),
-                    current_buffer.as_ref(),
-                    &mut preloaded_sinks,
-                    &mut scheduled_transition,
-                    &mut transition_scheduler,
-                    OutputRecoveryReason::ManualSelection,
-                    Some(device_name),
-                );
-            }
-
-            AudioCommand::RetryOutput => {
-                request_output_recovery(
-                    &mut output_recovery,
-                    &output_recovery_worker,
-                    &device_signals,
-                    &event_tx,
-                    &mut player,
-                    &state,
-                    current_context.as_ref(),
-                    current_buffer.as_ref(),
-                    &mut preloaded_sinks,
-                    &mut scheduled_transition,
-                    &mut transition_scheduler,
-                    OutputRecoveryReason::ExplicitRetry,
-                    None,
-                );
-            }
-
-            AudioCommand::LatestMailboxWake => {}
-
-            AudioCommand::BufferDataAvailable => {
-                while let Some(update) = buffer_mailbox.take_latest() {
-                    handle_buffer_data_update(
-                        &mut player,
-                        &event_tx,
-                        &state,
-                        &generation,
-                        current_buffer.as_ref(),
-                        update,
-                    );
-                }
-            }
-
-            AudioCommand::DeviceSignalWake => {}
         }
 
         if run_control_maintenance(
@@ -2383,7 +2474,26 @@ fn run_control_maintenance(
         return true;
     }
 
-    if let Some(action) = transition_scheduler.poll(player.get_info().position)
+    // The audio clock stops when the outgoing source ends. If that happens
+    // before the scheduled deadline (metadata duration longer than the real
+    // audio), the deadline would never be reached; promote immediately.
+    let outgoing_ended = playback_reached_end(player, current_buffer.as_ref());
+    let mut due_transition = transition_scheduler.poll(player.get_info().position);
+    if due_transition.is_none()
+        && outgoing_ended
+        && let Some(group) = scheduled_transition
+            .as_ref()
+            .map(|scheduled| scheduled.transition.group)
+    {
+        due_transition = transition_scheduler.force(group);
+        if due_transition.is_some() {
+            tracing::info!(
+                group = group.0,
+                "Outgoing source ended before its scheduled transition; promoting now"
+            );
+        }
+    }
+    if let Some(action) = due_transition
         && scheduled_transition
             .as_ref()
             .is_some_and(|scheduled| scheduled.transition.group == action.group)
@@ -2392,6 +2502,15 @@ fn run_control_maintenance(
             .take()
             .expect("matching scheduled transition exists");
         let owner_current = generation.accepts(&scheduled.owner);
+        if outgoing_ended
+            && owner_current
+            && let Some(context) = current_context.as_ref()
+        {
+            // The app owns this handoff through its pending request. A failed
+            // promotion is reported as that request's error; a parallel
+            // `Finished` for the outgoing generation would advance twice.
+            let _ = finished_guard.try_mark(context.generation);
+        }
         if owner_current
             && generation.accepts_preload(&scheduled.identity)
             && preloaded_sinks
@@ -2436,8 +2555,6 @@ fn run_control_maintenance(
                                 transition.group,
                             );
                         }
-                        let _ = finished_guard
-                            .try_mark(context.generation, FinishReason::TransitionDisposed);
                         finished_guard.reset();
                         let outgoing_shared_buffer = if will_overlap {
                             current_buffer
@@ -2505,6 +2622,28 @@ fn run_control_maintenance(
         finished_guard,
     );
     false
+}
+
+/// Wall-clock deadline of the next scheduled transition, derived from the
+/// remaining audio time. `None` while nothing is scheduled or the clock is
+/// not advancing (paused / stopped).
+fn transition_wake_deadline(
+    next_deadline: Option<Duration>,
+    info: &super::PlaybackInfo,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let trigger_at = next_deadline?;
+    if info.status != PlaybackStatus::Playing {
+        return None;
+    }
+    Some(now + trigger_at.saturating_sub(info.position))
+}
+
+/// The current source ended and its stream (if any) cannot supply more
+/// bytes. This is exactly the condition under which `Finished` is published.
+fn playback_reached_end(player: &AudioPlayer, current_buffer: Option<&SharedBuffer>) -> bool {
+    player.is_finished()
+        && current_buffer.is_none_or(|buffer| buffer.health() != SharedBufferHealth::Refillable)
 }
 
 fn terminate_terminal_stream(
@@ -2686,6 +2825,45 @@ fn release_preloaded_identity(
     }
 }
 
+/// Move a paused local preload to its planned Automix entry while the
+/// transition is being scheduled (well ahead of the deadline), so the
+/// deadline handoff does not block the actor on a decoder seek.
+///
+/// Streaming preloads are left untouched: their seek may need a Range refetch
+/// and must never run through the output callback.
+fn preseek_automix_entry(
+    preloaded_sinks: &mut HashMap<u64, PreloadedSink>,
+    identity: &super::identity::PreloadIdentity,
+    transition: &super::automix::TransitionDirective,
+) {
+    if transition.kind != super::automix::TransitionKind::Automix {
+        return;
+    }
+    let Some(preloaded) = preloaded_sinks
+        .get_mut(&identity.request_id)
+        .filter(|preloaded| preloaded.identity == *identity && !preloaded.is_streaming)
+    else {
+        return;
+    };
+    let current = preloaded.preseeked_entry.unwrap_or(Duration::ZERO);
+    if current == transition.entry {
+        return;
+    }
+    match preloaded.sink.try_seek(transition.entry) {
+        Ok(()) => preloaded.preseeked_entry = Some(transition.entry),
+        Err(error) => {
+            // Leave the decoder where it is; the handoff retries the seek and
+            // falls back to a baseline transition if it still fails.
+            tracing::debug!(
+                request_id = identity.request_id,
+                entry_ms = transition.entry.as_millis(),
+                %error,
+                "Automix entry pre-seek failed"
+            );
+        }
+    }
+}
+
 fn cancel_scheduled_transition(
     scheduled: &mut Option<ScheduledPreloadedTransition>,
     scheduler: &mut super::automix::AudioClockScheduler,
@@ -2723,7 +2901,16 @@ fn process_tick(
         current_status,
         PlaybackStatus::Buffering { .. } | PlaybackStatus::Paused
     ) {
-        state.set_status(info.status);
+        // The player keeps its internal `Playing` status after the source
+        // ends; publishing it would flip the `Stopped` set alongside
+        // `Finished` back to `Playing` and make the stall detector treat a
+        // finished track as a frozen output.
+        let status = if playback_reached_end(player, current_buffer) {
+            PlaybackStatus::Stopped
+        } else {
+            info.status
+        };
+        state.set_status(status);
     }
 }
 
@@ -3014,20 +3201,42 @@ fn handle_streaming_preparation_result(
         StreamingPreparationResult::Preload(prepared) => {
             let PreparedPreload {
                 identity,
-                shared_buffer,
-                reader_cancellation,
                 source,
-                duration,
                 track_gain,
             } = prepared;
             if !generation.accepts_preload(&identity) || identity.cancellation.is_cancelled() {
                 tracing::debug!(
                     request_id = identity.request_id,
                     generation = identity.generation.0,
-                    "Discarded stale streaming preload preparation"
+                    "Discarded stale preload preparation"
                 );
                 return;
             }
+            let (shared_buffer, reader_cancellation, source, duration) = match source {
+                PreparedPreloadSource::Local { path, source } => {
+                    match source {
+                        Ok(source) => handle_create_preload_sink(
+                            player,
+                            event_tx,
+                            preloaded_sinks,
+                            identity,
+                            path,
+                            source,
+                            track_gain,
+                        ),
+                        Err(error) => {
+                            let _ = event_tx.send(AudioEvent::PreloadFailed { identity, error });
+                        }
+                    }
+                    return;
+                }
+                PreparedPreloadSource::Streaming {
+                    shared_buffer,
+                    reader_cancellation,
+                    source,
+                    duration,
+                } => (shared_buffer, reader_cancellation, source, duration),
+            };
             if let Some(error) = shared_buffer.health().promotion_error() {
                 tracing::warn!(
                     request_id = identity.request_id,
@@ -3471,10 +3680,11 @@ fn handle_create_preload_sink(
     preloaded_sinks: &mut HashMap<u64, PreloadedSink>,
     identity: super::identity::PreloadIdentity,
     path: PathBuf,
+    source: PreparedLocalSource,
     track_gain: f32,
 ) {
     let request_id = identity.request_id;
-    match player.create_preload_sink(&path, track_gain) {
+    match player.create_preload_sink_prepared_local(source, track_gain) {
         Ok((sink, duration, runtime)) => {
             // Store the sink for later playback
             preloaded_sinks.insert(
@@ -3489,6 +3699,7 @@ fn handle_create_preload_sink(
                     is_streaming: false,
                     shared_buffer: None, // Local files don't have shared buffer
                     reader_cancellation: None,
+                    preseeked_entry: None,
                 },
             );
             tracing::debug!(
@@ -3540,6 +3751,7 @@ fn handle_create_preload_sink_streaming(
                     is_streaming: true,
                     shared_buffer: Some(shared_buffer), // Save for callback setup on play
                     reader_cancellation: Some(reader_cancellation),
+                    preseeked_entry: None,
                 },
             );
             tracing::debug!("Preload streaming sink created: request_id={}", request_id);
@@ -3581,6 +3793,7 @@ fn handle_play_preloaded(
         is_streaming,
         shared_buffer,
         reader_cancellation,
+        preseeked_entry,
     } = preloaded;
     let request_id = identity.request_id;
 
@@ -3619,6 +3832,7 @@ fn handle_play_preloaded(
         reader_cancellation,
         outgoing_shared_buffer,
         transition,
+        preseeked_entry,
     ) {
         Ok(_) => {
             update_state_from_player(player, state);
@@ -3736,10 +3950,17 @@ fn check_buffer_status(
     let policy = buffer.policy();
 
     match &current_status {
+        // A fade-out pause is completing; pausing the sink now would freeze
+        // the envelope and leave the pause pending until data returns. The
+        // decoder gate keeps the fade running even if the window runs dry.
+        PlaybackStatus::Playing if player.has_pending_pause() => {}
         PlaybackStatus::Playing
-            if policy.should_enter_buffering(remaining_bytes, source_has_all_required_bytes) =>
+            if player.starvation_engaged()
+                || policy
+                    .should_enter_buffering(remaining_bytes, source_has_all_required_bytes) =>
         {
             tracing::info!(
+                starved = player.starvation_engaged(),
                 "Buffer low: remaining {} bytes < {} (low water mark), entering Buffering",
                 remaining_bytes,
                 policy.low_water_mark_bytes()
@@ -3862,7 +4083,7 @@ fn check_playback_finished(
     if player.is_finished()
         && let Some(context) = context
         && generation.accepts(context)
-        && finished_guard.try_mark(context.generation, FinishReason::Natural)
+        && finished_guard.try_mark(context.generation)
     {
         state.set_status(PlaybackStatus::Stopped);
         let _ = event_tx.send(AudioEvent::Finished {
@@ -4140,35 +4361,40 @@ mod tests {
     }
 
     #[test]
+    fn transition_wake_tracks_the_audio_clock_only_while_playing() {
+        let now = tokio::time::Instant::now();
+        let info = |status, position| crate::PlaybackInfo {
+            status,
+            position,
+            duration: Duration::from_secs(240),
+            volume: 1.0,
+        };
+        let playing = info(PlaybackStatus::Playing, Duration::from_millis(234_970));
+        assert_eq!(
+            transition_wake_deadline(Some(Duration::from_secs(235)), &playing, now),
+            Some(now + Duration::from_millis(30))
+        );
+        // An overdue deadline wakes immediately instead of underflowing.
+        assert_eq!(
+            transition_wake_deadline(Some(Duration::from_secs(230)), &playing, now),
+            Some(now)
+        );
+        let paused = info(PlaybackStatus::Paused, Duration::from_secs(10));
+        assert_eq!(
+            transition_wake_deadline(Some(Duration::from_secs(235)), &paused, now),
+            None
+        );
+        assert_eq!(transition_wake_deadline(None, &playing, now), None);
+    }
+
+    #[test]
     fn finished_guard_is_exactly_once_per_generation() {
         let mut guard = FinishedGuard::default();
-        assert!(!guard.try_mark(crate::identity::PlaybackGeneration(1), FinishReason::Stop));
-        assert!(!guard.try_mark(
-            crate::identity::PlaybackGeneration(1),
-            FinishReason::SeekRebuild
-        ));
-        assert!(!guard.try_mark(
-            crate::identity::PlaybackGeneration(1),
-            FinishReason::TransitionDisposed
-        ));
-        assert!(!guard.try_mark(crate::identity::PlaybackGeneration(1), FinishReason::Stale));
-        assert!(guard.try_mark(
-            crate::identity::PlaybackGeneration(1),
-            FinishReason::Natural
-        ));
-        assert!(!guard.try_mark(
-            crate::identity::PlaybackGeneration(1),
-            FinishReason::Natural
-        ));
-        assert!(guard.try_mark(
-            crate::identity::PlaybackGeneration(2),
-            FinishReason::Natural
-        ));
+        assert!(guard.try_mark(crate::identity::PlaybackGeneration(1)));
+        assert!(!guard.try_mark(crate::identity::PlaybackGeneration(1)));
+        assert!(guard.try_mark(crate::identity::PlaybackGeneration(2)));
         guard.reset();
-        assert!(guard.try_mark(
-            crate::identity::PlaybackGeneration(2),
-            FinishReason::Natural
-        ));
+        assert!(guard.try_mark(crate::identity::PlaybackGeneration(2)));
     }
 
     #[test]
