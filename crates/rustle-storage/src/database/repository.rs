@@ -190,6 +190,36 @@ impl Database {
         Ok(())
     }
 
+    /// Save the queue, current song, position and provenance in one transaction.
+    pub async fn save_playback_snapshot(&self, snapshot: &DbPlaybackSnapshot) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(songs) = &snapshot.songs {
+            let mut ids = Vec::with_capacity(songs.len());
+            for song in songs {
+                let id = if song.id < 0 || song.file_path.starts_with("ncm://") {
+                    ops::upsert_ncm_song_tx(&mut tx, song).await?
+                } else {
+                    song.id
+                };
+                ids.push(id);
+            }
+            ops::set_queue_tx(&mut tx, &ids, None).await?;
+        }
+        let current_id = match &snapshot.current_song {
+            Some(song) if song.id < 0 || song.file_path.starts_with("ncm://") => {
+                Some(ops::upsert_ncm_song_tx(&mut tx, song).await?)
+            }
+            Some(song) => Some(song.id),
+            None => None,
+        };
+        sqlx::query("UPDATE playback_state SET current_song_id = ?, queue_position = ?, position_secs = ?, personal_fm_mode = ?, playback_origin = ?, queue_origins = COALESCE(?, queue_origins), updated_at = ? WHERE id = 1")
+            .bind(current_id).bind(snapshot.queue_position).bind(snapshot.position_secs)
+            .bind(snapshot.personal_fm_mode).bind(&snapshot.playback_origin).bind(&snapshot.queue_origins)
+            .bind(ops::current_timestamp()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn get_queue(&self) -> Result<Vec<DbSong>> {
         ops::get_queue(&self.pool).await
     }
@@ -267,5 +297,68 @@ impl Database {
 
     pub async fn delete_watched_folder_by_playlist(&self, playlist_id: i64) -> Result<()> {
         ops::delete_watched_folder_by_playlist(&self.pool, playlist_id).await
+    }
+}
+
+#[cfg(test)]
+mod playback_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn playback_snapshot_preserves_duplicate_origins_and_rolls_back_on_failure() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrations::initialize(pool.clone(), PathBuf::from(":memory:"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO songs (file_path, title, last_modified, created_at) VALUES ('fixture.flac', 'Fixture', 1, 1)")
+            .execute(&pool).await.unwrap();
+        let song = sqlx::query_as::<_, DbSong>("SELECT * FROM songs WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let db = Database { pool };
+        let mut snapshot = DbPlaybackSnapshot {
+            songs: Some(vec![song.clone(), song.clone()]),
+            current_song: Some(song),
+            queue_position: 1,
+            position_secs: 42.0,
+            personal_fm_mode: false,
+            playback_origin: "\"Normal\"".into(),
+            queue_origins: Some("[{\"PersonalFm\":{\"session\":7}},\"Normal\"]".into()),
+        };
+        db.save_playback_snapshot(&snapshot).await.unwrap();
+        let state = db.get_playback_state().await.unwrap();
+        assert_eq!(state.queue_position, 1);
+        assert_eq!(state.position_secs, 42.0);
+        assert_eq!(
+            state.queue_origins.as_deref(),
+            snapshot.queue_origins.as_deref()
+        );
+        assert_eq!(db.get_queue().await.unwrap().len(), 2);
+
+        snapshot.songs.as_mut().unwrap()[0].id = 987654;
+        snapshot.personal_fm_mode = true;
+        snapshot.position_secs = 0.0;
+        assert!(db.save_playback_snapshot(&snapshot).await.is_err());
+        assert_eq!(db.get_queue().await.unwrap().len(), 2);
+        let retained = db.get_playback_state().await.unwrap();
+        assert_eq!(retained.position_secs, 42.0);
+        assert!(!retained.personal_fm_mode);
+        assert_eq!(retained.queue_origins, state.queue_origins);
+        // A periodic position checkpoint leaves queue rows and provenance intact.
+        snapshot.songs = None;
+        snapshot.queue_origins = None;
+        snapshot.personal_fm_mode = false;
+        snapshot.position_secs = 55.0;
+        db.save_playback_snapshot(&snapshot).await.unwrap();
+        let checkpoint = db.get_playback_state().await.unwrap();
+        assert_eq!(checkpoint.position_secs, 55.0);
+        assert_eq!(checkpoint.queue_origins, state.queue_origins);
+        assert_eq!(db.get_queue().await.unwrap().len(), 2);
+        db.pool.close().await;
     }
 }

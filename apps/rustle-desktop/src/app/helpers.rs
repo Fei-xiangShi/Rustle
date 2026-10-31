@@ -480,30 +480,15 @@ pub async fn load_playlist_view(
 use crate::app::state::App;
 
 impl App {
-    /// Check if currently in Personal FM mode
+    /// The visible mode belongs to the confirmed playback, never navigation.
     pub fn is_fm_mode(&self) -> bool {
-        self.playback.personal_fm_mode
-    }
-
-    /// Enter Personal FM mode
-    pub fn enter_fm_mode(&mut self) {
-        self.playback.personal_fm_mode = true;
-        self.playback.ncm_scrobble_source_id = None;
-        self.persist_personal_fm_mode(true);
-        self.clear_shuffle_cache();
-    }
-
-    /// Exit Personal FM mode
-    pub fn exit_fm_mode(&mut self) {
-        self.playback.personal_fm_mode = false;
-        self.playback.ncm_scrobble_source_id = None;
-        self.persist_personal_fm_mode(false);
+        self.playback.machine.origin().is_fm()
     }
 
     /// Check if more FM songs should be fetched
     /// Returns true if queue_index is within 3 songs of the end
     pub fn should_fetch_more_fm(&self) -> bool {
-        if !self.playback.personal_fm_mode {
+        if !self.is_fm_mode() {
             return false;
         }
         let queue_len = self.playback.queue.len();
@@ -511,59 +496,29 @@ impl App {
         queue_len.saturating_sub(current_idx) <= 3
     }
 
-    /// Fetch more FM songs (returns Task)
-    pub fn fetch_more_fm_songs(&self) -> Task<Message> {
-        if let Some(client) = &self.core.ncm_client {
-            let client = client.clone();
-            Task::perform(
-                async move {
-                    match client.personal_fm_tracks().await {
-                        Ok(songs) if !songs.is_empty() => Some(songs),
-                        _ => None,
-                    }
-                },
-                |songs_opt| {
-                    if let Some(songs) = songs_opt {
-                        // FM mode: append songs without starting playback
-                        Message::AddNcmPlaylist(songs, false)
-                    } else {
-                        Message::NoOp
-                    }
-                },
-            )
-        } else {
-            Task::none()
-        }
+    pub fn fetch_more_fm_songs(&mut self) -> Task<Message> {
+        self.request_fm_refill(false)
     }
 
-    /// Fetch more FM songs and start playing the first new song
-    /// Used when FM queue is exhausted
-    pub fn fetch_more_fm_songs_and_play(&self) -> Task<Message> {
-        if let Some(client) = &self.core.ncm_client {
-            let client = client.clone();
-            Task::perform(
-                async move {
-                    match client.personal_fm_tracks().await {
-                        Ok(songs) if !songs.is_empty() => Some(songs),
-                        _ => None,
-                    }
-                },
-                |songs_opt| {
-                    if let Some(songs) = songs_opt {
-                        // FM mode: append songs and start playback
-                        Message::AddNcmPlaylist(songs, true)
-                    } else {
-                        Message::ShowErrorToast("获取私人FM歌曲失败".to_string())
-                    }
-                },
-            )
-        } else {
-            Self::toast_warning(
-                self.core
-                    .locale
-                    .get(crate::i18n::Key::NotLoggedIn)
-                    .to_string(),
-            )
-        }
+    pub fn fetch_more_fm_songs_and_play(&mut self) -> Task<Message> {
+        self.request_fm_refill(true)
+    }
+
+    fn request_fm_refill(&mut self, play: bool) -> Task<Message> {
+        let Some(client) = self.core.ncm_client.clone() else {
+            return Task::none();
+        };
+        let Some((id, _)) = self.playback.machine.begin_fm_refill(play) else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                client
+                    .personal_fm_tracks()
+                    .await
+                    .map_err(crate::error::AppError::from)
+            },
+            move |result| Message::FmRefillLoaded(id, result),
+        )
     }
 }

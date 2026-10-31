@@ -1417,7 +1417,7 @@ impl App {
 
         let runtime = self.playback_runtime();
         let position_ms = if runtime.has_loaded_audio && runtime.info.duration.as_secs_f32() > 0.0 {
-            (runtime.info.position.as_secs_f32() * 1000.0) as u64
+            (runtime.display_position.as_secs_f32() * 1000.0) as u64
         } else {
             0
         };
@@ -1451,7 +1451,7 @@ impl App {
 
         let runtime = self.playback_runtime();
         let time_ms = if runtime.has_loaded_audio && runtime.info.duration.as_secs_f32() > 0.0 {
-            runtime.info.position.as_secs_f64() * 1000.0
+            runtime.display_position.as_secs_f64() * 1000.0
         } else {
             self.playback
                 .saved_state

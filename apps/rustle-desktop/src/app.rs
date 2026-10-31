@@ -2,6 +2,7 @@
 
 pub mod helpers;
 mod message;
+pub(crate) mod playback_machine;
 mod state;
 mod update;
 mod view;
@@ -155,9 +156,11 @@ impl App {
             open_window_and_init_services,
             // Protocol IPC listener and URI stream
             {
-                let (ipc_tx, ipc_rx) = crate::protocol::ipc::ipc_channel();
-                crate::platform::protocol::setup_macos_url_handler(ipc_tx.clone());
-                crate::protocol::ipc::spawn_ipc_listener(ipc_tx);
+                // The listener was claimed during startup negotiation; a
+                // standalone process still needs a channel for macOS events.
+                let (ipc_tx, ipc_rx) = crate::protocol::ipc::take_primary_channel()
+                    .unwrap_or_else(crate::protocol::ipc::ipc_channel);
+                crate::platform::protocol::setup_macos_url_handler(ipc_tx);
                 let ipc_stream = Task::run(
                     async_stream::stream! {
                         tokio::pin!(ipc_rx);
@@ -167,6 +170,9 @@ impl App {
                     },
                     |msg| match msg {
                         crate::protocol::ipc::IpcMessage::Uri(uri) => Message::UriReceived(uri),
+                        crate::protocol::ipc::IpcMessage::OpenFiles(paths) => {
+                            Message::OpenLocalFiles(paths)
+                        }
                         crate::protocol::ipc::IpcMessage::Focus => Message::ShowOrFocusWindow,
                     },
                 );
@@ -175,7 +181,13 @@ impl App {
                         .map(Message::UriReceived)
                         .unwrap_or(Message::Noop),
                 );
-                Task::batch([ipc_stream, pending])
+                let pending_files = crate::protocol::ipc::take_pending_startup_files();
+                let pending_files = if pending_files.is_empty() {
+                    Task::none()
+                } else {
+                    Task::done(Message::OpenLocalFiles(pending_files))
+                };
+                Task::batch([ipc_stream, pending, pending_files])
             },
             Task::perform(helpers::init_database(), |result| match result {
                 Ok(db) => Message::DatabaseReady(Arc::new(db)),
@@ -304,6 +316,8 @@ impl App {
         let focus_sub = iced::window::events().filter_map(|(_id, event)| match event {
             iced::window::Event::Focused => Some(Message::WindowFocused),
             iced::window::Event::Unfocused => Some(Message::WindowUnfocused),
+            // One event per dropped file; OpenLocalFiles coalesces them.
+            iced::window::Event::FileDropped(path) => Some(Message::OpenLocalFiles(vec![path])),
             _ => None,
         });
 

@@ -523,7 +523,7 @@ impl App {
         {
             let path = slot.path.clone();
             let buffer = slot.take_buffer();
-            self.playback.current_quality = slot.quality.take();
+            let quality = slot.quality.take();
             tracing::info!(
                 "Using {} preloaded track: idx={}, identity={:?}, path={:?}, streaming_buffer={}",
                 preloaded_direction,
@@ -532,7 +532,11 @@ impl App {
                 path,
                 buffer.is_some()
             );
-            return Some(PlaybackSource::Preloaded { identity, buffer });
+            return Some(PlaybackSource::Preloaded {
+                identity,
+                buffer,
+                quality,
+            });
         }
         tracing::debug!("No {} preloaded track available for idx={}", direction, idx);
         None

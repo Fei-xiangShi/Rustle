@@ -1,24 +1,48 @@
-//! IPC (Inter-Process Communication) for single-instance URL forwarding
+//! IPC (Inter-Process Communication) for single-instance launch forwarding
 //!
-//! When a second instance is launched with a rustle:// URI, it forwards the URI
-//! to the primary instance via a local socket and exits.
+//! When a second instance is launched with a rustle:// URI or with audio file
+//! paths, it forwards the request to the primary instance via a local socket
+//! and exits.
 //!
 //! On normal launch, a new instance first checks whether a primary instance is
 //! already running — if so, it sends a Focus command and exits, enforcing
 //! single-instance behavior.
+//!
+//! The primary instance claims the socket name synchronously during startup,
+//! before the UI runtime exists. Shells that open several files at once may
+//! start several processes simultaneously; claiming early lets exactly one of
+//! them win while the others retry forwarding to it.
 
 use std::error::Error;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
+
+use super::launch::LaunchRequest;
 
 /// Well-known socket name for Rustle single-instance IPC
 const IPC_SOCKET_NAME: &str = "rustle_instance";
+
+/// Upper bound for a single IPC message (file lists can be long).
+const MAX_MESSAGE_BYTES: u64 = 1024 * 1024;
+
+/// How long a starting process keeps trying to reach a primary instance that
+/// is concurrently claiming the socket name.
+const STARTUP_NEGOTIATION_ATTEMPTS: u32 = 20;
+const STARTUP_NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
+
+/// Failed attempts after which an unreachable but taken name is treated as
+/// stale. A live Unix listener accepts connections into its backlog as soon as
+/// it is bound, so only a just-binding peer can look unreachable this long.
+const STALE_RECLAIM_AFTER_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpcErrorKind {
     Namespace,
     Connect,
     Write,
+    Listen,
 }
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -60,6 +84,16 @@ impl IpcError {
         }
     }
 
+    fn listen<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            kind: IpcErrorKind::Listen,
+            source: Box::new(source),
+        }
+    }
+
     pub const fn kind(&self) -> IpcErrorKind {
         self.kind
     }
@@ -75,6 +109,7 @@ impl fmt::Display for IpcError {
             IpcErrorKind::Namespace => "The local IPC endpoint could not be prepared",
             IpcErrorKind::Connect => "No reachable primary Rustle instance was found",
             IpcErrorKind::Write => "The local IPC message could not be delivered",
+            IpcErrorKind::Listen => "The local IPC endpoint could not be claimed",
         })
     }
 }
@@ -94,12 +129,34 @@ impl From<IpcError> for rustle_application::error::AppError {
 }
 
 /// Messages exchanged between instances via the IPC socket
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcMessage {
     /// A rustle:// URI to process
     Uri(String),
+    /// Local files to open for playback, in launcher order
+    OpenFiles(Vec<PathBuf>),
     /// Show and focus the main window
     Focus,
+}
+
+impl IpcMessage {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Uri(_) => "uri",
+            Self::OpenFiles(_) => "open_files",
+            Self::Focus => "focus",
+        }
+    }
+}
+
+impl From<LaunchRequest> for IpcMessage {
+    fn from(request: LaunchRequest) -> Self {
+        match request {
+            LaunchRequest::Normal => Self::Focus,
+            LaunchRequest::Uri(uri) => Self::Uri(uri),
+            LaunchRequest::OpenFiles(paths) => Self::OpenFiles(paths),
+        }
+    }
 }
 
 /// Channel types for IPC message forwarding
@@ -114,6 +171,12 @@ pub fn ipc_channel() -> (IpcSender, IpcReceiver) {
 /// Stores a URI from CLI args that should be processed on startup
 static PENDING_STARTUP_URI: Mutex<Option<String>> = Mutex::new(None);
 
+/// Stores file paths from CLI args that should be opened on startup
+static PENDING_STARTUP_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Channel already fed by the primary-instance listener claimed at startup
+static PRIMARY_CHANNEL: Mutex<Option<(IpcSender, IpcReceiver)>> = Mutex::new(None);
+
 /// Store a URI to be processed when the application starts
 pub fn set_pending_startup_uri(uri: String) {
     if let Ok(mut guard) = PENDING_STARTUP_URI.lock() {
@@ -126,113 +189,230 @@ pub fn take_pending_startup_uri() -> Option<String> {
     PENDING_STARTUP_URI.lock().ok()?.take()
 }
 
+/// Store file paths to be opened when the application starts
+pub fn set_pending_startup_files(paths: Vec<PathBuf>) {
+    if let Ok(mut guard) = PENDING_STARTUP_FILES.lock() {
+        *guard = paths;
+    }
+}
+
+/// Take and clear the pending startup files
+pub fn take_pending_startup_files() -> Vec<PathBuf> {
+    PENDING_STARTUP_FILES
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default()
+}
+
+/// Take the channel served by the listener claimed during startup, if any.
+///
+/// `None` means this process runs standalone without a listener (the endpoint
+/// could not be claimed); the caller should use a local-only channel.
+pub fn take_primary_channel() -> Option<(IpcSender, IpcReceiver)> {
+    PRIMARY_CHANNEL.lock().ok()?.take()
+}
+
+/// Outcome of startup single-instance negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRole {
+    /// The request was delivered to an existing instance; exit now.
+    Forwarded,
+    /// This process is the primary instance and should start the UI.
+    Primary,
+}
+
+/// Deliver `request` to an existing instance or become the primary instance.
+///
+/// Concurrent launches (for example, Explorer opening several selected files
+/// as separate processes) race to claim the socket name. Losers retry
+/// forwarding until the winner starts accepting connections. If no instance
+/// can be reached or claimed, the process starts standalone without IPC.
+pub fn negotiate_startup(request: &LaunchRequest) -> StartupRole {
+    let message = IpcMessage::from(request.clone());
+
+    for attempt in 0..STARTUP_NEGOTIATION_ATTEMPTS {
+        if forward_to_primary(&message).is_ok() {
+            return StartupRole::Forwarded;
+        }
+
+        // A socket file left behind by a crashed process (Unix filesystem
+        // names) never becomes reachable; reclaim it instead of waiting out
+        // every attempt. Overwriting has no effect on Windows named pipes.
+        let reclaim_stale = attempt + 1 >= STALE_RECLAIM_AFTER_ATTEMPTS;
+        match claim_primary_listener(reclaim_stale) {
+            Ok(listener) => {
+                let (tx, rx) = ipc_channel();
+                match serve_listener(listener, tx.clone()) {
+                    Ok(()) => {
+                        if let Ok(mut guard) = PRIMARY_CHANNEL.lock() {
+                            *guard = Some((tx, rx));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Failed to start IPC listener thread");
+                    }
+                }
+                return StartupRole::Primary;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    attempt,
+                    error = %error,
+                    "IPC endpoint busy, retrying forward to primary instance"
+                );
+                std::thread::sleep(STARTUP_NEGOTIATION_DELAY);
+            }
+        }
+    }
+
+    tracing::warn!("Could not reach or claim the single-instance endpoint, starting standalone");
+    StartupRole::Primary
+}
+
+fn claim_primary_listener(
+    reclaim_stale: bool,
+) -> Result<interprocess::local_socket::Listener, IpcError> {
+    use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName};
+
+    let name = IPC_SOCKET_NAME
+        .to_ns_name::<GenericNamespaced>()
+        .map_err(IpcError::namespace)?;
+    ListenerOptions::new()
+        .name(name)
+        .try_overwrite(reclaim_stale)
+        .create_sync()
+        .map_err(IpcError::listen)
+}
+
+fn serve_listener(
+    listener: interprocess::local_socket::Listener,
+    tx: IpcSender,
+) -> Result<(), IpcError> {
+    use interprocess::local_socket::traits::Listener as _;
+
+    std::thread::Builder::new()
+        .name("rustle-ipc".to_string())
+        .spawn(move || {
+            tracing::info!("IPC listener started on '{}'", IPC_SOCKET_NAME);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::warn!("IPC accept error: {}", error);
+                        continue;
+                    }
+                };
+                let mut buf = Vec::new();
+                let read = std::io::Read::read_to_end(
+                    &mut std::io::Read::take(&mut stream, MAX_MESSAGE_BYTES),
+                    &mut buf,
+                );
+                // Some named-pipe peers disconnect right after writing; keep
+                // whatever arrived before the error.
+                if let Err(error) = read
+                    && buf.is_empty()
+                {
+                    tracing::warn!("IPC read error: {}", error);
+                    continue;
+                }
+                if !dispatch_received(&buf, &tx) {
+                    break;
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(IpcError::listen)
+}
+
+/// Decode and forward one received message. Returns false once the
+/// application side of the channel has gone away.
+fn dispatch_received(buf: &[u8], tx: &IpcSender) -> bool {
+    let Some(message) = decode_message(buf) else {
+        tracing::warn!(bytes = buf.len(), "IPC received an unrecognized message");
+        return true;
+    };
+    tracing::info!(message_kind = message.kind(), "IPC message received");
+    tx.send(message).is_ok()
+}
+
 /// Wire format prefixes
 const PREFIX_FOCUS: &[u8] = b"FOCUS";
 const PREFIX_URI: &[u8] = b"URI:";
+const PREFIX_FILES: &[u8] = b"FILES:";
 
-/// Spawn an IPC listener in a tokio background task.
-///
-/// Binds a local socket and forwards received messages to the application
-/// via the provided mpsc sender.
-pub fn spawn_ipc_listener(tx: IpcSender) -> tokio::task::JoinHandle<()> {
-    use interprocess::local_socket::ToNsName;
-    use interprocess::local_socket::traits::tokio::Listener;
-    use interprocess::local_socket::{GenericNamespaced, ListenerOptions};
-    use tokio::io::AsyncReadExt;
+/// Separator between paths in a FILES message (paths cannot contain NUL).
+const PATH_SEPARATOR: u8 = 0;
 
-    tokio::spawn(async move {
-        let name = match IPC_SOCKET_NAME.to_ns_name::<GenericNamespaced>() {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!("Failed to create IPC socket name: {}", e);
-                return;
-            }
-        };
-
-        let listener = match ListenerOptions::new().name(name).create_tokio() {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!("Failed to bind IPC socket: {}", e);
-                return;
-            }
-        };
-
-        tracing::info!("IPC listener started on '{}'", IPC_SOCKET_NAME);
-
-        loop {
-            match listener.accept().await {
-                Ok(mut stream) => {
-                    let mut buf = vec![0u8; 4096];
-                    match stream.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            buf.truncate(n);
-                            let msg = if buf.starts_with(PREFIX_FOCUS) {
-                                IpcMessage::Focus
-                            } else if buf.starts_with(PREFIX_URI) {
-                                match String::from_utf8(buf[PREFIX_URI.len()..].to_vec()) {
-                                    Ok(uri) => {
-                                        let uri = uri.trim().to_string();
-                                        IpcMessage::Uri(uri)
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("IPC received invalid UTF-8: {}", e);
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                // Backward compat: raw URI without prefix
-                                match String::from_utf8(buf) {
-                                    Ok(uri) => {
-                                        let uri = uri.trim().to_string();
-                                        IpcMessage::Uri(uri)
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("IPC received invalid UTF-8: {}", e);
-                                        continue;
-                                    }
-                                }
-                            };
-                            let message_kind = match &msg {
-                                IpcMessage::Uri(_) => "uri",
-                                IpcMessage::Focus => "focus",
-                            };
-                            tracing::info!(message_kind, "IPC message received");
-                            let _ = tx.send(msg);
-                        }
-                        Ok(_) => {
-                            tracing::warn!("IPC received empty message");
-                        }
-                        Err(e) => {
-                            tracing::warn!("IPC read error: {}", e);
-                        }
-                    }
+fn encode_message(message: &IpcMessage) -> Vec<u8> {
+    match message {
+        IpcMessage::Focus => PREFIX_FOCUS.to_vec(),
+        IpcMessage::Uri(uri) => [PREFIX_URI, uri.as_bytes()].concat(),
+        IpcMessage::OpenFiles(paths) => {
+            let mut buf = PREFIX_FILES.to_vec();
+            for (index, path) in paths.iter().enumerate() {
+                if index > 0 {
+                    buf.push(PATH_SEPARATOR);
                 }
-                Err(e) => {
-                    tracing::warn!("IPC accept error: {}", e);
-                }
+                buf.extend_from_slice(&path_to_bytes(path));
             }
+            buf
         }
-    })
+    }
 }
 
-/// Forward a URI to the primary instance via local socket.
+fn decode_message(buf: &[u8]) -> Option<IpcMessage> {
+    if buf.starts_with(PREFIX_FOCUS) {
+        return Some(IpcMessage::Focus);
+    }
+    if let Some(rest) = buf.strip_prefix(PREFIX_FILES) {
+        let paths: Vec<PathBuf> = rest
+            .split(|byte| *byte == PATH_SEPARATOR)
+            .filter(|segment| !segment.is_empty())
+            .map(bytes_to_path)
+            .collect();
+        return (!paths.is_empty()).then_some(IpcMessage::OpenFiles(paths));
+    }
+    // Backward compat: raw URI without prefix
+    let uri = buf.strip_prefix(PREFIX_URI).unwrap_or(buf);
+    match std::str::from_utf8(uri) {
+        Ok(uri) => Some(IpcMessage::Uri(uri.trim().to_string())),
+        Err(error) => {
+            tracing::warn!("IPC received invalid UTF-8: {}", error);
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn path_to_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn path_to_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    match path.to_string_lossy() {
+        std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.as_bytes()),
+        std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.into_bytes()),
+    }
+}
+
+#[cfg(unix)]
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Forward a message to the primary instance via local socket.
 ///
-/// Called by secondary instances. Returns Ok(()) if the URI was
-/// successfully forwarded, or Err if no primary instance is running.
-pub fn forward_uri_to_primary(uri: &str) -> Result<(), IpcError> {
-    let payload = format!("URI:{}", uri);
-    write_to_socket(&payload, "uri")
-}
-
-/// Send a focus command to the primary instance via local socket.
-///
-/// Called by secondary instances on normal launch. Returns Ok(())
-/// if the focus command was forwarded, or Err if no primary instance is running.
-pub fn forward_focus_to_primary() -> Result<(), IpcError> {
-    write_to_socket("FOCUS", "focus")
-}
-
-fn write_to_socket(payload: &str, message_kind: &'static str) -> Result<(), IpcError> {
+/// Returns Ok(()) if the message was delivered, or Err if no primary
+/// instance is reachable.
+fn forward_to_primary(message: &IpcMessage) -> Result<(), IpcError> {
     use interprocess::local_socket::ConnectOptions;
     use interprocess::local_socket::GenericNamespaced;
     use interprocess::local_socket::ToNsName;
@@ -247,12 +427,12 @@ fn write_to_socket(payload: &str, message_kind: &'static str) -> Result<(), IpcE
         .connect_sync()
         .map_err(IpcError::connect)?;
 
-    stream
-        .write_all(payload.as_bytes())
-        .map_err(IpcError::write)?;
+    let payload = encode_message(message);
+    stream.write_all(&payload).map_err(IpcError::write)?;
+    stream.flush().map_err(IpcError::write)?;
 
     tracing::info!(
-        message_kind,
+        message_kind = message.kind(),
         payload_bytes = payload.len(),
         "IPC message forwarded"
     );
@@ -276,6 +456,43 @@ mod tests {
         assert_eq!(
             error.source().expect("native source").to_string(),
             "private endpoint detail"
+        );
+    }
+
+    #[test]
+    fn messages_round_trip_through_wire_format() {
+        let files = IpcMessage::OpenFiles(vec![
+            std::env::temp_dir().join("a b.mp3"),
+            std::env::temp_dir().join("歌曲\n换行.flac"),
+        ]);
+        for message in [
+            IpcMessage::Focus,
+            IpcMessage::Uri("rustle://play/1".to_string()),
+            files,
+        ] {
+            assert_eq!(decode_message(&encode_message(&message)), Some(message));
+        }
+    }
+
+    #[test]
+    fn unprefixed_payload_is_treated_as_uri_for_backward_compatibility() {
+        assert_eq!(
+            decode_message(b"rustle://search/x\n"),
+            Some(IpcMessage::Uri("rustle://search/x".to_string()))
+        );
+    }
+
+    #[test]
+    fn empty_file_list_is_rejected() {
+        assert_eq!(decode_message(b"FILES:"), None);
+    }
+
+    #[test]
+    fn launch_requests_map_to_ipc_messages() {
+        assert_eq!(IpcMessage::from(LaunchRequest::Normal), IpcMessage::Focus);
+        assert_eq!(
+            IpcMessage::from(LaunchRequest::Uri("rustle://x".to_string())),
+            IpcMessage::Uri("rustle://x".to_string())
         );
     }
 }

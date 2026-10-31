@@ -47,7 +47,7 @@ impl App {
                         if runtime.has_loaded_audio && runtime.info.duration.as_secs_f32() > 0.0 {
                             (
                                 runtime.is_playing(),
-                                runtime.info.position.as_secs_f32()
+                                runtime.display_position.as_secs_f32()
                                     / runtime.info.duration.as_secs_f32().max(1.0),
                                 runtime.info.duration.as_secs_f32(),
                             )

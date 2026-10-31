@@ -1,12 +1,35 @@
 // src/app/update/queue.rs
 //! Queue management message handlers
 
+use crate::app::playback_machine::{PlaybackOrigin, TransportIntent};
 use iced::Task;
 
 use crate::app::message::Message;
 use crate::app::state::App;
 
 impl App {
+    /// Replace the queue and start local playback in the current update turn.
+    pub(super) fn play_loaded_local_queue(
+        &mut self,
+        songs: &[crate::database::DbSong],
+        intent: TransportIntent,
+    ) -> Task<Message> {
+        self.store_db_song_cover_paths(songs);
+        if songs.is_empty() {
+            return Task::none();
+        }
+        self.clear_shuffle_cache();
+        self.playback.queue_artists_by_song_id.clear();
+        if !self.cancel_playback_transaction() {
+            return Task::none();
+        }
+        self.playback
+            .queue
+            .replace(songs.to_vec(), PlaybackOrigin::Normal);
+        self.sync_current_queue_index();
+        self.play_song_at_index_with_intent(0, intent)
+    }
+
     /// Handle queue-related messages
     pub fn handle_queue(&mut self, message: &Message) -> Option<Task<Message>> {
         match message {
@@ -34,7 +57,6 @@ impl App {
             }
 
             Message::PlayPlaylist(playlist_id) => {
-                self.exit_fm_mode();
                 let id = *playlist_id;
 
                 // For recently played (id = -1), use the recently_played list
@@ -43,9 +65,13 @@ impl App {
                         let db_songs = self.library.recently_played.clone();
                         self.clear_shuffle_cache();
                         self.playback.queue_artists_by_song_id.clear();
-                        self.playback.queue = db_songs.clone();
-                        self.persist_queue_snapshot();
-
+                        if !self.cancel_playback_transaction() {
+                            return Some(Task::none());
+                        }
+                        self.playback
+                            .queue
+                            .replace(db_songs, PlaybackOrigin::Normal);
+                        self.sync_current_queue_index();
                         return Some(self.play_song_at_index(0));
                     }
                     return Some(Task::none());
@@ -60,16 +86,12 @@ impl App {
                         .filter(|tracks| !tracks.is_empty())
                         .unwrap_or(&self.ui.home.current_ncm_playlist_songs);
                     if !ncm_songs.is_empty() {
-                        let source_id = if self.is_fm_mode() {
-                            None
-                        } else {
-                            self.current_route_ncm_scrobble_source()
-                        };
-                        return Some(Task::done(Message::AddNcmPlaylistWithSource(
-                            ncm_songs.to_vec(),
+                        let tracks = ncm_songs.to_vec();
+                        return self.handle_ncm_playlist_queue(
+                            &tracks,
                             true,
-                            source_id,
-                        )));
+                            self.current_route_ncm_scrobble_source(),
+                        );
                     }
                     tracing::warn!(
                         page_id = id,
@@ -84,25 +106,28 @@ impl App {
                 // For local playlists, load from database
                 if let Some(db) = &self.core.db {
                     let db = db.clone();
+                    let Some(selection) = self.begin_playback_selection(false) else {
+                        return Some(Task::none());
+                    };
                     return Some(Task::perform(
                         async move { db.get_playlist_songs(id).await.unwrap_or_default() },
-                        Message::QueueLoaded,
+                        move |songs| Message::QueueLoaded(selection, songs),
                     ));
                 }
                 Some(Task::none())
             }
 
-            Message::QueueLoaded(songs) => {
-                self.exit_fm_mode();
-                self.store_db_song_cover_paths(songs);
-                if !songs.is_empty() {
-                    self.clear_shuffle_cache();
-                    self.playback.queue_artists_by_song_id.clear();
-                    self.playback.queue = songs.clone();
-                    self.persist_queue_snapshot();
-                    return Some(self.play_song_at_index(0));
+            Message::QueueLoaded(id, songs) => {
+                if self.playback.machine.selection(*id).is_none() {
+                    return Some(Task::none());
                 }
-                Some(Task::none())
+                if songs.is_empty() {
+                    return Some(self.recover_failed_playback_selection(*id));
+                }
+                let intent = self.playback.machine.intent;
+                self.playback.machine.pending = None;
+                let task = self.play_loaded_local_queue(songs, intent);
+                Some(task)
             }
 
             Message::PlayQueueIndex(idx) => Some(self.play_song_at_index(*idx)),
@@ -138,7 +163,13 @@ impl App {
 
                 tracing::error!("Failed to resolve song: {}", reason);
                 // Use handle_playback_failure for consistent failure tracking
-                if let Some(idx) = self.playback.pending_resolution_index.take() {
+                if let Some(idx) = self
+                    .playback
+                    .machine
+                    .preparing(context)
+                    .and_then(|target| target.entry)
+                    .and_then(|id| self.playback.queue.index_of(id))
+                {
                     return Some(Task::batch([
                         Self::toast_error(format!("无法播放：{reason}")),
                         self.handle_playback_failure(idx, reason.user_summary()),
@@ -151,25 +182,10 @@ impl App {
                 if *idx < self.playback.queue.len() {
                     self.playback.queue.remove(*idx);
                     self.prune_queue_artist_metadata();
-                    if let Some(current_idx) = self.playback.current_index {
-                        if *idx < current_idx {
-                            self.playback.current_index = Some(current_idx - 1);
-                        } else if *idx == current_idx {
-                            if self.playback.queue.is_empty() {
-                                self.playback.current_index = None;
-                            } else if current_idx >= self.playback.queue.len() {
-                                self.playback.current_index = Some(self.playback.queue.len() - 1);
-                            }
-                        }
-                    }
+                    self.sync_current_queue_index();
+                    self.cancel_removed_playback_target();
 
-                    if let Some(db) = &self.core.db {
-                        let db = db.clone();
-                        let position = *idx as i64;
-                        tokio::spawn(async move {
-                            let _ = db.remove_from_queue(position).await;
-                        });
-                    }
+                    self.persist_queue_snapshot();
 
                     // Refresh coordinator window and re-preload adjacent tracks
                     self.clear_shuffle_cache();
@@ -181,6 +197,10 @@ impl App {
             }
 
             Message::ClearQueue => {
+                if !self.cancel_playback_transaction() {
+                    return Some(Task::none());
+                }
+                self.playback.machine.discard_deferred_finish();
                 self.playback.queue.clear();
                 self.playback.queue_artists_by_song_id.clear();
                 self.playback.current_index = None;
@@ -190,12 +210,7 @@ impl App {
                 let released = self.playback.audio_preload_manager.reset();
                 self.release_preload_requests(released);
 
-                if let Some(db) = &self.core.db {
-                    let db = db.clone();
-                    tokio::spawn(async move {
-                        let _ = db.clear_queue().await;
-                    });
-                }
+                self.persist_queue_snapshot();
                 Some(Task::none())
             }
 

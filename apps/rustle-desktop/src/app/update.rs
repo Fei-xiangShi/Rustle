@@ -15,6 +15,7 @@ pub mod lyrics_render_manager;
 mod mpris;
 mod navigation;
 mod ncm;
+mod open_files;
 mod overlay;
 pub mod page_loader;
 mod playback;
@@ -42,6 +43,8 @@ use super::{App, Message};
 impl App {
     /// Handle messages by delegating to appropriate submodule handlers
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.invalidate_open_files_for_message(&message);
+
         macro_rules! handle {
             ($handler:ident) => {
                 if let Some(task) = self.$handler(&message) {
@@ -77,6 +80,7 @@ impl App {
         handle!(handle_podcast);
         handle!(handle_preload);
         handle!(handle_protocol);
+        handle!(handle_open_files);
 
         // Default: no task
         Task::none()

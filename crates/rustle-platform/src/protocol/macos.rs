@@ -1,9 +1,10 @@
 //! Platform-level URL scheme handling.
 
-/// Setup macOS URL event handler to capture `kAEGetURL` Apple Events.
+/// Setup macOS Apple Event handlers for `kAEGetURL` and `kAEOpenDocuments`.
 ///
 /// On macOS, `rustle://` links arrive as Apple Events rather than CLI args.
-/// This handler intercepts them and forwards URLs through the IPC channel.
+/// Opened documents (file association / "Open with") arrive the same way.
+/// These handlers forward both through the IPC channel.
 #[cfg(target_os = "macos")]
 pub fn setup_macos_url_handler(tx: super::ipc::IpcSender) {
     use objc2::rc::Retained;
@@ -72,6 +73,42 @@ pub fn setup_macos_url_handler(tx: super::ipc::IpcSender) {
                     });
                 }
             }
+
+            #[unsafe(method(handleOpenDocumentsEvent:withReplyEvent:))]
+            fn handle_open_documents_event(
+                &self,
+                event: &NSAppleEventDescriptor,
+                _reply: &NSAppleEventDescriptor,
+            ) {
+                // keyDirectObject = '----' (0x2d2d2d2d) holds a list of file URLs.
+                // SAFETY: same contract as the GURL handler above.
+                let list: Option<Retained<NSAppleEventDescriptor>> = unsafe {
+                    msg_send![event, paramDescriptorForKeyword: 0x2d2d2d2du32]
+                };
+                let Some(list) = list else {
+                    return;
+                };
+                // Apple Event descriptor lists are 1-based.
+                let paths: Vec<std::path::PathBuf> = (1..=list.numberOfItems())
+                    .filter_map(|index| list.descriptorAtIndex(index))
+                    .filter_map(|item| item.fileURLValue())
+                    .filter_map(|url| url.path())
+                    .map(|path| std::path::PathBuf::from(path.to_string()))
+                    .collect();
+                if paths.is_empty() {
+                    return;
+                }
+                tracing::info!(count = paths.len(), "macOS open documents handler received files");
+                SENDER.with(|sender| {
+                    let Ok(sender) = sender.try_borrow() else {
+                        tracing::warn!("macOS URL sender is already borrowed");
+                        return;
+                    };
+                    if let Some(sender) = sender.as_ref() {
+                        let _ = sender.send(super::ipc::IpcMessage::OpenFiles(paths));
+                    }
+                });
+            }
         }
     );
 
@@ -108,6 +145,19 @@ pub fn setup_macos_url_handler(tx: super::ipc::IpcSender) {
             andSelector: sel!(handleGetURLEvent:withReplyEvent:),
             forEventClass: 0x4755524cu32,
             andEventID: 0x4755524cu32,
+        ];
+    }
+
+    // kAEOpenDocuments: eventClass = 'aevt', eventID = 'odoc'. Finder delivers
+    // "Open with" and double-clicked documents this way instead of argv.
+    // SAFETY: identical registration contract to the GURL handler above.
+    unsafe {
+        let _: () = msg_send![
+            &manager,
+            setEventHandler: &*handler,
+            andSelector: sel!(handleOpenDocumentsEvent:withReplyEvent:),
+            forEventClass: 0x61657674u32,
+            andEventID: 0x6f646f63u32,
         ];
     }
 

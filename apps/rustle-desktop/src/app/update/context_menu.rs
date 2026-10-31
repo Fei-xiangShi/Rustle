@@ -224,7 +224,7 @@ impl App {
         song_id: i64,
     ) -> Option<Task<Message>> {
         match action {
-            ContextMenuAction::PlayNow => Some(Task::done(Message::PlaySong(song_id))),
+            ContextMenuAction::PlayNow => Some(self.update(Message::PlaySong(song_id))),
             ContextMenuAction::PlayNext => {
                 let preload = self.insert_next_in_queue(song_id);
                 Some(Task::batch([
@@ -288,6 +288,8 @@ impl App {
             let idx = self.playback.current_index.map(|i| i + 1).unwrap_or(0);
             if idx <= self.playback.queue.len() {
                 self.playback.queue.insert(idx, s);
+                self.sync_current_queue_index();
+                self.clear_scheduled_transition_state();
                 self.persist_queue_snapshot();
                 self.clear_shuffle_cache();
                 self.cache_shuffle_indices();
@@ -415,13 +417,8 @@ impl App {
         if let Some(pos) = self.playback.queue.iter().position(|s| s.id == song_id) {
             self.playback.queue.remove(pos);
             self.prune_queue_artist_metadata();
-            if let Some(ref mut idx) = self.playback.current_index {
-                if pos < *idx {
-                    *idx -= 1;
-                } else if pos == *idx {
-                    *idx = idx.saturating_sub(1);
-                }
-            }
+            self.sync_current_queue_index();
+            self.cancel_removed_playback_target();
             self.persist_queue_snapshot();
             self.clear_shuffle_cache();
             self.cache_shuffle_indices();

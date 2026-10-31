@@ -237,7 +237,10 @@ pub enum Message {
     /// Songs validated - invalid entries removed
     SongsValidated(u32),
     /// Queue loaded from playlist (starts playing)
-    QueueLoaded(Vec<DbSong>),
+    QueueLoaded(u64, Vec<DbSong>),
+    PlaybackSelectionLoaded(u64, Vec<Track>),
+    PlaybackSelectionFailed(u64, String),
+    FmRefillLoaded(u64, Result<Vec<Track>, crate::error::AppError>),
     /// Recently played loaded
     RecentlyPlayedLoaded(Vec<DbSong>),
     /// Watched local library folders restored from database
@@ -579,8 +582,6 @@ pub enum Message {
     /// Play NCM song
     PlayNcmSong(Track),
     /// Add NCM songs to queue
-    AddNcmPlaylist(Vec<Track>, bool),
-    AddNcmPlaylistWithSource(Vec<Track>, bool, Option<u64>),
     /// Open NCM playlist detail page
     OpenNcmPlaylist(u64),
     /// Open user detail page
@@ -703,7 +704,6 @@ pub enum Message {
     SearchSuggestDismiss,
     SearchSuggestMove(i32),
     SearchSuggestPick(usize),
-    SearchSuggestSongLoaded(u64, Result<Vec<crate::api::Track>, crate::error::AppError>),
     /// Hover over search result song
     HoverSearchSong(Option<i64>),
     /// Hover over search result card (album/playlist)
@@ -735,6 +735,14 @@ pub enum Message {
     // ============ Protocol (rustle://) ============
     /// URI received from OS protocol handler or IPC
     UriReceived(String),
+
+    // ============ Open local files (file association / drag and drop) ============
+    /// Files to play, from launch args, IPC, or window drop
+    OpenLocalFiles(Vec<PathBuf>),
+    /// Debounce window elapsed for the given request generation
+    FlushOpenLocalFiles(u64),
+    /// Imported files with their request generation (skipped = unreadable/unsupported).
+    LocalFilesOpened(u64, Vec<DbSong>, usize),
 
     // ============ Context Menu ============
     /// Show context menu for a local song (triggered by right-click)
@@ -874,23 +882,25 @@ impl std::fmt::Debug for Message {
                     context.generation.0
                 )
             }
-            Self::QueueLoaded(v) => simple!("QueueLoaded", "{} songs", v.len()),
+            Self::QueueLoaded(id, v) => simple!("QueueLoaded", "request={}, {} songs", id, v.len()),
+            Self::PlaybackSelectionLoaded(id, v) => simple!(
+                "PlaybackSelectionLoaded",
+                "request={}, {} songs",
+                id,
+                v.len()
+            ),
+            Self::PlaybackSelectionFailed(id, error) => {
+                simple!("PlaybackSelectionFailed", "request={}, {}", id, error)
+            }
+            Self::FmRefillLoaded(id, result) => simple!(
+                "FmRefillLoaded",
+                "request={}, success={}",
+                id,
+                result.is_ok()
+            ),
             Self::RecentlyPlayedLoaded(v) => simple!("RecentlyPlayedLoaded", "{} songs", v.len()),
             Self::UserPlaylistsLoaded(v) => simple!("UserPlaylistsLoaded", "{} playlists", v.len()),
-            Self::AddNcmPlaylist(v, play) => {
-                simple!("AddNcmPlaylist", "{} songs, play={}", v.len(), play)
-            }
-            Self::AddNcmPlaylistWithSource(v, play, source) => {
-                simple!(
-                    "AddNcmPlaylistWithSource",
-                    "{} songs, play={}, source={:?}",
-                    v.len(),
-                    play,
-                    source
-                )
-            }
 
-            // Arc-wrapped types - just show variant name
             Self::DatabaseReady(_) => simple!("DatabaseReady"),
             Self::CoverCacheReady(_) => simple!("CoverCacheReady"),
             Self::TrayStarted(_) => simple!("TrayStarted"),
@@ -1412,7 +1422,6 @@ impl std::fmt::Debug for Message {
             Self::SearchSuggestDismiss => simple!("SearchSuggestDismiss"),
             Self::SearchSuggestMove(_) => simple!("SearchSuggestMove"),
             Self::SearchSuggestPick(_) => simple!("SearchSuggestPick"),
-            Self::SearchSuggestSongLoaded(_, _) => simple!("SearchSuggestSongLoaded"),
             Self::SearchPageChanged(page) => simple!("SearchPageChanged", "{}", page),
             Self::HoverSearchSong(id) => simple!("HoverSearchSong", "{:?}", id),
             Self::HoverSearchCard(id) => simple!("HoverSearchCard", "{:?}", id),
@@ -1438,6 +1447,19 @@ impl std::fmt::Debug for Message {
 
             // Protocol
             Self::UriReceived(uri) => simple!("UriReceived", "{}", uri),
+            Self::OpenLocalFiles(paths) => simple!("OpenLocalFiles", "{} files", paths.len()),
+            Self::FlushOpenLocalFiles(generation) => {
+                simple!("FlushOpenLocalFiles", "{}", generation)
+            }
+            Self::LocalFilesOpened(generation, songs, skipped) => {
+                simple!(
+                    "LocalFilesOpened",
+                    "{} songs, skipped={}, generation={}",
+                    songs.len(),
+                    skipped,
+                    generation
+                )
+            }
 
             // Context Menu
             Self::RightClickSong(id) => simple!("RightClickSong", "{}", id),

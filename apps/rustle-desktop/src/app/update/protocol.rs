@@ -48,26 +48,27 @@ impl App {
                 true,
             ),
             ProtocolAction::PlaySong(id) => {
+                self.invalidate_open_files_autoplay();
                 let Some(client) = self.core.ncm_client.clone() else {
                     return Task::done(Message::ShowWarningToast("未登录".to_string()));
                 };
+                let Some(selection) = self.begin_playback_selection(false) else {
+                    return Task::none();
+                };
                 Task::perform(
-                    async move {
-                        client
-                            .track_detail(&[id])
-                            .await
-                            .ok()
-                            .and_then(|tracks| tracks.into_iter().next())
-                    },
-                    |track| {
-                        if let Some(track) = track {
-                            Message::PlayNcmSong(track)
-                        } else {
-                            Message::ShowErrorToast("无法获取歌曲信息".to_string())
+                    async move { client.track_detail(&[id]).await },
+                    move |result| match result {
+                        Ok(mut tracks) => {
+                            tracks.truncate(1);
+                            Message::PlaybackSelectionLoaded(selection, tracks)
+                        }
+                        Err(error) => {
+                            Message::PlaybackSelectionFailed(selection, error.to_string())
                         }
                     },
                 )
             }
+
             ProtocolAction::PlaybackControl(cmd) => {
                 let msg = match cmd {
                     PlaybackCmd::Play | PlaybackCmd::Pause | PlaybackCmd::Toggle => {

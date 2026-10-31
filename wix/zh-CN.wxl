@@ -3,6 +3,7 @@
     <String Id="ProductName">Rustle</String>
     <String Id="Manufacturer">Fei Xiangshi</String>
     <String Id="PackageDescription">Rustle 音乐播放器</String>
+    <String Id="AudioFileTypeName">Rustle 音频文件</String>
     <String Id="InstallOptionsDialogTitle">安装选项</String>
     <String Id="InstallOptionsTitle">选择安装选项</String>
     <String Id="InstallOptionsDescription">你可以选择是否创建快捷方式。两个选项默认关闭，之后仍可在 Windows 中手动调整。</String>

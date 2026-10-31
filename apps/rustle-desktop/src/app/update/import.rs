@@ -21,7 +21,7 @@ use crate::features::import::{
 };
 use crate::ui::components::ImportingPlaylist;
 
-fn build_new_song(path: &Path, scan_result: ScanResult) -> NewSong {
+pub(super) fn build_new_song(path: &Path, scan_result: ScanResult) -> NewSong {
     let cover_path = scan_result
         .cover_path
         .as_ref()
@@ -565,7 +565,7 @@ impl App {
             }
         }
 
-        for song in &mut self.playback.queue {
+        for song in self.playback.queue.iter_mut() {
             if song.file_path == old_path_str {
                 song.file_path = new_path_str.clone();
             }

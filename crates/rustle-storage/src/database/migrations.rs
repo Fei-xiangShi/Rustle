@@ -494,7 +494,11 @@ mod tests {
             .unwrap();
         assert_eq!(songs.len(), 1);
         assert_eq!(songs[0].title, "Preserved song");
-        old_migrator.run(&pool).await.unwrap();
+        released_crlf_migrator(windows.checksum.as_ref())
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
         pool.close().await;
     }
 
@@ -526,9 +530,20 @@ mod tests {
         let managed_pool = connection::connect(managed_database.path.clone())
             .await
             .unwrap();
-        initialize(managed_pool.clone(), managed_database.path.clone())
-            .await
-            .unwrap();
+        // This contract compares the released baseline, not subsequent additive migrations.
+        Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version == 1)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        }
+        .run(&managed_pool)
+        .await
+        .unwrap();
 
         let legacy_database = TestDatabase::new("legacy-parity");
         let legacy_pool = connection::connect(legacy_database.path.clone())

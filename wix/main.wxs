@@ -62,6 +62,32 @@
                         <File Id="RustleExe" Name="rustle.exe" Source="$(var.CargoTargetBinDir)\rustle.exe" KeyPath="yes" />
                         <RemoveFolder Id="RemoveApplicationFolder" On="uninstall" />
                     </Component>
+                    <!-- "Open with" registration for supported audio formats. Only
+                         OpenWithProgids and Default Apps capabilities are written;
+                         existing per-extension defaults are never replaced. -->
+                    <Component Id="AudioFileAssociations" Guid="DD2B943F-EB13-4CE3-A82C-D8FF1D9E8363">
+                        <RegistryValue Root="HKLM" Key="Software\Classes\Rustle.AudioFile" Type="string" Value="!(loc.AudioFileTypeName)" KeyPath="yes" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\Rustle.AudioFile\DefaultIcon" Type="string" Value="&quot;[#RustleExe]&quot;,0" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\Rustle.AudioFile\shell\open" Name="FriendlyAppName" Type="string" Value="Rustle" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\Rustle.AudioFile\shell\open\command" Type="string" Value="&quot;[#RustleExe]&quot; &quot;%1&quot;" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities" Name="ApplicationName" Type="string" Value="Rustle" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities" Name="ApplicationDescription" Type="string" Value="!(loc.PackageDescription)" />
+                        <RegistryValue Root="HKLM" Key="Software\RegisteredApplications" Name="Rustle" Type="string" Value="Software\FeiXiangShi\Rustle\Capabilities" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".mp3" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".flac" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.m4a\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".m4a" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.aac\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".aac" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.ogg\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".ogg" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".wav" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="Rustle.AudioFile" Type="string" Value="Rustle.AudioFile" />
+                        <RegistryValue Root="HKLM" Key="Software\FeiXiangShi\Rustle\Capabilities\FileAssociations" Name=".aiff" Type="string" Value="Rustle.AudioFile" />
+                    </Component>
                 </Directory>
             </Directory>
 
@@ -117,6 +143,7 @@
 
         <Feature Id="MainFeature" Title="!(loc.ProductName)" Level="1" Absent="disallow">
             <ComponentRef Id="ApplicationFiles" />
+            <ComponentRef Id="AudioFileAssociations" />
             <ComponentRef Id="StartMenuShortcut" />
             <ComponentRef Id="DesktopShortcut" />
             <ComponentRef Id="StartupShortcut" />

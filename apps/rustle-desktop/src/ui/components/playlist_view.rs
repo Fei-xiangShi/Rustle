@@ -534,7 +534,12 @@ fn build_song_row(
             })
             .opacity(1.0 - hover_progress);
 
-        iced::widget::stack![playing_icon, hovered_icon].into()
+        iced::widget::stack![
+            container(playing_icon).center_x(Fill),
+            container(hovered_icon).center(Fill),
+        ]
+        .width(Fill)
+        .into()
     } else {
         let index = text(index_str)
             .size(tokens.text(TextRole::BodyLarge))
@@ -542,7 +547,14 @@ fn build_song_row(
                 color: Some(theme::dimmed_text(theme).scale_alpha(1.0 - hover_progress)),
             });
 
-        iced::widget::stack![index, hovered_icon].into()
+        // Stack clamps overlay layers to the base layer's size, so the base must
+        // span the whole slot; otherwise a single-digit index shrinks the icon.
+        iced::widget::stack![
+            container(index).center_x(Fill),
+            container(hovered_icon).center(Fill),
+        ]
+        .width(Fill)
+        .into()
     };
 
     // --- Song cover (use pre-loaded handle, no disk IO) ---

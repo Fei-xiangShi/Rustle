@@ -1,6 +1,7 @@
 // src/app/update/playback.rs
 //! Playback control message handlers
 
+use crate::app::playback_machine::PlaybackOrigin;
 use iced::Task;
 use std::time::Duration;
 
@@ -46,6 +47,7 @@ impl App {
                 tracing::info!("Playing song id: {}", id);
                 // Find song in queue or add it
                 if let Some(idx) = self.playback.queue.iter().position(|s| s.id == *id) {
+                    self.playback.queue.set_origin(idx, PlaybackOrigin::Normal);
                     return Some(self.play_song_at_index(idx));
                 }
 
@@ -74,13 +76,18 @@ impl App {
                     )
                     .cloned()
                     {
-                        self.set_ncm_scrobble_source(self.current_route_ncm_scrobble_source());
                         self.extend_queue_artist_metadata(std::slice::from_ref(&song_info));
                         let db_song = Self::ncm_track_to_db_song(&song_info);
                         self.clear_shuffle_cache();
                         self.playback.queue.push(db_song);
                         self.persist_queue_snapshot();
                         let idx = self.playback.queue.len() - 1;
+                        let origin = self
+                            .current_route_ncm_scrobble_source()
+                            .map_or(PlaybackOrigin::Normal, |source_id| PlaybackOrigin::Ncm {
+                                source_id,
+                            });
+                        self.playback.queue.set_origin(idx, origin);
                         return Some(self.play_song_at_index(idx));
                     }
 
@@ -278,19 +285,8 @@ impl App {
         self.ui.save_position_counter += 1;
         if self.ui.save_position_counter >= 50 {
             self.ui.save_position_counter = 0;
-            if let (Some(db), Some(song)) = (&self.core.db, &self.playback.current_song)
-                && self.playback_is_playing()
-            {
-                let info = self.playback_info().clone();
-                let position_secs = info.position.as_secs_f64();
-                let db = db.clone();
-                let song_id = song.id;
-                let queue_pos = self.playback.current_index.unwrap_or(0) as i64;
-                tokio::spawn(async move {
-                    let _ = db
-                        .update_playback_position(Some(song_id), queue_pos, position_secs)
-                        .await;
-                });
+            if self.playback_is_playing() && self.playback.current_song.is_some() {
+                self.persist_committed_playback(self.playback_info().position.as_secs_f64());
             }
         }
 
@@ -536,13 +532,12 @@ impl App {
                 }
                 return Self::toast_error(safe_summary);
             }
-            AudioEvent::Finished { .. } => {
+            AudioEvent::Finished { context } => {
                 tracing::info!("Song finished (AudioEvent::Finished)");
-                if self.playback.pending_resolution_index.is_none()
-                    && self.playback.current_song.is_some()
-                {
+                if self.playback.machine.pending.is_none() && self.playback.current_song.is_some() {
                     return self.handle_song_finished();
                 }
+                self.playback.machine.defer_finish_during_selection(context);
             }
             AudioEvent::Error {
                 request_id, error, ..

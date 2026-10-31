@@ -102,17 +102,6 @@ impl App {
                 Some(Task::none())
             }
             Message::SearchSuggestPick(index) => Some(self.pick_search_suggestion(*index)),
-            Message::SearchSuggestSongLoaded(generation, result) => {
-                if *generation != self.ui.search.suggestions.generation {
-                    return Some(Task::none());
-                }
-                match result {
-                    Ok(tracks) if !tracks.is_empty() => {
-                        Some(Task::done(Message::PlayNcmSong(tracks[0].clone())))
-                    }
-                    _ => Some(Self::toast_error("无法加载这首歌曲，请重试".to_string())),
-                }
-            }
             Message::SearchSubmit => {
                 if self.ui.search.suggestions.open
                     && let Some(index) = self.ui.search.suggestions.selected
@@ -285,7 +274,7 @@ impl App {
                     song_info.title,
                     song_info.artist_names()
                 );
-                Some(Task::done(Message::PlayNcmSong(song_info)))
+                Some(self.update(Message::PlayNcmSong(song_info)))
             }
 
             Message::OpenSearchResult(id, tab) => {
@@ -447,15 +436,27 @@ impl App {
         self.ui.search.suggestions.close();
         match item.kind {
             SearchType::Songs => {
+                self.invalidate_open_files_autoplay();
                 let Some(client) = self.core.ncm_client.clone() else {
                     return Task::none();
                 };
-                let generation = self.ui.search.suggestions.generation;
+                let Some(selection) = self.begin_playback_selection(false) else {
+                    return Task::none();
+                };
                 Task::perform(
-                    async move { client.track_detail(&[item.id]).await.map_err(Into::into) },
-                    move |result| Message::SearchSuggestSongLoaded(generation, result),
+                    async move { client.track_detail(&[item.id]).await },
+                    move |result| match result {
+                        Ok(mut tracks) => {
+                            tracks.truncate(1);
+                            Message::PlaybackSelectionLoaded(selection, tracks)
+                        }
+                        Err(error) => {
+                            Message::PlaybackSelectionFailed(selection, error.to_string())
+                        }
+                    },
                 )
             }
+
             SearchType::Artists => self.navigate_to_route(Route::Artist(item.id), true),
             SearchType::Albums => self.navigate_to_route(Route::Album(item.id), true),
             SearchType::Playlists => self.navigate_to_route(Route::NcmPlaylist(item.id), true),

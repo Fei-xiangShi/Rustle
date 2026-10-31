@@ -1,5 +1,7 @@
 //! NCM (Netease Cloud Music) related message handlers
 
+use crate::app::playback_machine::{PlaybackOrigin, TransportIntent};
+
 use iced::Task;
 use std::time::Duration;
 use tracing::{debug, error};
@@ -203,10 +205,6 @@ impl App {
         db_song
     }
 
-    pub(super) fn set_ncm_scrobble_source(&mut self, source_id: Option<u64>) {
-        self.playback.ncm_scrobble_source_id = source_id;
-    }
-
     pub(super) fn current_route_ncm_scrobble_source(&self) -> Option<u64> {
         match self.ui.current_route {
             Route::NcmPlaylist(playlist_id) => (playlist_id != 0).then_some(playlist_id),
@@ -215,52 +213,60 @@ impl App {
         }
     }
 
-    fn handle_ncm_playlist_queue(
+    pub(super) fn handle_ncm_playlist_queue(
         &mut self,
         tracks: &[crate::api::Track],
         play_now: bool,
         source_id: Option<u64>,
     ) -> Option<Task<Message>> {
-        debug!(
-            "Adding {} NCM tracks to playlist, play_now: {}",
-            tracks.len(),
-            play_now
-        );
-        self.ui.home.current_ncm_playlist_songs = tracks.to_vec();
+        let origin = source_id.map_or(PlaybackOrigin::Normal, |source_id| PlaybackOrigin::Ncm {
+            source_id,
+        });
+        Some(self.install_ncm_tracks(tracks, play_now, origin, TransportIntent::Play))
+    }
 
-        let source_id = if self.is_fm_mode() { None } else { source_id };
-        self.set_ncm_scrobble_source(source_id);
-
-        let db_songs: Vec<crate::database::DbSong> =
-            tracks.iter().map(Self::ncm_track_to_db_song).collect();
-
-        if self.is_fm_mode() && !play_now {
-            debug!("FM mode: appending {} songs to queue", db_songs.len());
-            self.extend_queue_artist_metadata(tracks);
-            self.clear_shuffle_cache();
-            self.playback.queue.extend(db_songs);
-            self.persist_queue_snapshot();
-            self.cache_shuffle_indices();
-            self.refresh_preload_window();
-            return Some(self.preload_adjacent_tracks_with_ncm());
+    fn install_ncm_tracks(
+        &mut self,
+        tracks: &[crate::api::Track],
+        play_now: bool,
+        origin: PlaybackOrigin,
+        intent: TransportIntent,
+    ) -> Task<Message> {
+        if tracks.is_empty() {
+            return Task::none();
         }
-
+        let songs = tracks.iter().map(Self::ncm_track_to_db_song).collect();
         if play_now {
+            // Replacing the queue invalidates every index-keyed preload slot.
+            self.clear_shuffle_cache();
+            if !self.cancel_playback_transaction() {
+                return Task::none();
+            }
             self.replace_queue_artist_metadata(tracks);
-            self.clear_shuffle_cache();
-            self.playback.queue = db_songs;
-            self.playback.current_index = Some(0);
-            self.persist_queue_snapshot();
-            Some(self.update(Message::PlayQueueIndex(0)))
+            self.playback.queue.replace(songs, origin);
+            self.sync_current_queue_index();
+            self.play_song_at_index_with_intent(0, intent)
         } else {
+            // Appending keeps every existing index, so index-keyed preload
+            // slots stay valid and `preload_adjacent_tracks_with_ncm` releases
+            // any slot whose adjacency changed. A full reset here would drop
+            // (and re-download) the next track's preload on every FM refill.
+            self.playback.shuffle_cache.clear();
             self.extend_queue_artist_metadata(tracks);
-            self.clear_shuffle_cache();
-            self.playback.queue.extend(db_songs);
+            self.playback.queue.extend_with_origin(songs, origin);
             self.persist_queue_snapshot();
             self.cache_shuffle_indices();
             self.refresh_preload_window();
-            Some(self.preload_adjacent_tracks_with_ncm())
+            self.preload_adjacent_tracks_with_ncm()
         }
+    }
+
+    pub(super) fn begin_playback_selection(&mut self, fm: bool) -> Option<u64> {
+        if !self.cancel_playback_transaction() {
+            return None;
+        }
+        self.finish_startup_restore();
+        Some(self.playback.machine.select(fm).0)
     }
 
     /// Set the NCM client and sync request settings before its first request.
@@ -271,43 +277,24 @@ impl App {
     }
 
     pub(super) fn start_personal_fm_route(&mut self) -> Task<Message> {
-        debug!("Starting Personal FM");
-
-        self.enter_fm_mode();
-
-        let prefetched_tracks = std::mem::take(&mut self.ui.discover.personal_fm_prefetched_tracks);
-        if !prefetched_tracks.is_empty() {
-            return Task::done(Message::AddNcmPlaylist(prefetched_tracks, true));
+        let Some(client) = self.core.ncm_client.clone() else {
+            return Self::toast_warning(self.core.locale.get(Key::NotLoggedIn).to_string());
+        };
+        self.invalidate_open_files_autoplay();
+        let Some(id) = self.begin_playback_selection(true) else {
+            return Task::none();
+        };
+        let tracks = std::mem::take(&mut self.ui.discover.personal_fm_prefetched_tracks);
+        if !tracks.is_empty() {
+            return self.update(Message::PlaybackSelectionLoaded(id, tracks));
         }
-
-        if let Some(client) = &self.core.ncm_client {
-            let client = client.clone();
-            let not_logged_in_msg = self.core.locale.get(Key::NotLoggedIn).to_string();
-
-            Task::perform(
-                async move {
-                    match client.personal_fm_tracks().await {
-                        Ok(tracks) if !tracks.is_empty() => Some(tracks),
-                        Ok(_) => None,
-                        Err(e) => {
-                            error!("Failed to get personal FM: {}", e);
-                            None
-                        }
-                    }
-                },
-                move |songs_opt| {
-                    if let Some(songs) = songs_opt {
-                        Message::AddNcmPlaylist(songs, true)
-                    } else {
-                        Message::ShowWarningToast(not_logged_in_msg)
-                    }
-                },
-            )
-        } else {
-            self.exit_fm_mode();
-            let msg = self.core.locale.get(Key::NotLoggedIn).to_string();
-            Self::toast_warning(msg)
-        }
+        Task::perform(
+            async move { client.personal_fm_tracks().await },
+            move |result| match result {
+                Ok(tracks) => Message::PlaybackSelectionLoaded(id, tracks),
+                Err(error) => Message::PlaybackSelectionFailed(id, error.to_string()),
+            },
+        )
     }
 
     pub(super) fn open_ncm_playlist_route(&mut self, playlist_id: u64) -> Task<Message> {
@@ -1137,26 +1124,75 @@ impl App {
 
                 require_ncm_client!(self);
 
-                self.exit_fm_mode();
-                self.ui.home.current_ncm_playlist_songs = vec![song_info.clone()];
-                self.set_ncm_scrobble_source(None);
-                self.replace_queue_artist_metadata(std::slice::from_ref(song_info));
-                self.clear_shuffle_cache();
-                self.playback.queue.clear();
-                self.playback
-                    .queue
-                    .push(Self::ncm_track_to_db_song(song_info));
-                self.persist_queue_snapshot();
-
-                Some(self.play_song_at_index(0))
+                Some(self.install_ncm_tracks(
+                    std::slice::from_ref(song_info),
+                    true,
+                    PlaybackOrigin::Normal,
+                    TransportIntent::Play,
+                ))
             }
 
-            Message::AddNcmPlaylist(songs, play_now) => {
-                self.handle_ncm_playlist_queue(songs, *play_now, None)
+            Message::PlaybackSelectionLoaded(id, tracks) => {
+                let Some(origin) = self.playback.machine.selection(*id) else {
+                    return Some(Task::none());
+                };
+                let intent = self.playback.machine.intent;
+                if tracks.is_empty() {
+                    return Some(Task::batch([
+                        Self::toast_warning("没有可播放的歌曲".to_string()),
+                        self.recover_failed_playback_selection(*id),
+                    ]));
+                }
+                self.playback.machine.pending = None;
+                let task = self.install_ncm_tracks(tracks, true, origin, intent);
+                Some(task)
             }
-
-            Message::AddNcmPlaylistWithSource(songs, play_now, source_id) => {
-                self.handle_ncm_playlist_queue(songs, *play_now, *source_id)
+            Message::PlaybackSelectionFailed(id, error) => {
+                if self.playback.machine.selection(*id).is_none() {
+                    return Some(Task::none());
+                }
+                Some(Task::batch([
+                    Self::toast_error(error.clone()),
+                    self.recover_failed_playback_selection(*id),
+                ]))
+            }
+            Message::FmRefillLoaded(id, result) => {
+                let Some(refill) = self
+                    .playback
+                    .machine
+                    .finish_fm_refill(*id, &self.playback.queue)
+                else {
+                    return Some(Task::none());
+                };
+                let tracks = match result {
+                    Ok(tracks) => tracks,
+                    // Background refills run on every activation near the end
+                    // of the FM queue and retry on the next one; only surface
+                    // a failure when playback is actually waiting for it.
+                    Err(error) if refill.play => {
+                        return Some(Self::toast_error(error.to_string()));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Background personal FM refill failed");
+                        return Some(Task::none());
+                    }
+                };
+                if tracks.is_empty() {
+                    return Some(Task::none());
+                }
+                let start = self.playback.queue.len();
+                let task = self.install_ncm_tracks(
+                    tracks,
+                    false,
+                    refill.origin,
+                    self.playback.machine.intent,
+                );
+                if refill.play {
+                    let intent = self.playback.machine.intent;
+                    let play_task = self.play_song_at_index_with_intent(start, intent);
+                    return Some(Task::batch([task, play_task]));
+                }
+                Some(task)
             }
 
             Message::UserPlaylistsLoaded(playlists) => {

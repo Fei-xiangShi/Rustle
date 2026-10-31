@@ -97,6 +97,10 @@ pub struct DbPlaybackState {
     pub repeat_mode: i64,
     /// Whether Personal FM mode was active when playback state was saved
     pub personal_fm_mode: bool,
+    /// Application-owned serialized playback provenance (None for legacy snapshots).
+    pub playback_origin: Option<String>,
+    /// Application-owned serialized provenance for each saved queue entry.
+    pub queue_origins: Option<String>,
     /// Last updated timestamp
     pub updated_at: i64,
 }
@@ -166,4 +170,16 @@ pub struct DownloadRow {
     pub file_size: i64,
     pub quality: String,
     pub downloaded_at: i64,
+}
+
+/// One acknowledged playback snapshot; queue and current track commit atomically.
+#[derive(Debug)]
+pub struct DbPlaybackSnapshot {
+    pub songs: Option<Vec<DbSong>>,
+    pub current_song: Option<DbSong>,
+    pub queue_position: i64,
+    pub position_secs: f64,
+    pub personal_fm_mode: bool,
+    pub playback_origin: String,
+    pub queue_origins: Option<String>,
 }

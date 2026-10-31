@@ -117,6 +117,19 @@ impl App {
                         .get(Key::DiscoverPlaylistLoadFailed)
                         .to_string();
 
+                    let Some(selection) = self.begin_playback_selection(false) else {
+                        return Some(Task::none());
+                    };
+                    if playlist_id != 0
+                        && let Some(crate::app::playback_machine::PlaybackTransaction::Selecting {
+                            origin,
+                            ..
+                        }) = &mut self.playback.machine.pending
+                    {
+                        *origin = crate::app::playback_machine::PlaybackOrigin::Ncm {
+                            source_id: playlist_id,
+                        };
+                    }
                     if playlist_id == 0 {
                         return Some(Task::perform(
                             async move {
@@ -131,9 +144,9 @@ impl App {
                             },
                             move |tracks_opt| {
                                 if let Some(tracks) = tracks_opt {
-                                    Message::AddNcmPlaylist(tracks, true)
+                                    Message::PlaybackSelectionLoaded(selection, tracks)
                                 } else {
-                                    Message::ShowErrorToast(error_msg)
+                                    Message::PlaybackSelectionFailed(selection, error_msg)
                                 }
                             },
                         ));
@@ -156,10 +169,10 @@ impl App {
                             }
                         },
                         move |detail_opt| {
-                            if let Some((detail_id, tracks)) = detail_opt {
-                                Message::AddNcmPlaylistWithSource(tracks, true, Some(detail_id))
+                            if let Some((_detail_id, tracks)) = detail_opt {
+                                Message::PlaybackSelectionLoaded(selection, tracks)
                             } else {
-                                Message::ShowErrorToast(error_msg)
+                                Message::PlaybackSelectionFailed(selection, error_msg)
                             }
                         },
                     ));

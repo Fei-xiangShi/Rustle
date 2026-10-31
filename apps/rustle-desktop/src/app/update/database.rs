@@ -1,6 +1,8 @@
 // src/app/update/database.rs
 //! Database message handlers
 
+use crate::app::playback_machine::{PlaybackOrigin, PlaybackTransaction, TransportIntent};
+
 use iced::Task;
 
 use crate::app::helpers::{
@@ -22,6 +24,10 @@ impl App {
         &self,
         state: &crate::database::DbPlaybackState,
     ) -> StartupRestoreDecision {
+        if state.playback_origin.is_some() && state.queue_position < 0 {
+            // A current track removed from the queue must not bind to another duplicate.
+            return StartupRestoreDecision::Skip;
+        }
         let queue_len = self.playback.queue.len();
         if queue_len == 0 {
             tracing::info!("Startup restore skipped: queue is empty");
@@ -122,13 +128,20 @@ impl App {
         restore.playback_state_loaded && restore.queue_loaded
     }
 
-    fn finish_startup_restore(&mut self) {
+    pub(super) fn finish_startup_restore(&mut self) {
         self.playback.startup_restore.in_progress = false;
         self.playback.startup_restore.completed = true;
     }
 
     fn try_restore_startup_playback(&mut self) -> Task<Message> {
         if self.playback.startup_restore.completed || self.playback.startup_restore.in_progress {
+            return Task::none();
+        }
+
+        // Files opened at launch take precedence over resuming the previous
+        // session, even while they are still debouncing or importing.
+        if self.open_files_requested() {
+            self.finish_startup_restore();
             return Task::none();
         }
 
@@ -166,20 +179,37 @@ impl App {
             return Task::none();
         };
 
-        self.playback.current_index = Some(idx);
-        self.playback.current_song = Some(song.clone());
-        self.cache_shuffle_indices();
-        self.refresh_preload_window();
-        let background_task = self.update_lyrics_background(&song);
-        self.update_tray_and_mpris_current(false);
-
-        if self.playback.pending_playback_request.is_some()
-            || self.playback.pending_resolution_index == Some(idx)
-        {
-            self.playback.startup_restore.in_progress = true;
-            return background_task;
+        if self.playback.machine.pending.is_some() || self.playback.machine.current.is_some() {
+            self.finish_startup_restore();
+            return Task::none();
         }
-
+        let origin = if state.personal_fm_mode {
+            PlaybackOrigin::PersonalFm { session: 0 }
+        } else {
+            PlaybackOrigin::Normal
+        };
+        let origin = state
+            .playback_origin
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<PlaybackOrigin>(value).ok())
+            .unwrap_or(origin);
+        let origins = state
+            .queue_origins
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Vec<PlaybackOrigin>>(value).ok());
+        for index in 0..self.playback.queue.len() {
+            let entry_origin = origins
+                .as_ref()
+                .and_then(|origins| origins.get(index))
+                .copied()
+                .unwrap_or(origin);
+            self.playback.machine.observe_restored_origin(entry_origin);
+            self.playback.queue.set_origin(index, entry_origin);
+        }
+        // Legacy snapshots carry only a queue-wide FM bit.
+        self.playback.queue.set_origin(idx, origin);
+        self.playback.machine.intent = TransportIntent::Pause;
+        let background_task = Task::none();
         self.playback.startup_restore.in_progress = true;
 
         if crate::app::update::song_resolver::needs_resolution(&song) {
@@ -198,7 +228,13 @@ impl App {
                     }
                 };
 
-                self.playback.pending_resolution_index = Some(idx);
+                let Some(target) = self.queue_target(idx) else {
+                    return Task::none();
+                };
+                self.playback.machine.pending = Some(PlaybackTransaction::Preparing {
+                    target,
+                    context: context.clone(),
+                });
 
                 let context_for_task = context.clone();
 
@@ -241,7 +277,7 @@ impl App {
         }
 
         let position = std::time::Duration::from_secs_f64(state.position_secs);
-        if let Err(err) = self.load_audio_path_paused_for_song(&song, path_buf, position) {
+        if let Err(err) = self.load_audio_path_paused_for_song(idx, &song, path_buf, position) {
             tracing::warn!("Failed to restore local song {}: {}", song.title, err);
             self.finish_startup_restore();
         } else {
@@ -331,7 +367,6 @@ impl App {
                     state.volume
                 );
                 self.set_output_volume(state.volume as f32, false);
-                self.playback.personal_fm_mode = state.personal_fm_mode;
                 self.playback.saved_state = Some(state.clone());
                 self.playback.startup_restore.playback_state_loaded = true;
                 self.refresh_playback_runtime();
@@ -343,26 +378,44 @@ impl App {
                 self.store_db_song_cover_paths(queue);
                 self.clear_shuffle_cache();
                 self.playback.queue_artists_by_song_id.clear();
-                self.playback.queue = queue.clone();
+                if self.playback.machine.current.is_none()
+                    && self.playback.machine.pending.is_none()
+                {
+                    self.playback
+                        .queue
+                        .replace(queue.clone(), PlaybackOrigin::Normal);
+                }
                 self.playback.startup_restore.queue_loaded = true;
 
                 // Initialize shuffle cache for preloading (must be done before preload)
                 self.cache_shuffle_indices();
-                Some(self.try_restore_startup_playback())
+
+                // Restore yields to opened files first, then the flush that was
+                // waiting for the queue can run.
+                Some(Task::batch([
+                    self.try_restore_startup_playback(),
+                    self.flush_open_local_files(),
+                ]))
             }
 
-            Message::SongResolvedForRestore(idx, result, saved_position, context) => {
+            Message::SongResolvedForRestore(_idx, result, saved_position, context) => {
                 if !self.accepts_audio_context(context) {
                     tracing::debug!(
                         generation = context.generation.0,
-                        index = idx,
+                        index = _idx,
                         "Ignoring stale startup restore resolution"
                     );
                     return Some(Task::none());
                 }
 
-                // Handle NCM song resolution result during app startup
-                self.playback.pending_resolution_index = None;
+                let Some(target) = self.playback.machine.preparing(context).cloned() else {
+                    return Some(Task::none());
+                };
+                let Some(idx) = target.entry.and_then(|id| self.playback.queue.index_of(id)) else {
+                    self.cancel_playback_transaction();
+                    self.finish_startup_restore();
+                    return Some(Task::none());
+                };
                 self.playback.startup_restore.in_progress = false;
 
                 let resolved = match result {
@@ -373,63 +426,46 @@ impl App {
                             idx,
                             error
                         );
+                        self.cancel_playback_transaction();
                         self.finish_startup_restore();
                         return Some(Task::none());
                     }
                 };
+                let Some(song) = self.apply_resolved_song_to_queue(idx, resolved) else {
+                    self.cancel_playback_transaction();
+                    self.finish_startup_restore();
+                    return Some(Task::none());
+                };
+                if let Some(PlaybackTransaction::Preparing { target, .. }) =
+                    &mut self.playback.machine.pending
                 {
-                    tracing::info!(
-                        "NCM song resolved for restore: finalized_cache_path={:?}",
-                        resolved.finalized_cache_path
-                    );
-
-                    let _ = self.apply_resolved_song_to_queue(*idx, resolved);
-
-                    // Update current_song if this is the current song
-                    if self.playback.current_index == Some(*idx) {
-                        if let Some(song) = self.playback.queue.get(*idx).cloned() {
-                            let position = std::time::Duration::from_secs_f64(*saved_position);
-                            let restore_result = if let Some(buffer) =
-                                resolved.shared_buffer.clone()
-                            {
-                                self.load_streaming_buffer_paused_for_song_in_context(
-                                    &song,
-                                    buffer,
-                                    resolved.duration_secs,
-                                    resolved.finalized_cache_path.clone(),
-                                    position,
-                                    context,
-                                )
-                            } else if let Some(finalized_cache_path) =
-                                resolved.finalized_cache_path.clone()
-                            {
-                                self.load_audio_path_paused_for_song_in_context(
-                                    &song,
-                                    std::path::PathBuf::from(finalized_cache_path),
-                                    position,
-                                    context,
-                                )
-                            } else {
-                                Err(crate::audio::PlaybackError::SourceUnavailable(
-                                    "resolved NCM song has neither a streaming buffer nor a finalized cache path".to_string(),
-                                ))
-                            };
-
-                            if let Err(err) = restore_result {
-                                tracing::warn!(
-                                    "Failed to restore resolved NCM song {}: {}",
-                                    song.title,
-                                    err
-                                );
-                                self.finish_startup_restore();
-                            } else {
-                                tracing::info!("Loaded NCM song and seeked to {:?}", position);
-                                self.finish_startup_restore();
-                            }
-                        }
-
-                        return Some(Task::none());
-                    }
+                    target.quality = resolved.quality.clone();
+                }
+                let position = std::time::Duration::from_secs_f64(*saved_position);
+                let restore_result = if let Some(buffer) = resolved.shared_buffer.clone() {
+                    self.load_streaming_buffer_paused_for_song_in_context(
+                        &song,
+                        buffer,
+                        resolved.duration_secs,
+                        resolved.finalized_cache_path.clone(),
+                        position,
+                        context,
+                    )
+                } else if let Some(path) = resolved.finalized_cache_path.clone() {
+                    self.load_audio_path_paused_for_song_in_context(
+                        &song,
+                        path.into(),
+                        position,
+                        context,
+                    )
+                } else {
+                    Err(crate::audio::PlaybackError::SourceUnavailable(
+                        "resolved restore has no audio source".to_string(),
+                    ))
+                };
+                if let Err(error) = restore_result {
+                    tracing::warn!("Failed to restore playback: {error}");
+                    self.cancel_playback_transaction();
                 }
                 self.finish_startup_restore();
                 Some(Task::none())

@@ -7,6 +7,8 @@ use super::current_timestamp;
 use crate::database::{DbSong, NewSong};
 
 /// Upsert a local song by storage path while preserving the existing row id.
+/// A scan without gain analysis preserves cached gain only when the non-null
+/// file hash and size still match; the comparison is atomic with the update.
 pub async fn upsert_local_song(pool: &Pool<Sqlite>, song: NewSong) -> Result<i64> {
     let now = current_timestamp();
 
@@ -21,7 +23,11 @@ pub async fn upsert_local_song(pool: &Pool<Sqlite>, song: NewSong) -> Result<i64
             UPDATE songs SET
                 title = ?, artist = ?, album = ?, duration_secs = ?, track_number = ?,
                 year = ?, genre = ?, cover_path = ?, file_hash = ?, file_size = ?,
-                format = ?, normalization_gain = ?, last_modified = ?, is_missing = 0
+                format = ?,
+                normalization_gain = COALESCE(?, CASE
+                    WHEN file_hash IS NOT NULL AND file_hash = ? AND file_size = ?
+                    THEN normalization_gain END),
+                last_modified = ?, is_missing = 0
             WHERE id = ?
             "#,
         )
@@ -37,6 +43,8 @@ pub async fn upsert_local_song(pool: &Pool<Sqlite>, song: NewSong) -> Result<i64
         .bind(song.file_size)
         .bind(&song.format)
         .bind(song.normalization_gain)
+        .bind(&song.file_hash)
+        .bind(song.file_size)
         .bind(now)
         .bind(existing_id)
         .execute(pool)
@@ -78,6 +86,7 @@ pub async fn upsert_local_song(pool: &Pool<Sqlite>, song: NewSong) -> Result<i64
 }
 
 /// Upsert local songs by storage path in one transaction while preserving row ids.
+/// Missing gain follows the same file-identity preservation rule as single upsert.
 pub async fn upsert_local_songs(pool: &Pool<Sqlite>, songs: Vec<NewSong>) -> Result<Vec<i64>> {
     if songs.is_empty() {
         return Ok(Vec::new());
@@ -108,7 +117,11 @@ pub async fn upsert_local_songs(pool: &Pool<Sqlite>, songs: Vec<NewSong>) -> Res
                 file_hash = excluded.file_hash,
                 file_size = excluded.file_size,
                 format = excluded.format,
-                normalization_gain = excluded.normalization_gain,
+                normalization_gain = COALESCE(excluded.normalization_gain, CASE
+                    WHEN songs.file_hash IS NOT NULL
+                        AND songs.file_hash = excluded.file_hash
+                        AND songs.file_size = excluded.file_size
+                    THEN songs.normalization_gain END),
                 last_modified = excluded.last_modified,
                 is_missing = 0
             "#,

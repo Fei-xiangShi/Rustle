@@ -1600,7 +1600,9 @@ impl App {
         self.core.audio.as_ref()
     }
 
-    fn require_audio_handle(&self) -> crate::audio::PlaybackResult<&crate::audio::AudioHandle> {
+    pub(crate) fn require_audio_handle(
+        &self,
+    ) -> crate::audio::PlaybackResult<&crate::audio::AudioHandle> {
         self.audio_handle().ok_or_else(|| {
             crate::audio::PlaybackError::DeviceUnavailable(
                 "the audio backend is unavailable".to_string(),
@@ -1610,7 +1612,8 @@ impl App {
 
     pub(crate) fn refresh_playback_runtime(&mut self) {
         let analysis = self.core.audio_chain.analysis();
-        let pause_requested = self.playback.pause_requested;
+        let pause_requested =
+            self.playback.machine.intent == super::playback_machine::TransportIntent::Pause;
 
         if let Some(audio) = self.audio_handle() {
             let mut info = audio.get_info();
@@ -1769,31 +1772,16 @@ impl App {
             .schedule_preloaded_transition(identity, trigger_at, fade_in, transition)
     }
 
-    pub(crate) fn cancel_scheduled_audio_transition(&self) {
-        if let Some(audio) = self.audio_handle()
-            && let Err(error) = audio.cancel_scheduled_transition()
-        {
-            tracing::warn!("Failed to cancel scheduled audio transition: {error}");
-        }
-    }
-
     pub(crate) fn clear_scheduled_transition_state(&mut self) {
-        if self.playback.scheduled_transition_request_id.is_some() {
-            self.cancel_scheduled_audio_transition();
+        if self.playback.machine.scheduled() {
+            match self
+                .require_audio_handle()
+                .and_then(|audio| audio.cancel_scheduled_transition())
+            {
+                Ok(()) => self.playback.machine.pending = None,
+                Err(error) => tracing::warn!("Failed to cancel scheduled playback: {error}"),
+            }
         }
-        self.playback.scheduled_transition_buffer.take();
-        if let Some(request_id) = self.playback.scheduled_transition_request_id.take()
-            && self
-                .playback
-                .pending_playback_request
-                .as_ref()
-                .is_some_and(|pending| pending.request_id == request_id)
-        {
-            self.playback.pending_playback_request = None;
-        }
-        self.playback.pending_transition = None;
-        self.playback.pending_transition_trigger = None;
-        self.playback.crossfade_triggered = false;
     }
 
     pub(crate) fn load_audio_file_paused(
@@ -1923,18 +1911,11 @@ impl App {
         self.require_audio_handle()?.resume_with_fade(fade_in)
     }
 
-    pub(crate) fn stop_audio_backend(&self) {
-        if let Some(audio) = self.audio_handle()
-            && let Err(error) = audio.stop()
-        {
-            tracing::warn!("Failed to enqueue stop: {error}");
-        }
-    }
-
     pub(crate) fn seek_audio_output(&mut self, position: Duration) {
         if let Some(audio) = self.audio_handle()
             && audio.seek(position).is_ok()
         {
+            self.playback.machine.discard_deferred_finish();
             self.refresh_playback_runtime();
         }
     }
@@ -1962,27 +1943,60 @@ impl App {
         }
     }
 
-    pub(crate) fn persist_personal_fm_mode(&self, enabled: bool) {
-        if let Some(db) = &self.core.db {
-            let db = db.clone();
-            tokio::spawn(async move {
-                if let Err(err) = db.update_personal_fm_mode(enabled).await {
-                    tracing::warn!("Failed to persist Personal FM mode: {}", err);
-                }
-            });
-        }
+    pub(crate) fn persist_queue_snapshot(&self) {
+        self.persist_committed_playback(self.playback_info().position.as_secs_f64());
     }
 
-    pub(crate) fn persist_queue_snapshot(&self) {
-        if let Some(db) = &self.core.db {
-            let db = db.clone();
-            let queue_snapshot = self.playback.queue.clone();
-            tokio::spawn(async move {
-                if let Err(err) = db.save_queue_with_songs(&queue_snapshot, None).await {
-                    tracing::warn!("Failed to persist queue snapshot: {}", err);
-                }
-            });
+    pub(crate) fn persist_committed_playback(&self, position_secs: f64) {
+        use std::sync::atomic::Ordering;
+        // A proposed replacement queue is not a committed session.
+        if self.playback.machine.pending.is_some() {
+            return;
         }
+        let Some(db) = self.core.db.clone() else {
+            return;
+        };
+        let origin = self.playback.machine.origin();
+        let origins: Vec<_> = (0..self.playback.queue.len())
+            .filter_map(|idx| self.playback.queue.entry(idx).map(|entry| entry.1))
+            .collect();
+        let (Ok(playback_origin), Ok(queue_origins)) = (
+            serde_json::to_string(&origin),
+            serde_json::to_string(&origins),
+        ) else {
+            tracing::warn!("Failed to serialize playback provenance");
+            return;
+        };
+        let queue_revision = self.playback.queue.revision();
+        let saved_queue_revision = self.playback.persistence.saved_queue_revision.clone();
+        let mut snapshot = crate::database::DbPlaybackSnapshot {
+            songs: Some(self.playback.queue.to_vec()),
+            current_song: self.playback.current_song.clone(),
+            queue_position: self.playback.current_index.map_or(-1, |idx| idx as i64),
+            position_secs,
+            personal_fm_mode: origin.is_fm(),
+            playback_origin,
+            queue_origins: Some(queue_origins),
+        };
+        let revisions = self.playback.persistence.revision.clone();
+        let revision = revisions.fetch_add(1, Ordering::SeqCst) + 1;
+        let writer = self.playback.persistence.writer.clone();
+        tokio::spawn(async move {
+            let _guard = writer.lock().await;
+            if revisions.load(Ordering::SeqCst) != revision {
+                return;
+            }
+            if saved_queue_revision.load(Ordering::SeqCst) == queue_revision {
+                snapshot.songs = None;
+                snapshot.queue_origins = None;
+            }
+            match db.save_playback_snapshot(&snapshot).await {
+                Ok(()) => {
+                    saved_queue_revision.store(queue_revision, Ordering::SeqCst);
+                }
+                Err(error) => tracing::warn!("Failed to persist playback snapshot: {error}"),
+            }
+        });
     }
 
     pub(crate) fn set_output_volume(&mut self, volume: f32, persist: bool) {
@@ -2090,13 +2104,11 @@ pub struct PlaybackSessionState {
     /// Last saved playback snapshot loaded from the database.
     pub saved_state: Option<DbPlaybackState>,
     /// Active playback queue.
-    pub queue: Vec<DbSong>,
+    pub queue: super::playback_machine::PlaybackQueue,
     /// Current position within the active queue.
     pub current_index: Option<usize>,
-    /// Whether personal FM playback mode is active.
-    pub personal_fm_mode: bool,
-    /// Source id used when reporting NCM scrobble events for the active queue.
-    pub ncm_scrobble_source_id: Option<u64>,
+    pub machine: super::playback_machine::PlaybackMachine,
+    pub persistence: super::playback_machine::PlaybackPersistence,
     /// Queue navigation cache used as the single source of truth for shuffle order.
     pub shuffle_cache: crate::app::update::queue_navigator::ShuffleCache,
     /// Audio preload state machine for adjacent tracks.
@@ -2107,34 +2119,58 @@ pub struct PlaybackSessionState {
     pub lyrics_render_manager: crate::app::update::lyrics_render_manager::LyricsRenderManager,
     /// Central preload coordinator - owns the preload window lifecycle.
     pub preload_coordinator: crate::app::update::preload_coordinator::PreloadCoordinator,
-    /// Track index currently being resolved before playback starts.
-    pub pending_resolution_index: Option<usize>,
-    /// Playback request waiting for audio thread confirmation.
-    pub pending_playback_request: Option<PendingPlaybackRequest>,
     /// Active streaming buffer shared with the audio thread.
     pub active_streaming_buffer: Option<crate::audio::SharedBuffer>,
     /// Cached runtime snapshot consumed by UI/system integrations.
     pub runtime: PlaybackRuntimeState,
-    /// Logical pause intent exposed immediately while the backend finishes its
-    /// sample-driven Fade and physical Sink pause.
-    pub pause_requested: bool,
     /// Consecutive playback failure counter.
     pub consecutive_failures: u8,
-    /// Prevents repeated natural Crossfade triggers while the next generation
-    /// is being promoted.
-    pub crossfade_triggered: bool,
-    /// One-shot transition intent consumed only by the next preloaded handoff.
-    pub pending_transition: Option<crate::audio::automix::TransitionDirective>,
-    /// Audio-clock deadline paired with `pending_transition` for natural handoff.
-    pub pending_transition_trigger: Option<Duration>,
-    /// Request whose UI commit is deferred until the scheduled handoff starts.
-    pub scheduled_transition_request_id: Option<u64>,
-    /// Incoming streaming buffer retained without cancelling the outgoing source.
-    pub scheduled_transition_buffer: Option<crate::audio::SharedBuffer>,
     /// Throttles finalized-cache discovery for streaming Automix analysis.
     pub automix_analysis_poll_at: Option<std::time::Instant>,
+    /// Memoized natural-transition plan for the current/next pair, so the
+    /// playback tick does not re-read Automix analysis files every 100 ms.
+    pub natural_transition_cache: Option<NaturalTransitionCache>,
     /// Startup restore coordination state.
     pub startup_restore: StartupRestoreState,
+    /// Files opened from outside the library (launch args, IPC, drop).
+    pub open_files: OpenFilesState,
+}
+
+/// Identity of the current/next pair a natural transition was planned for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NaturalTransitionKey {
+    pub generation: Option<u64>,
+    pub current_id: i64,
+    pub next_id: i64,
+    pub next_index: usize,
+    pub automix_enabled: bool,
+    pub duration: Duration,
+}
+
+/// Memoized natural transition plan.
+#[derive(Debug, Clone)]
+pub struct NaturalTransitionCache {
+    pub key: NaturalTransitionKey,
+    pub computed_at: std::time::Instant,
+    /// Automix plans and plain crossfades are final for their key. Only an
+    /// Automix fallback is re-planned, because analysis may appear later.
+    pub settled: bool,
+    pub trigger_at: Duration,
+    pub transition: crate::audio::automix::TransitionDirective,
+}
+
+/// Debounce and serialization state for opening external files.
+#[derive(Debug, Default)]
+pub struct OpenFilesState {
+    /// Requested files awaiting the next flush, in arrival order.
+    pub pending: Vec<PathBuf>,
+    /// Bumped per request or superseding playback choice; only matching timers
+    /// and import results may flush or start playback.
+    pub debounce_generation: u64,
+    /// Whether a debounce timer for `debounce_generation` is outstanding.
+    pub flush_scheduled: bool,
+    /// Whether an import batch is running; later batches wait for it.
+    pub import_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2144,21 +2180,6 @@ pub struct StartupRestoreState {
     pub songs_loaded: bool,
     pub in_progress: bool,
     pub completed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingPlaybackKind {
-    StartPlaying,
-    LoadPaused,
-    RestartCurrent,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingPlaybackRequest {
-    pub request_id: u64,
-    pub queue_index: Option<usize>,
-    pub song: DbSong,
-    pub kind: PendingPlaybackKind,
 }
 
 /// Unified route model for page rendering and navigation history

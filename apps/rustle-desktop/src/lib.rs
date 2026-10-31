@@ -31,34 +31,23 @@ pub fn run() -> iced::Result {
     let _observability = observability::initialize();
     observability::set_runtime_phase(observability::RuntimePhase::SingleInstance);
 
-    let args: Vec<String> = std::env::args().collect();
+    // Launchers pass a rustle:// URI, audio file paths ("Open with" / file
+    // association / `file://` URIs from desktop entries), or nothing.
+    let current_dir = std::env::current_dir().ok();
+    let request =
+        protocol::launch::parse_launch_args(std::env::args_os().skip(1), current_dir.as_deref());
 
-    // Handle rustle:// protocol URL from CLI.
-    // The desktop file passes the URL directly as the first argument via %u.
-    if args.len() >= 2 && (args[1].starts_with("rustle://") || args[1].starts_with("rustle-dev://"))
-    {
-        let uri = args[1].clone();
-        match protocol::ipc::forward_uri_to_primary(&uri) {
-            Ok(()) => {
-                tracing::info!("URI forwarded to primary instance, exiting");
-                return Ok(());
-            }
-            Err(error) => {
-                tracing::warn!("No primary instance found ({}), starting new one", error);
-                protocol::ipc::set_pending_startup_uri(uri);
-            }
-        }
-    } else {
-        // Normal launch: check if another instance is already running.
-        // If so, focus its window and exit — single-instance enforcement.
-        match protocol::ipc::forward_focus_to_primary() {
-            Ok(()) => {
-                tracing::info!("Focused existing instance, exiting");
-                return Ok(());
-            }
-            Err(_) => {
-                // No existing instance, proceed with normal startup.
-            }
+    // Single-instance enforcement: hand the request to a running instance and
+    // exit, or claim the primary role and keep the request for startup.
+    if protocol::ipc::negotiate_startup(&request) == protocol::ipc::StartupRole::Forwarded {
+        tracing::info!("Launch request forwarded to primary instance, exiting");
+        return Ok(());
+    }
+    match request {
+        protocol::launch::LaunchRequest::Normal => {}
+        protocol::launch::LaunchRequest::Uri(uri) => protocol::ipc::set_pending_startup_uri(uri),
+        protocol::launch::LaunchRequest::OpenFiles(paths) => {
+            protocol::ipc::set_pending_startup_files(paths);
         }
     }
 

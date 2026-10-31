@@ -9,7 +9,9 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cover::{CoverCache, find_cover_art};
 use crate::error::{MediaError, MediaResult};
-use crate::metadata::{AudioMetadata, apply_smart_parsing, extract_metadata, resolve_track_gain};
+use crate::metadata::{
+    AudioMetadata, apply_smart_parsing, extract_metadata, extract_track_gain, resolve_track_gain,
+};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "m4a", "aac", "ogg", "wav", "opus", "wma", "aiff",
@@ -30,6 +32,9 @@ pub struct ScanConfig {
     pub compute_hash: bool,
     pub extract_covers: bool,
     pub smart_parsing: bool,
+    /// Decode the whole track to measure loudness when no gain tag exists.
+    /// Interactive callers disable this; playback analyzes lazily instead.
+    pub analyze_loudness: bool,
     pub max_depth: Option<usize>,
     pub extensions: Vec<String>,
 }
@@ -40,6 +45,7 @@ impl Default for ScanConfig {
             compute_hash: true,
             extract_covers: true,
             smart_parsing: true,
+            analyze_loudness: true,
             max_depth: None,
             extensions: Vec::new(),
         }
@@ -159,7 +165,12 @@ pub fn scan_audio_file(
         .compute_hash
         .then(|| compute_partial_hash(path))
         .transpose()?;
-    let normalization_gain = resolve_track_gain(path).map(f64::from);
+    let normalization_gain = if config.analyze_loudness {
+        resolve_track_gain(path)
+    } else {
+        extract_track_gain(path)
+    }
+    .map(f64::from);
     let cover_path = if config.extract_covers && metadata.cover_data.is_none() {
         find_cover_art(path)
     } else {

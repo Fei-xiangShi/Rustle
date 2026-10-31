@@ -263,16 +263,16 @@ impl App {
                 {
                     self.ui.importing_playlist = None;
                 }
-                // Update audio state. Each tick wakes the audio actor, so only do
-                // it per frame where a frame-accurate position is rendered;
-                // otherwise the 100 ms PlaybackTick already refreshes it while
-                // playing.
+                // Refresh the runtime snapshot for frame-accurate views. The audio
+                // actor samples its clock on its own maintenance deadline and the
+                // shared state extrapolates between samples, so frames read the
+                // snapshot without waking the audio thread.
                 let needs_frame_position = self.ui.lyrics.is_open
                     || self.ui.lyrics.animation.is_animating()
                     || matches!(self.ui.current_route, Route::AudioEngine)
                     || !self.playback_is_playing();
                 if needs_frame_position {
-                    self.update_audio_tick();
+                    self.refresh_playback_runtime();
                 }
 
                 // Check if lyrics page close animation is complete
