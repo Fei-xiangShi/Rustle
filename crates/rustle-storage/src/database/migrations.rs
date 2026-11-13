@@ -4,8 +4,8 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
-use sqlx::SqlitePool;
 use sqlx::migrate::{Migration, Migrator};
+use sqlx::{AssertSqlSafe, SqlSafeStr, SqlitePool};
 
 use super::StorageResult as Result;
 use super::error::StorageError;
@@ -161,10 +161,10 @@ fn run_migrator(
                     migration_version = 1,
                     "Using the released Windows baseline checksum without rewriting the ledger"
                 );
-                return migrator.run_direct(&mut *connection).await;
+                return migrator.run_direct(None, &mut *connection, false).await;
             }
         }
-        MIGRATOR.run_direct(&mut *connection).await
+        MIGRATOR.run_direct(None, &mut *connection, false).await
     })
 }
 
@@ -181,7 +181,8 @@ fn released_crlf_migrator(checksum: &[u8]) -> Option<Migrator> {
         baseline.version,
         baseline.description.clone(),
         baseline.migration_type,
-        Cow::Owned(baseline.sql.replace('\n', "\r\n")),
+        // Only line endings of the trusted embedded migration are changed.
+        AssertSqlSafe(baseline.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
         baseline.no_tx,
     );
     if checksum != crlf.checksum.as_ref() {
@@ -413,7 +414,7 @@ mod tests {
     fn embedded_migrations_use_lf_bytes() {
         for migration in MIGRATOR.iter() {
             assert!(
-                !migration.sql.contains('\r'),
+                !migration.sql.as_str().contains('\r'),
                 "migration {} must use LF on every build host",
                 migration.version
             );
@@ -429,7 +430,7 @@ mod tests {
             1,
             baseline.description.clone(),
             baseline.migration_type,
-            baseline.sql.replace('\n', "\r\n").into(),
+            AssertSqlSafe(baseline.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
             baseline.no_tx,
         )
     }

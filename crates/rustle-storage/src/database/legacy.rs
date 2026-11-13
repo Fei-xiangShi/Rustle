@@ -155,25 +155,23 @@ pub(crate) fn fingerprint_connection(
             let table_sql = table.get::<String, _>("sql");
             components.push(format!("table|{table_name}"));
 
-            let mut columns = sqlx::query(&format!(
-                "PRAGMA table_info({})",
-                quote_identifier(&table_name)
-            ))
-            .fetch_all(&mut *connection)
-            .await?
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("name"),
-                    row.get::<String, _>("type").trim().to_ascii_uppercase(),
-                    row.get::<i64, _>("notnull"),
-                    row.get::<Option<String>, _>("dflt_value")
-                        .map(|value| normalize_sql(&value))
-                        .unwrap_or_else(|| "<none>".to_string()),
-                    row.get::<i64, _>("pk"),
-                )
-            })
-            .collect::<Vec<_>>();
+            let mut columns = sqlx::query("SELECT * FROM pragma_table_info(?)")
+                .bind(&table_name)
+                .fetch_all(&mut *connection)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("name"),
+                        row.get::<String, _>("type").trim().to_ascii_uppercase(),
+                        row.get::<i64, _>("notnull"),
+                        row.get::<Option<String>, _>("dflt_value")
+                            .map(|value| normalize_sql(&value))
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        row.get::<i64, _>("pk"),
+                    )
+                })
+                .collect::<Vec<_>>();
             columns.sort();
             for (name, data_type, not_null, default, primary_key) in columns {
                 components.push(format!(
@@ -181,25 +179,23 @@ pub(crate) fn fingerprint_connection(
                 ));
             }
 
-            let mut foreign_keys = sqlx::query(&format!(
-                "PRAGMA foreign_key_list({})",
-                quote_identifier(&table_name)
-            ))
-            .fetch_all(&mut *connection)
-            .await?
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("from"),
-                    row.get::<String, _>("table"),
-                    row.get::<Option<String>, _>("to")
-                        .unwrap_or_else(|| "<implicit>".to_string()),
-                    row.get::<String, _>("on_update"),
-                    row.get::<String, _>("on_delete"),
-                    row.get::<String, _>("match"),
-                )
-            })
-            .collect::<Vec<_>>();
+            let mut foreign_keys = sqlx::query("SELECT * FROM pragma_foreign_key_list(?)")
+                .bind(&table_name)
+                .fetch_all(&mut *connection)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("from"),
+                        row.get::<String, _>("table"),
+                        row.get::<Option<String>, _>("to")
+                            .unwrap_or_else(|| "<implicit>".to_string()),
+                        row.get::<String, _>("on_update"),
+                        row.get::<String, _>("on_delete"),
+                        row.get::<String, _>("match"),
+                    )
+                })
+                .collect::<Vec<_>>();
             foreign_keys.sort();
             for (from, target_table, to, on_update, on_delete, match_kind) in foreign_keys {
                 components.push(format!(
@@ -207,39 +203,35 @@ pub(crate) fn fingerprint_connection(
             ));
             }
 
-            let mut indexes = sqlx::query(&format!(
-                "PRAGMA index_list({})",
-                quote_identifier(&table_name)
-            ))
-            .fetch_all(&mut *connection)
-            .await?
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("name"),
-                    row.get::<i64, _>("unique"),
-                    row.get::<String, _>("origin"),
-                    row.get::<i64, _>("partial"),
-                )
-            })
-            .collect::<Vec<_>>();
-            indexes.sort();
-            for (index_name, unique, origin, partial) in indexes {
-                let mut index_columns = sqlx::query(&format!(
-                    "PRAGMA index_info({})",
-                    quote_identifier(&index_name)
-                ))
+            let mut indexes = sqlx::query("SELECT * FROM pragma_index_list(?)")
+                .bind(&table_name)
                 .fetch_all(&mut *connection)
                 .await?
                 .into_iter()
                 .map(|row| {
                     (
-                        row.get::<i64, _>("seqno"),
-                        row.get::<Option<String>, _>("name")
-                            .unwrap_or_else(|| "<expression>".to_string()),
+                        row.get::<String, _>("name"),
+                        row.get::<i64, _>("unique"),
+                        row.get::<String, _>("origin"),
+                        row.get::<i64, _>("partial"),
                     )
                 })
                 .collect::<Vec<_>>();
+            indexes.sort();
+            for (index_name, unique, origin, partial) in indexes {
+                let mut index_columns = sqlx::query("SELECT * FROM pragma_index_info(?)")
+                    .bind(&index_name)
+                    .fetch_all(&mut *connection)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        (
+                            row.get::<i64, _>("seqno"),
+                            row.get::<Option<String>, _>("name")
+                                .unwrap_or_else(|| "<expression>".to_string()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 index_columns.sort_by_key(|(sequence, _)| *sequence);
                 let column_names = index_columns
                     .into_iter()
@@ -299,10 +291,6 @@ pub(crate) fn fingerprint_connection(
     })
 }
 
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
 fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -359,7 +347,7 @@ pub(crate) const LEGACY_FIXTURE_SQL: [&str; 5] = [
 #[cfg(test)]
 pub(crate) async fn apply_fixture(pool: &SqlitePool, version: LegacySchemaVersion) -> Result<()> {
     for script in LEGACY_FIXTURE_SQL.iter().take(version.fixture_count()) {
-        sqlx::raw_sql(script).execute(pool).await?;
+        sqlx::raw_sql(*script).execute(pool).await?;
     }
     Ok(())
 }

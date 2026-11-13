@@ -387,7 +387,10 @@ mod tests {
         assert!(destination.is_file());
 
         let mut archive = ZipArchive::new(File::open(&destination).unwrap()).unwrap();
-        let names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+        let names = archive
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect::<Vec<_>>();
         assert_eq!(
             names,
             vec![

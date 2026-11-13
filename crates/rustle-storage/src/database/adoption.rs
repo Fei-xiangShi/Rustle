@@ -343,7 +343,7 @@ async fn apply_adoption_transaction(
     }
 
     for script in version.upgrade_scripts() {
-        if let Err(source) = sqlx::raw_sql(script).execute(&mut *connection).await {
+        if let Err(source) = sqlx::raw_sql(*script).execute(&mut *connection).await {
             return rollback_transaction(&mut connection, source.into()).await;
         }
     }
@@ -869,7 +869,7 @@ fn run_migrator(
 ) -> BoxFuture<'static, std::result::Result<(), sqlx::migrate::MigrateError>> {
     Box::pin(async move {
         let mut connection = pool.acquire().await?;
-        migrator.run_direct(&mut *connection).await
+        migrator.run_direct(None, &mut *connection, false).await
     })
 }
 

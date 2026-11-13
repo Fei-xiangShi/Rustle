@@ -22,7 +22,9 @@ rustle-application.workspace = true
 rustle-domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-rustls", "macros"] }
+# Storage-owned temporary pin: SQLx 0.9.0 on crates.io excludes patched SQLite.
+# https://github.com/launchbadge/sqlx/pull/4502; return to a release containing it.
+sqlx = { git = "https://github.com/launchbadge/sqlx.git", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", features = ["sqlite", "runtime-tokio", "tls-none", "macros"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tracing.workspace = true
