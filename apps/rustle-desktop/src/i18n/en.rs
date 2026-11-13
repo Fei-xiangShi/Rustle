@@ -372,6 +372,8 @@ static TRANSLATIONS: LazyLock<HashMap<Key, &'static str>> = LazyLock::new(|| {
         "The system tray is unavailable. Rustle will keep this window visible.",
     );
 
+    m.insert(Key::TrayRecovering, "The system tray is recovering. Please try again shortly. Rustle will keep this window visible.");
+
     // Context Menu
     m.insert(Key::ContextMenuEditTags, "Edit Tags");
 

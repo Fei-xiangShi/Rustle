@@ -34,7 +34,8 @@ fn initialize_tray_task(language: crate::i18n::Language) -> Task<Message> {
         Task::done(match crate::platform::tray::initialize(presentation) {
             Ok(receiver) => Message::TrayStarted(receiver),
             Err(error) => {
-                tracing::warn!(%error, "Failed to start system tray");
+                tracing::warn!(%error, operation = error.operation(), native_code = error.native_code(),
+                    "Failed to start system tray");
                 Message::TrayUnavailable(error.to_string())
             }
         })
@@ -71,7 +72,18 @@ impl App {
 
             Message::TrayStarted(rx) => {
                 tracing::info!("Tray service started");
-                self.core.tray_availability = TrayAvailability::Available;
+                #[cfg(target_os = "windows")]
+                {
+                    self.core.tray_availability = if crate::platform::tray::is_available() {
+                        TrayAvailability::Available
+                    } else {
+                        TrayAvailability::Recovering
+                    };
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    self.core.tray_availability = TrayAvailability::Available;
+                }
                 self.update_tray_and_mpris_current(self.playback_is_playing());
                 let rx = rx.clone();
                 Some(Task::run(
@@ -159,7 +171,10 @@ impl App {
                                 );
                         self.core.tray_availability = availability.clone();
 
-                        if matches!(availability, TrayAvailability::Unavailable(_)) {
+                        if matches!(
+                            availability,
+                            TrayAvailability::Recovering | TrayAvailability::Unavailable(_)
+                        ) {
                             let mut tasks = Vec::new();
                             if self.core.is_window_hidden() {
                                 tasks.push(self.update(Message::ShowWindow));

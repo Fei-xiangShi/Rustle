@@ -13,7 +13,8 @@ use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    SetLastError, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
@@ -29,17 +30,34 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetCursorPos,
-    GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, ICONINFO, MF_CHECKED, MF_DISABLED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, RegisterClassExW,
-    RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SM_MENUDROPALIGNMENT, SetForegroundWindow,
-    SetWindowLongPtrW, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, UnregisterClassW, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_NCCREATE,
-    WM_NCDESTROY, WM_NULL, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetSystemMetrics, GetWindowLongPtrW, HICON, HMENU, ICONINFO, KillTimer, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PostMessageW, RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON,
+    SM_CYSMICON, SM_MENUDROPALIGNMENT, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+    UnregisterClassW, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY,
+    WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 0x51;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const TRAY_ICON_ID: u32 = 1;
+const RECOVERY_TIMER_ID: usize = 1;
+const RECOVERY_DELAYS_MS: [u32; 6] = [250, 500, 1_000, 2_000, 4_000, 8_000];
+
+#[derive(Default)]
+struct RecoveryBackoff {
+    attempts: usize,
+    pending: bool,
+}
+
+impl RecoveryBackoff {
+    fn next_delay(&mut self) -> Option<u32> {
+        let delay = *RECOVERY_DELAYS_MS.get(self.attempts)?;
+        self.attempts += 1;
+        Some(delay)
+    }
+}
 
 const CMD_PLAY_PAUSE: u16 = 1001;
 const CMD_PREV_TRACK: u16 = 1002;
@@ -136,7 +154,10 @@ pub fn is_available() -> bool {
     WINDOWS_TRAY.with(|slot| {
         slot.try_borrow()
             .ok()
-            .and_then(|slot| slot.as_ref().map(|tray| tray.state.shell_available))
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(|tray| tray.state.availability.is_available())
+            })
             .unwrap_or(false)
     })
 }
@@ -215,7 +236,8 @@ impl WindowsTray {
             icon: icon.handle,
             icon_owned: icon.owned,
             icon_registered: false,
-            shell_available: false,
+            availability: TrayAvailability::Starting,
+            recovery: RecoveryBackoff::default(),
             taskbar_created,
             command_tx,
             command_overflow_warned: false,
@@ -272,7 +294,7 @@ impl WindowsTray {
             owns_window_class,
             _thread_bound: PhantomData,
         };
-        if let Err(error) = tray.state.register_icon() {
+        if let Err(error) = tray.state.sync_icon() {
             drop(tray);
             return Err(error);
         }
@@ -289,6 +311,7 @@ impl WindowsTray {
 
 impl Drop for WindowsTray {
     fn drop(&mut self) {
+        self.state.cancel_recovery_timer();
         self.state.unregister_icon();
         if !self.state.menu.is_null() {
             // SAFETY: WindowsTray is thread-bound and uniquely owns this root
@@ -336,7 +359,8 @@ struct WindowState {
     icon: HICON,
     icon_owned: bool,
     icon_registered: bool,
-    shell_available: bool,
+    availability: TrayAvailability,
+    recovery: RecoveryBackoff,
     taskbar_created: u32,
     command_tx: mpsc::Sender<TrayCommand>,
     command_overflow_warned: bool,
@@ -346,25 +370,12 @@ struct WindowState {
 
 impl WindowState {
     fn register_icon(&mut self) -> Result<(), TrayError> {
-        let mut data = self.notify_data(
+        let data = self.notify_data(
             NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             &self.presentation.tooltip,
         );
-        // SAFETY: data contains a live callback HWND and HICON owned by self.
-        if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
-            self.shell_available = false;
-            return Err(last_error("Shell_NotifyIconW(NIM_ADD)"));
-        }
+        repair_icon(data, notify_icon)?;
         self.icon_registered = true;
-
-        data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        // SAFETY: the icon was just registered using this HWND and numeric ID.
-        if unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) } == 0 {
-            let error = last_error("Shell_NotifyIconW(NIM_SETVERSION)");
-            self.unregister_icon();
-            return Err(error);
-        }
-        self.shell_available = true;
         Ok(())
     }
 
@@ -376,39 +387,85 @@ impl WindowState {
         // SAFETY: deletion is idempotently guarded by icon_registered.
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
         self.icon_registered = false;
-        self.shell_available = false;
+        self.availability = TrayAvailability::Starting;
     }
 
     fn sync_icon(&mut self) -> Result<(), TrayError> {
-        if !self.icon_registered {
-            let result = self.register_icon();
-            return match result {
-                Ok(()) => {
-                    self.send_command(TrayCommand::AvailabilityChanged(
-                        TrayAvailability::Available,
-                    ));
-                    Ok(())
+        // Playback changes and repeated broadcasts must not bypass or postpone
+        // a pending retry. The retry uses the newest presentation.
+        if self.recovery.pending {
+            return Ok(());
+        }
+        let result = self.register_icon();
+        self.finish_sync(result)
+    }
+
+    fn finish_sync(&mut self, result: Result<(), TrayError>) -> Result<(), TrayError> {
+        match result {
+            Ok(()) => {
+                self.cancel_recovery_timer();
+                self.recovery = RecoveryBackoff::default();
+                self.set_availability(TrayAvailability::Available);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::debug!(
+                    operation = error.operation(),
+                    native_code = error.native_code(),
+                    "Windows tray repair failed"
+                );
+                if let Some(delay) = self.recovery.next_delay() {
+                    // SAFETY: hwnd is our live UI-thread window. A null callback
+                    // delivers WM_TIMER on that same thread; no Rust pointer is retained.
+                    if unsafe { SetTimer(self.hwnd, RECOVERY_TIMER_ID, delay, None) } != 0 {
+                        self.recovery.pending = true;
+                        // Once warned, remain unavailable until a confirmed
+                        // success. More shell broadcasts must not create a new
+                        // warning episode while the same outage continues.
+                        if !matches!(self.availability, TrayAvailability::Unavailable(_)) {
+                            self.set_availability(TrayAvailability::Recovering);
+                        }
+                        return Ok(());
+                    }
+                    let timer_error = last_error("SetTimer(tray recovery)");
+                    tracing::warn!(
+                        operation = timer_error.operation(),
+                        native_code = timer_error.native_code(),
+                        "Could not schedule Windows tray recovery"
+                    );
                 }
-                Err(error) => {
-                    self.report_unavailable(&error);
-                    Err(error)
-                }
-            };
+                self.set_availability(TrayAvailability::Unavailable(error.to_string()));
+                Err(error)
+            }
         }
-        let data = self.notify_data(NIF_TIP | NIF_SHOWTIP, &self.presentation.tooltip);
-        // SAFETY: data points to no borrowed buffers and targets our live HWND/ID.
-        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
-            let error = last_error("Shell_NotifyIconW(NIM_MODIFY tooltip)");
-            self.report_unavailable(&error);
-            return Err(error);
+    }
+
+    fn cancel_recovery_timer(&mut self) {
+        // SAFETY: hwnd is the tray-owned window. Killing an absent timer is harmless.
+        let _ = unsafe { KillTimer(self.hwnd, RECOVERY_TIMER_ID) };
+        self.recovery.pending = false;
+    }
+
+    fn recover(&mut self, timer: bool) {
+        if timer {
+            // KillTimer does not remove already queued messages. Ignore stale
+            // WM_TIMER after a successful recovery/cancellation.
+            if !self.recovery.pending {
+                return;
+            }
+            self.cancel_recovery_timer();
+        } else if !self.recovery.pending {
+            // A fresh shell/resume event can start a new bounded attempt after
+            // exhaustion. Repeated events during recovery do not reset its budget.
+            self.recovery = RecoveryBackoff::default();
         }
-        if !self.shell_available {
-            self.shell_available = true;
-            self.send_command(TrayCommand::AvailabilityChanged(
-                TrayAvailability::Available,
-            ));
+        if let Err(error) = self.sync_icon() {
+            tracing::warn!(
+                operation = error.operation(),
+                native_code = error.native_code(),
+                "Windows tray recovery exhausted"
+            );
         }
-        Ok(())
     }
 
     fn notify_data(&self, flags: u32, tooltip: &str) -> NOTIFYICONDATAW {
@@ -454,12 +511,10 @@ impl WindowState {
         }
     }
 
-    fn report_unavailable(&mut self, error: &TrayError) {
-        if self.shell_available {
-            self.shell_available = false;
-            self.send_command(TrayCommand::AvailabilityChanged(
-                TrayAvailability::Unavailable(error.to_string()),
-            ));
+    fn set_availability(&mut self, availability: TrayAvailability) {
+        if self.availability != availability {
+            self.availability = availability.clone();
+            self.send_command(TrayCommand::AvailabilityChanged(availability));
         }
     }
 
@@ -481,26 +536,6 @@ impl WindowState {
     fn send_menu_command(&mut self, id: u16) {
         if let Some(command) = command_for_menu_id(id) {
             self.send_command(command);
-        }
-    }
-
-    fn recover_after_explorer_restart(&mut self) {
-        self.icon_registered = false;
-        self.shell_available = false;
-        let result = self.register_icon();
-        match result {
-            Ok(()) => {
-                tracing::info!("Windows tray icon restored after Explorer restart");
-                self.send_command(TrayCommand::AvailabilityChanged(
-                    TrayAvailability::Available,
-                ));
-            }
-            Err(error) => {
-                tracing::warn!(%error, "Failed to restore tray icon after Explorer restart");
-                self.send_command(TrayCommand::AvailabilityChanged(
-                    TrayAvailability::Unavailable(error.to_string()),
-                ));
-            }
         }
     }
 }
@@ -577,7 +612,7 @@ unsafe fn tray_window_proc_inner(
         if message == taskbar_created {
             // SAFETY: This callback runs on the owner thread and no Rust
             // reference to the state is held across this call.
-            unsafe { (&mut *state_ptr).recover_after_explorer_restart() };
+            unsafe { (&mut *state_ptr).recover(false) };
             return 0;
         }
 
@@ -585,7 +620,7 @@ unsafe fn tray_window_proc_inner(
             // SAFETY: Same validated live state pointer; copying TrayIdentity
             // does not create a reference that can cross a nested message loop.
             let identity = unsafe { (*state_ptr).identity };
-            match classify_callback(identity, lparam) {
+            match classify_callback(identity, wparam, lparam) {
                 TrayCallbackAction::PrimaryActivation => {
                     // SAFETY: The pointer is live and callback dispatch holds no
                     // competing Rust reference. send_command is non-blocking.
@@ -595,11 +630,11 @@ unsafe fn tray_window_proc_inner(
                         ));
                     }
                 }
-                TrayCallbackAction::ContextMenu => {
+                TrayCallbackAction::ContextMenu(position) => {
                     // SAFETY: The pointer is the tray-owned state on its UI
                     // thread. show_context_menu revalidates it after the nested
                     // TrackPopupMenuEx loop before reacquiring a Rust reference.
-                    unsafe { show_context_menu(state_ptr, wparam) };
+                    unsafe { show_context_menu(state_ptr, position) };
                 }
                 TrayCallbackAction::Ignore => {}
             }
@@ -607,6 +642,19 @@ unsafe fn tray_window_proc_inner(
         }
 
         match message {
+            WM_TIMER if wparam == RECOVERY_TIMER_ID => {
+                // SAFETY: This is the live window-owned state on its UI thread.
+                unsafe { (&mut *state_ptr).recover(true) };
+                return 0;
+            }
+            WM_POWERBROADCAST
+                if matches!(wparam as u32, PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND) =>
+            {
+                // SAFETY: Resume is delivered to our live top-level window on
+                // the owner thread; recovery uses the same bounded retry path.
+                unsafe { (&mut *state_ptr).recover(false) };
+                return 1;
+            }
             WM_COMMAND => {
                 // SAFETY: The state pointer remains live and no reference is
                 // retained after the bounded, non-blocking command projection.
@@ -639,7 +687,7 @@ unsafe fn tray_window_proc_inner(
 /// the callback `HWND`, and this function must run on that window's owner thread.
 /// The pointer may be invalidated by nested dispatch, so it must be revalidated
 /// through `GWLP_USERDATA` before it is dereferenced after `TrackPopupMenuEx`.
-unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM) {
+unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: Option<WPARAM>) {
     // Capture the native handles, then end the Rust borrow before calling
     // TrackPopupMenuEx because it runs a nested Windows message loop.
     // SAFETY: The caller guarantees state_ptr is live and uniquely accessible
@@ -710,23 +758,30 @@ unsafe fn show_context_menu(state_ptr: *mut WindowState, packed_position: WPARAM
     }
 }
 
-fn context_menu_point(hwnd: HWND, identity: TrayIdentity, packed_position: WPARAM) -> POINT {
-    let point = point_from_packed_position(packed_position);
-    if point.x != -1 || point.y != -1 {
-        return point;
+fn context_menu_point(
+    hwnd: HWND,
+    identity: TrayIdentity,
+    packed_position: Option<WPARAM>,
+) -> POINT {
+    if let Some(position) = packed_position {
+        let point = point_from_packed_position(position);
+        if point.x != -1 || point.y != -1 {
+            return point;
+        }
+
+        let identifier = identity.identifier(hwnd);
+        let mut icon_rect = RECT::default();
+        // SAFETY: Both values are live for the call. Only S_OK is usable.
+        if unsafe { Shell_NotifyIconGetRect(&identifier, &mut icon_rect) } == 0 {
+            return POINT {
+                x: icon_rect.left + (icon_rect.right - icon_rect.left) / 2,
+                y: icon_rect.top + (icon_rect.bottom - icon_rect.top) / 2,
+            };
+        }
     }
 
-    let identifier = identity.identifier(hwnd);
-    let mut icon_rect = RECT::default();
-    // SAFETY: identifier and icon_rect are valid for the duration of the call.
-    // The API documents S_OK specifically; S_FALSE must use the cursor fallback.
-    if unsafe { Shell_NotifyIconGetRect(&identifier, &mut icon_rect) } == 0 {
-        return POINT {
-            x: icon_rect.left + (icon_rect.right - icon_rect.left) / 2,
-            y: icon_rect.top + (icon_rect.bottom - icon_rect.top) / 2,
-        };
-    }
-
+    // Legacy callbacks carry an icon ID in wParam, not coordinates. Use the
+    // cursor so a third-party dock opens the menu at its own icon location.
     let mut cursor = POINT::default();
     // SAFETY: GetCursorPos writes one initialized POINT on success.
     if unsafe { GetCursorPos(&mut cursor) } != 0 {
@@ -1041,20 +1096,75 @@ fn append_text(menu: HMENU, flags: u32, id: usize, label: &str) -> Result<(), Tr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayCallbackAction {
     PrimaryActivation,
-    ContextMenu,
+    ContextMenu(Option<WPARAM>),
     Ignore,
 }
 
-fn classify_callback(identity: TrayIdentity, packed: LPARAM) -> TrayCallbackAction {
-    if !identity.matches_callback(packed) {
-        return TrayCallbackAction::Ignore;
+fn classify_callback(identity: TrayIdentity, wparam: WPARAM, packed: LPARAM) -> TrayCallbackAction {
+    if identity.matches_callback(packed) {
+        return match packed as u32 & 0xffff {
+            NIN_SELECT | NIN_KEYSELECT => TrayCallbackAction::PrimaryActivation,
+            WM_CONTEXTMENU => TrayCallbackAction::ContextMenu(Some(wparam)),
+            // Raw mouse messages alongside version-4 semantic events must not
+            // activate twice or reopen a menu that was just dismissed.
+            _ => TrayCallbackAction::Ignore,
+        };
     }
+    // Some third-party trays forward the legacy format even after Explorer
+    // accepted version 4. Validate both the full event and the numeric ID.
+    if wparam == identity.window_id as WPARAM {
+        return match u32::try_from(packed) {
+            Ok(WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT) => TrayCallbackAction::PrimaryActivation,
+            Ok(WM_RBUTTONUP | WM_CONTEXTMENU) => TrayCallbackAction::ContextMenu(None),
+            _ => TrayCallbackAction::Ignore,
+        };
+    }
+    TrayCallbackAction::Ignore
+}
 
-    match packed as u32 & 0xffff {
-        NIN_SELECT | NIN_KEYSELECT => TrayCallbackAction::PrimaryActivation,
-        WM_CONTEXTMENU => TrayCallbackAction::ContextMenu,
-        _ => TrayCallbackAction::Ignore,
+/// Idempotently update an existing icon before attempting to add a missing one.
+/// A duplicate TaskbarCreated broadcast must not invalidate a working icon.
+fn repair_icon(
+    mut data: NOTIFYICONDATAW,
+    mut notify: impl FnMut(u32, &NOTIFYICONDATAW) -> Result<(), TrayError>,
+) -> Result<(), TrayError> {
+    if notify(NIM_MODIFY, &data).is_ok() {
+        return Ok(());
     }
+    if let Err(add_error) = notify(NIM_ADD, &data) {
+        // The shell may finish restoring the existing registration between calls.
+        return notify(NIM_MODIFY, &data).map_err(|_| add_error);
+    }
+    data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    if let Err(error) = notify(NIM_SETVERSION, &data) {
+        // Successful registration still provides a usable legacy recovery
+        // surface. Our callback decoder supports both formats.
+        tracing::debug!(
+            operation = error.operation(),
+            native_code = error.native_code(),
+            "Windows tray retained with legacy callbacks after version negotiation failed"
+        );
+    }
+    Ok(())
+}
+
+fn notify_icon(operation: u32, data: &NOTIFYICONDATAW) -> Result<(), TrayError> {
+    // SAFETY: data contains handles owned by the caller on this UI thread and
+    // no borrowed buffers. Clear stale last-error state: Shell_NotifyIcon only
+    // guarantees a BOOL result, so a zero native code means no further detail.
+    let result = unsafe {
+        SetLastError(0);
+        Shell_NotifyIconW(operation, data)
+    };
+    if result != 0 {
+        return Ok(());
+    }
+    Err(last_error(match operation {
+        NIM_ADD => "Shell_NotifyIconW(NIM_ADD)",
+        NIM_MODIFY => "Shell_NotifyIconW(NIM_MODIFY)",
+        NIM_SETVERSION => "Shell_NotifyIconW(NIM_SETVERSION)",
+        _ => "Shell_NotifyIconW",
+    }))
 }
 
 fn menu_alignment_flag(drop_alignment: bool) -> u32 {
@@ -1186,26 +1296,31 @@ mod tests {
     fn callback_classification_covers_mouse_keyboard_and_context_menu() {
         let window_id = TrayIdentity::window_id(TRAY_ICON_ID);
         assert_eq!(
-            classify_callback(window_id, (TRAY_ICON_ID << 16 | NIN_SELECT) as LPARAM),
+            classify_callback(window_id, 0, (TRAY_ICON_ID << 16 | NIN_SELECT) as LPARAM),
             TrayCallbackAction::PrimaryActivation
         );
         assert_eq!(
-            classify_callback(window_id, (TRAY_ICON_ID << 16 | NIN_KEYSELECT) as LPARAM),
+            classify_callback(window_id, 0, (TRAY_ICON_ID << 16 | NIN_KEYSELECT) as LPARAM),
             TrayCallbackAction::PrimaryActivation
-        );
-        assert_eq!(
-            classify_callback(window_id, (TRAY_ICON_ID << 16 | WM_CONTEXTMENU) as LPARAM),
-            TrayCallbackAction::ContextMenu
         );
         assert_eq!(
             classify_callback(
                 window_id,
+                0,
+                (TRAY_ICON_ID << 16 | WM_CONTEXTMENU) as LPARAM
+            ),
+            TrayCallbackAction::ContextMenu(Some(0))
+        );
+        assert_eq!(
+            classify_callback(
+                window_id,
+                0,
                 ((TRAY_ICON_ID + 1) << 16 | WM_CONTEXTMENU) as LPARAM,
             ),
             TrayCallbackAction::Ignore
         );
         assert_eq!(
-            classify_callback(window_id, (TRAY_ICON_ID << 16 | 0xffff) as LPARAM),
+            classify_callback(window_id, 0, (TRAY_ICON_ID << 16 | 0xffff) as LPARAM),
             TrayCallbackAction::Ignore
         );
     }
@@ -1216,6 +1331,115 @@ mod tests {
             default_tray_identity(),
             TrayIdentity::window_id(TRAY_ICON_ID)
         );
+    }
+
+    #[test]
+    fn legacy_dock_callbacks_validate_identity_and_use_cursor_position() {
+        let identity = default_tray_identity();
+        assert_eq!(
+            classify_callback(identity, TRAY_ICON_ID as WPARAM, WM_RBUTTONUP as LPARAM),
+            TrayCallbackAction::ContextMenu(None)
+        );
+        assert_eq!(
+            classify_callback(identity, TRAY_ICON_ID as WPARAM, WM_CONTEXTMENU as LPARAM),
+            TrayCallbackAction::ContextMenu(None)
+        );
+        assert_eq!(
+            classify_callback(identity, TRAY_ICON_ID as WPARAM, WM_LBUTTONUP as LPARAM),
+            TrayCallbackAction::PrimaryActivation
+        );
+        assert_eq!(
+            classify_callback(
+                identity,
+                (TRAY_ICON_ID + 1) as WPARAM,
+                WM_RBUTTONUP as LPARAM
+            ),
+            TrayCallbackAction::Ignore
+        );
+        // A packed callback for a different icon cannot masquerade as a legacy
+        // callback just because its screen coordinates happen to equal our ID.
+        assert_eq!(
+            classify_callback(
+                identity,
+                TRAY_ICON_ID as WPARAM,
+                ((TRAY_ICON_ID + 1) << 16 | WM_CONTEXTMENU) as LPARAM
+            ),
+            TrayCallbackAction::Ignore
+        );
+    }
+
+    #[test]
+    fn modern_callbacks_preserve_position_without_duplicate_mouse_activation() {
+        let identity = default_tray_identity();
+        let position = ((0xffec_u32 << 16) | 0xfff6) as WPARAM;
+        assert_eq!(
+            classify_callback(
+                identity,
+                position,
+                (TRAY_ICON_ID << 16 | WM_CONTEXTMENU) as LPARAM
+            ),
+            TrayCallbackAction::ContextMenu(Some(position))
+        );
+        for event in [WM_RBUTTONUP, WM_LBUTTONUP] {
+            assert_eq!(
+                classify_callback(identity, position, (TRAY_ICON_ID << 16 | event) as LPARAM),
+                TrayCallbackAction::Ignore
+            );
+        }
+    }
+
+    fn scripted_repair(expected: &[(u32, bool)]) -> Result<(), TrayError> {
+        let mut steps = expected.iter();
+        let result = repair_icon(NOTIFYICONDATAW::default(), |operation, data| {
+            let &(expected_operation, succeeds) = steps.next().expect("unexpected shell operation");
+            assert_eq!(operation, expected_operation);
+            if operation == NIM_SETVERSION {
+                // SAFETY: repair_icon initializes the version union before this call.
+                assert_eq!(unsafe { data.Anonymous.uVersion }, NOTIFYICON_VERSION_4);
+            }
+            if succeeds {
+                Ok(())
+            } else {
+                Err(TrayError::native("simulated shell failure", 0))
+            }
+        });
+        assert!(steps.next().is_none(), "missing shell operation");
+        result
+    }
+
+    #[test]
+    fn duplicate_taskbar_notification_updates_existing_icon_without_adding() {
+        scripted_repair(&[(NIM_MODIFY, true)]).expect("existing icon remains available");
+    }
+
+    #[test]
+    fn missing_icon_is_added_and_versioned_but_legacy_shells_keep_the_icon() {
+        scripted_repair(&[(NIM_MODIFY, false), (NIM_ADD, true), (NIM_SETVERSION, true)])
+            .expect("restore missing icon");
+        scripted_repair(&[
+            (NIM_MODIFY, false),
+            (NIM_ADD, true),
+            (NIM_SETVERSION, false),
+        ])
+        .expect("retain usable legacy registration");
+    }
+
+    #[test]
+    fn shell_recovery_race_is_rechecked_before_reporting_failure() {
+        scripted_repair(&[(NIM_MODIFY, false), (NIM_ADD, false), (NIM_MODIFY, true)])
+            .expect("shell restored icon during registration");
+        assert!(
+            scripted_repair(&[(NIM_MODIFY, false), (NIM_ADD, false), (NIM_MODIFY, false)]).is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_retries_back_off_and_exhaust_the_budget() {
+        let mut retry = RecoveryBackoff::default();
+        let delays: Vec<_> = std::iter::from_fn(|| retry.next_delay()).collect();
+        assert_eq!(delays, [250, 500, 1_000, 2_000, 4_000, 8_000]);
+        assert_eq!(retry.next_delay(), None);
+        assert_eq!(retry.next_delay(), None);
     }
 
     #[test]
@@ -1264,8 +1488,8 @@ mod tests {
     }
 
     fn run_native_shell_smoke(identity: TrayIdentity, title: &str) {
-        let (_handle, _commands) =
-            start_windows_tray_with_identity(test_presentation(), 4, identity)
+        let (_handle, mut commands) =
+            start_windows_tray_with_identity(test_presentation(), 32, identity)
                 .expect("register tray icon");
         assert!(is_available(), "registered tray must be reported available");
         update_state(TrayPresentation {
@@ -1279,6 +1503,80 @@ mod tests {
         })
         .expect("update registered tray icon");
         assert!(is_available(), "updated tray must remain available");
+        WINDOWS_TRAY.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let tray = slot.as_mut().expect("live native tray");
+            // Exercise the same recovery path without broadcasting to or
+            // restarting Explorer or touching other applications' icons.
+            for _ in 0..3 {
+                tray.state.recover(false);
+                assert!(tray.state.availability.is_available());
+            }
+            tray.state
+                .finish_sync(Err(TrayError::native("simulated resume failure", 0)))
+                .expect("schedule a transient retry");
+            assert_eq!(tray.state.availability, TrayAvailability::Recovering);
+            assert!(tray.state.recovery.pending);
+            let attempts = tray.state.recovery.attempts;
+            tray.state.recover(false);
+            assert_eq!(
+                tray.state.recovery.attempts, attempts,
+                "broadcasts must not reset backoff"
+            );
+            tray.state.recover(true);
+            assert!(tray.state.availability.is_available());
+            assert!(!tray.state.recovery.pending);
+            assert_eq!(tray.state.recovery.attempts, 0);
+            tray.state.recover(true); // Ignore a timer queued before cancellation.
+            assert!(tray.state.availability.is_available());
+            tray.state.recovery.attempts = RECOVERY_DELAYS_MS.len();
+            assert!(
+                tray.state
+                    .finish_sync(Err(TrayError::native("simulated persistent failure", 0)))
+                    .is_err()
+            );
+            assert!(matches!(
+                tray.state.availability,
+                TrayAvailability::Unavailable(_)
+            ));
+            assert!(!tray.state.recovery.pending);
+            tray.state.recovery = RecoveryBackoff::default();
+            tray.state
+                .finish_sync(Err(TrayError::native("same outage, new attempt", 0)))
+                .expect("retry a new recovery episode");
+            assert!(matches!(
+                tray.state.availability,
+                TrayAvailability::Unavailable(_)
+            ));
+            tray.state.recover(true);
+            assert!(tray.state.availability.is_available());
+            tray.state.unregister_icon();
+            tray.state.recover(false);
+            assert!(
+                tray.state.availability.is_available(),
+                "restore our missing icon"
+            );
+        });
+        let mut transitions = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let TrayCommand::AvailabilityChanged(availability) = command {
+                transitions.push(availability);
+            }
+        }
+        assert!(
+            matches!(
+                transitions.as_slice(),
+                [
+                    TrayAvailability::Available,
+                    TrayAvailability::Recovering,
+                    TrayAvailability::Available,
+                    TrayAvailability::Unavailable(_),
+                    TrayAvailability::Available,
+                    TrayAvailability::Available,
+                ]
+            ),
+            "duplicate broadcasts and retries must not repeat warnings: {transitions:?}"
+        );
         shutdown();
         assert!(
             !is_available(),

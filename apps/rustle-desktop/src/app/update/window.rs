@@ -61,7 +61,16 @@ impl App {
             return Self::toast_warning(
                 self.core
                     .locale
-                    .get(crate::i18n::Key::TrayUnavailable)
+                    .get(
+                        if matches!(
+                            self.core.tray_availability,
+                            TrayAvailability::Starting | TrayAvailability::Recovering
+                        ) {
+                            crate::i18n::Key::TrayRecovering
+                        } else {
+                            crate::i18n::Key::TrayUnavailable
+                        },
+                    )
                     .to_string(),
             );
         }
@@ -333,6 +342,7 @@ mod tests {
     #[test]
     fn hiding_requires_a_confirmed_tray_recovery_surface() {
         assert!(!tray_allows_hiding(&TrayAvailability::Starting, true));
+        assert!(!tray_allows_hiding(&TrayAvailability::Recovering, true));
         assert!(!tray_allows_hiding(
             &TrayAvailability::Unavailable("registration failed".into()),
             true,

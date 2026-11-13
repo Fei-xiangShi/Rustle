@@ -170,7 +170,8 @@ impl TrayHandle {
     /// Apply the newest state synchronously on the Win32/Winit UI thread.
     pub fn update(&self, presentation: TrayPresentation) {
         if let Err(error) = windows::update_state(presentation) {
-            tracing::warn!(%error, "Failed to update Windows system tray state");
+            tracing::warn!(%error, operation = error.operation(), native_code = error.native_code(),
+                "Failed to update Windows system tray state");
         }
     }
 }

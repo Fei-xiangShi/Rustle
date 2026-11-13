@@ -6,6 +6,8 @@ use rustle_domain::playback::PlayMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAvailability {
     Starting,
+    /// Registration is being retried; the last window must remain accessible.
+    Recovering,
     Available,
     Unavailable(String),
 }

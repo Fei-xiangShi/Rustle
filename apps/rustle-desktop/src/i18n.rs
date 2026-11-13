@@ -351,6 +351,7 @@ pub enum Key {
     TrayQuit,
     TrayNotPlaying,
     TrayUnavailable,
+    TrayRecovering,
 
     // Context Menu
     ContextMenuEditTags,

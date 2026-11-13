@@ -265,7 +265,10 @@ mod tests {
 
     #[test]
     fn stop_and_clear_queue_revoke_debounced_and_inflight_file_autoplay() {
-        for message in [Message::ClearQueue, Message::MprisCommand(MediaCommand::Stop)] {
+        for message in [
+            Message::ClearQueue,
+            Message::MprisCommand(MediaCommand::Stop),
+        ] {
             for importing in [false, true] {
                 let mut open = OpenFilesState {
                     pending: vec![PathBuf::from("pending.flac")],

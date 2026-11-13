@@ -330,6 +330,11 @@ static TRANSLATIONS: LazyLock<HashMap<Key, &'static str>> = LazyLock::new(|| {
         "系统托盘当前不可用，Rustle 将保持窗口可见。",
     );
 
+    m.insert(
+        Key::TrayRecovering,
+        "系统托盘正在恢复，请稍后再试。Rustle 将保持窗口可见。",
+    );
+
     // Context Menu
     m.insert(Key::ContextMenuEditTags, "编辑标签");
 
