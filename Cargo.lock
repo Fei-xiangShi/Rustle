@@ -5728,7 +5728,7 @@ dependencies = [
 
 [[package]]
 name = "rustle"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -5768,14 +5768,14 @@ dependencies = [
 
 [[package]]
 name = "rustle-application"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "rustle-domain",
 ]
 
 [[package]]
 name = "rustle-audio"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "objc2-core-audio",
  "parking_lot",
@@ -5795,11 +5795,11 @@ dependencies = [
 
 [[package]]
 name = "rustle-cleanup"
-version = "0.5.5"
+version = "0.5.6"
 
 [[package]]
 name = "rustle-domain"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "regex",
  "serde",
@@ -5808,7 +5808,7 @@ dependencies = [
 
 [[package]]
 name = "rustle-media"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "base64",
  "encoding_rs",
@@ -5831,7 +5831,7 @@ dependencies = [
 
 [[package]]
 name = "rustle-ncm"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "base64",
  "directories",
@@ -5853,7 +5853,7 @@ dependencies = [
 
 [[package]]
 name = "rustle-observability"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "directories",
  "serde",
@@ -5867,7 +5867,7 @@ dependencies = [
 
 [[package]]
 name = "rustle-platform"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "cosmic-text",
  "discord-rich-presence",
@@ -5893,7 +5893,7 @@ dependencies = [
 
 [[package]]
 name = "rustle-storage"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "directories",
@@ -5913,7 +5913,7 @@ dependencies = [
 
 [[package]]
 name = "rustle-ui"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bytemuck",
  "iced",
