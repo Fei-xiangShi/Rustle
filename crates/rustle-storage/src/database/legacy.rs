@@ -13,11 +13,22 @@ pub(crate) enum LegacySchemaVersion {
     V2,
     V3,
     V4,
+    /// V4 plus `songs.normalization_updated_at`, written by unreleased
+    /// development builds around the V2 normalization-gain work. No release
+    /// ever read the column, so normalization drops it before V4 -> V5.
+    V4Normalization,
     V5,
 }
 
 impl LegacySchemaVersion {
-    pub(crate) const ALL: [Self; 5] = [Self::V1, Self::V2, Self::V3, Self::V4, Self::V5];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::V1,
+        Self::V2,
+        Self::V3,
+        Self::V4,
+        Self::V4Normalization,
+        Self::V5,
+    ];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -25,6 +36,8 @@ impl LegacySchemaVersion {
             Self::V2 => "v2",
             Self::V3 => "v3",
             Self::V4 => "v4",
+            // Backup file names split on '-', so this identifier must not use it.
+            Self::V4Normalization => "v4_normalization",
             Self::V5 => "v5",
         }
     }
@@ -41,19 +54,25 @@ impl LegacySchemaVersion {
             Self::V2 => &LEGACY_UPGRADE_SQL[1..],
             Self::V3 => &LEGACY_UPGRADE_SQL[2..],
             Self::V4 => &LEGACY_UPGRADE_SQL[3..],
+            Self::V4Normalization => &V4_NORMALIZATION_UPGRADE_SQL,
             Self::V5 => &[],
         }
     }
 
     #[cfg(test)]
-    pub(crate) const fn fixture_count(self) -> usize {
-        match self {
+    pub(crate) fn fixture_scripts(self) -> Vec<&'static str> {
+        let cumulative = match self {
             Self::V1 => 1,
             Self::V2 => 2,
             Self::V3 => 3,
-            Self::V4 => 4,
+            Self::V4 | Self::V4Normalization => 4,
             Self::V5 => 5,
+        };
+        let mut scripts = LEGACY_FIXTURE_SQL[..cumulative].to_vec();
+        if self == Self::V4Normalization {
+            scripts.push(LEGACY_V4_NORMALIZATION_FIXTURE_SQL);
         }
+        scripts
     }
 }
 
@@ -62,6 +81,11 @@ const LEGACY_UPGRADE_SQL: [&str; 4] = [
     include_str!("../../migrations/legacy/v2_to_v3.sql"),
     include_str!("../../migrations/legacy/v3_to_v4.sql"),
     include_str!("../../migrations/legacy/v4_to_v5.sql"),
+];
+
+const V4_NORMALIZATION_UPGRADE_SQL: [&str; 2] = [
+    include_str!("../../migrations/legacy/v4_normalization_to_v4.sql"),
+    LEGACY_UPGRADE_SQL[3],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,7 +106,7 @@ impl fmt::Display for SchemaFingerprint {
     }
 }
 
-const KNOWN_LEGACY_SCHEMAS: [(LegacySchemaVersion, SchemaFingerprint); 5] = [
+const KNOWN_LEGACY_SCHEMAS: [(LegacySchemaVersion, SchemaFingerprint); 6] = [
     (
         LegacySchemaVersion::V1,
         SchemaFingerprint::new(0x0478_7227_05d9_e766_3d88_2d95_d866_4653, 76),
@@ -98,6 +122,10 @@ const KNOWN_LEGACY_SCHEMAS: [(LegacySchemaVersion, SchemaFingerprint); 5] = [
     (
         LegacySchemaVersion::V4,
         SchemaFingerprint::new(0x7a06_6da7_bd78_a1f5_b75a_3526_38a0_d991, 92),
+    ),
+    (
+        LegacySchemaVersion::V4Normalization,
+        SchemaFingerprint::new(0x1bf1_c343_ac63_d689_6a43_88f7_f715_401b, 93),
     ),
     (
         LegacySchemaVersion::V5,
@@ -345,9 +373,13 @@ pub(crate) const LEGACY_FIXTURE_SQL: [&str; 5] = [
 ];
 
 #[cfg(test)]
+const LEGACY_V4_NORMALIZATION_FIXTURE_SQL: &str =
+    include_str!("../../tests/fixtures/database/legacy_v4_normalization_delta.sql");
+
+#[cfg(test)]
 pub(crate) async fn apply_fixture(pool: &SqlitePool, version: LegacySchemaVersion) -> Result<()> {
-    for script in LEGACY_FIXTURE_SQL.iter().take(version.fixture_count()) {
-        sqlx::raw_sql(*script).execute(pool).await?;
+    for script in version.fixture_scripts() {
+        sqlx::raw_sql(script).execute(pool).await?;
     }
     Ok(())
 }
@@ -514,7 +546,10 @@ mod tests {
 
     #[test]
     fn fixture_sql_contains_only_synthetic_private_free_values() {
-        for fixture in LEGACY_FIXTURE_SQL {
+        for fixture in LEGACY_FIXTURE_SQL
+            .into_iter()
+            .chain([LEGACY_V4_NORMALIZATION_FIXTURE_SQL])
+        {
             let lowercase = fixture.to_ascii_lowercase();
             for forbidden in [
                 "http://",

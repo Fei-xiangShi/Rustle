@@ -11,6 +11,17 @@ use super::NcmError;
 const SESSION_VERSION: u8 = 2;
 static SESSION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Desktop client version advertised to NCM for requests that use the PC
+/// profile. ncm-api-rs pins `3.1.17.204416`, which NCM now rejects on
+/// `/song/enhance/player/url/v1` (code 400); 3.2.x is accepted.
+const DESKTOP_CLIENT_APPVER: &str = "3.2.0.205538";
+
+/// Mirrors ncm-api-rs `get_os_config`: every OS other than these falls back to
+/// the PC profile and therefore inherits its `appver`.
+fn uses_desktop_client_profile(os: &str) -> bool {
+    !matches!(os, "linux" | "android" | "iphone")
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct SessionState {
     #[serde(default)]
@@ -120,6 +131,13 @@ impl SessionState {
         }
         if let Some(os) = os {
             upsert_cookie(&mut pairs, "os", os.to_string());
+        }
+        let effective_os = pairs
+            .iter()
+            .find(|(name, _)| name == "os")
+            .map_or("pc", |(_, value)| value.as_str());
+        if uses_desktop_client_profile(effective_os) {
+            upsert_cookie(&mut pairs, "appver", DESKTOP_CLIENT_APPVER.to_string());
         }
         serialize_cookie_pairs(pairs)
     }
@@ -325,6 +343,16 @@ mod tests {
         let reloaded = SessionState::load(&path).unwrap().unwrap();
         assert_eq!(reloaded.device_id(), expected);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_cookie_advertises_supported_desktop_appver_only_for_pc_profile() {
+        let state = SessionState::new(Some("appver=3.1.17.204416".to_string()));
+        let expected = format!("appver={DESKTOP_CLIENT_APPVER}");
+        assert!(state.request_cookie().contains(&expected));
+        assert!(!state.request_cookie().contains("3.1.17"));
+        assert!(state.request_cookie_for_os("osx").contains(&expected));
+        assert!(!state.request_cookie_for_os("linux").contains(&expected));
     }
 
     #[test]

@@ -10,6 +10,7 @@ by every `legacy_vN_delta.sql` up to the requested generation.
 | V2 | `bd30afa2ae4eae94f01de904b7b1f18ee3e2519a` | v0.2.3 | V1–V2 |
 | V3 | `394f35871bd82f547a8ee7f2cabe1d964f71f711` | v0.2.4–v0.3.2 | V1–V3 |
 | V4 | `f9ed27fcae58cd78a44bf4cded6a68c19d40609b` | v0.3.3–v0.4.6 | V1–V4 |
+| V4 + normalization | unreleased development builds | — | V1–V4, `legacy_v4_normalization_delta.sql` |
 | V5 | `b02a5304c009d68d01b8a705fa7f5f7f639dacf5` | v0.4.7–v0.5.2 | V1–V5 |
 
 The rows are synthetic and intentionally use relative fixture paths. Never
@@ -17,11 +18,16 @@ replace these inputs with a copied developer/user database. V5 is the current
 unversioned canonical application schema; the SQLx-managed baseline adds only
 its migration ledger.
 
+`V4 + normalization` is not a release: it is V4 with the extra
+`songs.normalization_updated_at` column left behind by unreleased development
+builds. It is recognized only by its exact fingerprint and normalized by
+dropping that column before the regular V4 -> V5 upgrade.
+
 ## Adoption dependency
 
 These fixtures authorize classification only. They must not be used to claim a
 SQLx migration version until the adoption path has created and verified a
-recoverable pre-mutation backup, normalized the recognized V1–V5 schema,
+recoverable pre-mutation backup, normalized the recognized V1–V5 (or V4 + normalization) schema,
 installed the exact baseline ledger, run startup health checks, and proved
 restore behavior for failed or interrupted adoption. Unknown fingerprints are
 never repair candidates.
